@@ -1,0 +1,861 @@
+﻿import { NextResponse } from "next/server";
+import clientPromise from "@/lib/mongodb";
+import { uploadFileToR2, getFileFromR2, deleteFileFromR2 } from "@/lib/cloudflareR2";
+
+const sheetR2Key = (id: string) => `gem-sync/sheets/${id}.json`;
+
+// Helper: finds duplicate listings by (itemId/itemName + firmCode + GeM
+// Link) - a Master List entry is a firm's item->GeM-link mapping, reusable
+// for any buyer's quote, so buyerId plays no part in a listing's identity.
+// Two listings differing only by which buyer's sheet first created them ARE
+// duplicates. GeM Link IS part of the key though - a firm can legitimately
+// carry more than one listing for the same item under different Product
+// IDs, so item+firm alone would misidentify those as duplicates. Listings
+// with no link at all (pre-tracking data) still fall back to item+firm so
+// those old duplicates keep collapsing as before.
+// This is READ-ONLY - it never deletes anything itself. It returns the
+// deduplicated (still _id-free) "kept" list, and "discarded": the full
+// losing-duplicate listings (each carrying which listing's id it would be
+// replaced by), for a caller to show the user before anything is actually
+// removed. Deletion only ever happens by explicit app-level `id`s a caller
+// passes back in - never a recomputed, un-reviewed deleteMany({}) - so
+// nothing is ever removed the user hasn't specifically seen and confirmed,
+// and a listing added/updated by someone else is never at risk of being
+// swept up in an unrelated cleanup.
+function deduplicateListings(items: any[]): { kept: any[]; discarded: any[] } {
+  if (!Array.isArray(items)) return { kept: [], discarded: [] };
+  const seen = new Map<string, any>();
+  const discarded: any[] = [];
+
+  for (const lst of items) {
+    if (!lst) continue;
+    const itemKey = (lst.itemId || lst.itemName || "").toString().trim().toLowerCase();
+    const firmKey = (lst.firmCode || "").toString().trim().toLowerCase();
+    const linkKey = (lst.gemLink || "").toString().trim().toLowerCase();
+    const key = `${itemKey}::${firmKey}::${linkKey}`;
+
+    if (!seen.has(key)) {
+      seen.set(key, lst);
+    } else {
+      const existing = seen.get(key);
+      // Keep the record with a GeM link or the more recent sync date
+      const hasMoreInfo = !existing.gemLink && lst.gemLink;
+      const isNewer = new Date(lst.date || 0).getTime() > new Date(existing.date || 0).getTime();
+      if (hasMoreInfo || isNewer) {
+        const { _id, ...rest } = existing;
+        discarded.push({ ...rest, keptId: lst.id });
+        seen.set(key, lst);
+      } else {
+        const { _id, ...rest } = lst;
+        discarded.push({ ...rest, keptId: existing.id });
+      }
+    }
+  }
+
+  const kept = Array.from(seen.values()).map(({ _id, ...rest }) => ({ ...rest }));
+  return { kept, discarded };
+}
+
+// A listing's firmCode/rate/availGemStock/minQty hold its last CONFIRMED-
+// synced values - the Requirement Mapping Console's Master List tab and
+// Excel quoting only ever read those, never a staged pendingRevision (see
+// FirmItemListing.pendingRevision in app/dashboard/gem-sync/page.tsx). This
+// is the Mongo-side $set clause that promotes a confirmed sync: copies
+// pendingRevision into the confirmed fields (a listing with nothing staged,
+// e.g. paired via "Add to Master List" against an already-live GeM
+// Catalogue item, just gets marked confirmed as-is).
+function promoteListingSetClause(doc: any): Record<string, any> {
+  // Clears any lastSyncError left over from an earlier failed attempt (see
+  // mark_listing_sync_failed below) - a successful sync supersedes it, so the
+  // Sync Checklist's red warning shouldn't keep showing after a retry works.
+  const pending = doc?.pendingRevision;
+  if (pending) {
+    return {
+      firmCode: pending.firmCode,
+      rate: pending.rate,
+      availGemStock: pending.availGemStock,
+      minQty: pending.minQty,
+      pendingRevision: null,
+      everSynced: true,
+      status: "Synced",
+      lastSyncError: null,
+      lastSyncErrorAt: null,
+    };
+  }
+  return { everSynced: true, status: "Synced", lastSyncError: null, lastSyncErrorAt: null };
+}
+
+// GET: Fetch the shared console state from MongoDB (with auto-deduplicated listings).
+// ?sheetContent={id} instead fetches just that one sheet's heavy uploadedRows/
+// originalExcelData payload from R2 on demand — never eagerly loaded for every
+// sheet up front, so gem_sheets documents stay flat-sized no matter how large
+// individual Excel uploads get.
+export async function GET(req: Request) {
+  try {
+    const client = await clientPromise;
+    const db = client.db();
+
+    const { searchParams } = new URL(req.url);
+    const sheetContentId = searchParams.get("sheetContent");
+    if (sheetContentId) {
+      const sheet = await db.collection("gem_sheets").findOne({ id: sheetContentId });
+      if (!sheet || !sheet.r2Key) {
+        return NextResponse.json({ error: "Sheet content not found" }, { status: 404 });
+      }
+      try {
+        const bytes = await getFileFromR2(sheet.r2Key);
+        const content = JSON.parse(bytes.toString("utf-8"));
+        return NextResponse.json({
+          uploadedRows: content.uploadedRows || [],
+          originalExcelData: content.originalExcelData || [],
+        });
+      } catch (err) {
+        console.error("Failed to fetch sheet content from R2:", err);
+        return NextResponse.json({ error: "Could not load sheet content — check R2 connection" }, { status: 502 });
+      }
+    }
+
+    // gem_rate_history is fetched separately (?rateHistory=1) rather than as
+    // part of the main bulk load below — it's only used by the Upload Sheet
+    // tab's "last quoted rate" hint, but a full unfiltered scan of it has been
+    // observed taking 40+ seconds on this cluster (looks like Atlas shared-tier
+    // throttling, not a query/index problem — small collection, tiny data size).
+    // Keeping it out of the main response means every other tab (which never
+    // needed it) stops waiting on that one slow collection.
+    if (searchParams.get("rateHistory")) {
+      const rateHistory = await db.collection("gem_rate_history").find({}).toArray();
+      return NextResponse.json({ rateHistory: rateHistory.map(({ _id, ...rest }) => ({ ...rest })) });
+    }
+
+    // gem_catalogue_links is the raw browser-extension-scraped GeM catalogue —
+    // by far the largest/slowest collection here, and only the dedicated
+    // /dashboard/gem-sync/catalogue page ever needs it. Fetched only on
+    // ?catalogue=1 so the main console's every-visit load skips it entirely.
+    if (searchParams.get("catalogue")) {
+      const [catalogueLinks, rawListings] = await Promise.all([
+        db.collection("gem_catalogue_links").find({}).toArray(),
+        db.collection("gem_listings").find({}).toArray(),
+      ]);
+      const cleanCatalogueLinks = catalogueLinks.map(({ _id, ...rest }) => ({ ...rest }));
+      // Read-only view (no delete here), so the raw docs (with _id) can go
+      // straight in - dedupeListings strips _id from what it returns anyway.
+      return NextResponse.json({
+        catalogueLinks: cleanCatalogueLinks,
+        listings: deduplicateListings(rawListings).kept,
+      });
+    }
+
+    // Dry-run for the Master List's "Clean Duplicates" button - shows exactly
+    // which listings would be removed (and which one each is a duplicate of)
+    // before anything is actually deleted. Nothing here mutates the DB.
+    if (searchParams.get("previewDuplicates")) {
+      const rawListings = await db.collection("gem_listings").find({}).toArray();
+      const { discarded } = deduplicateListings(rawListings);
+      return NextResponse.json({ duplicates: discarded });
+    }
+
+    // Fetch history for the Catalogue page's History popup - one row per
+    // firm (its most recent fetch), for every firm including ones never
+    // fetched at all, not the raw append-only log (gem_catalogue_fetch_log
+    // itself keeps every past fetch too, e.g. for future "fetched N times"
+    // stats, but this view answers "which firm, when last, how many items").
+    if (searchParams.get("catalogueFetchLog")) {
+      const [companies, log] = await Promise.all([
+        db.collection("companies").find({}, { projection: { firmCode: 1, firmName: 1 } }).toArray(),
+        db.collection("gem_catalogue_fetch_log").find({}).sort({ fetchedAt: -1 }).toArray(),
+      ]);
+
+      const latestByFirm = new Map<string, { itemCount: number; fetchedAt: Date }>();
+      for (const entry of log as any[]) {
+        if (!latestByFirm.has(entry.firmCode)) {
+          latestByFirm.set(entry.firmCode, { itemCount: entry.itemCount, fetchedAt: entry.fetchedAt });
+        }
+      }
+
+      const history = companies.map((c: any) => {
+        const latest = latestByFirm.get(c.firmCode);
+        return {
+          firmCode: c.firmCode,
+          firmName: c.firmName,
+          itemCount: latest?.itemCount ?? null,
+          fetchedAt: latest?.fetchedAt ?? null,
+        };
+      });
+
+      history.sort((a, b) => {
+        if (!a.fetchedAt && !b.fetchedAt) return a.firmName.localeCompare(b.firmName);
+        if (!a.fetchedAt) return 1; // never-fetched firms sink to the bottom
+        if (!b.fetchedAt) return -1;
+        return new Date(b.fetchedAt).getTime() - new Date(a.fetchedAt).getTime();
+      });
+
+      return NextResponse.json({ log: history });
+    }
+
+    // Fetch the remaining collections concurrently rather than one-at-a-time —
+    // total wait becomes the slowest single query instead of the sum of all of them.
+    const [buyers, rawListings, customItems, sheets, rowMappings, newLinkChecklist, masterRates] = await Promise.all([
+      db.collection("gem_buyers").find({}).toArray(),
+      db.collection("gem_listings").find({}).toArray(),
+      db.collection("gem_custom_items").find({}).toArray(),
+      db.collection("gem_sheets").find({}).toArray(),
+      // Lightweight (originalName + mappedItemId only) per-sheet mapping history —
+      // powers "Quick Fill from Master List" across all past sheets without
+      // needing every sheet's full uploadedRows (which now live in R2).
+      db.collection("gem_row_mappings").find({}).toArray(),
+      // "New Upload Link" checklist portion - items that are completely new
+      // for a firm (no existing GeM listing yet), pushed here from the
+      // Requirement Mapping Console's "Add New Link" button. Separate from
+      // gem_listings (the "Stock Update" checklist portion), since these
+      // entries don't necessarily have a rate/inventory mapping yet.
+      db.collection("gem_new_link_checklist").find({}).toArray(),
+      // Master Rate Sheet - per-item A/B/C/D rate types, so a rate only has to
+      // be typed once instead of re-typed on every sheet that item appears in.
+      db.collection("gem_master_rates").find({}).toArray(),
+    ]);
+
+    // Clean MongoDB _id fields for React/JSON serialization
+    const cleanBuyers = buyers.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanListings = rawListings.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanCustomItems = customItems.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanSheets = sheets.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanRowMappings = rowMappings.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanNewLinkChecklist = newLinkChecklist.map(({ _id, ...rest }) => ({ ...rest }));
+    const cleanMasterRates = masterRates.map(({ _id, ...rest }) => ({ ...rest }));
+
+    // Listings are returned as-is, duplicates included - nothing gets
+    // silently removed just from loading this page any more. Master List's
+    // own display already collapses exact duplicates visually on its own
+    // (see filteredMasterListings in page.tsx); actually deleting one now
+    // only ever happens through the reviewable Clean Duplicates flow
+    // (?previewDuplicates=1 to see them, action=cleanup_duplicates with the
+    // specific ids the user confirmed to actually remove them).
+
+    return NextResponse.json({
+      buyers: cleanBuyers,
+      listings: cleanListings,
+      customItems: cleanCustomItems,
+      sheets: cleanSheets,
+      rowMappings: cleanRowMappings,
+      newLinkChecklist: cleanNewLinkChecklist,
+      masterRates: cleanMasterRates
+    });
+  } catch (error) {
+    console.error("GET gem-sync error:", error);
+    return NextResponse.json({ error: "Failed to fetch state" }, { status: 500 });
+  }
+}
+
+// POST: Save collections/sheets to MongoDB to share across team members
+export async function POST(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const action = searchParams.get("action");
+    const client = await clientPromise;
+    const db = client.db();
+    const body = await req.json();
+
+    // Map helpers to discard MongoDB native _id if they are present in incoming payload
+    const sanitizeBody = (items: any[]) => {
+      if (!Array.isArray(items)) return [];
+      return items.map(({ _id, ...rest }) => ({ ...rest }));
+    };
+
+    if (action === "save_buyers") {
+      await db.collection("gem_buyers").deleteMany({});
+      const sanitized = sanitizeBody(body);
+      if (sanitized.length > 0) {
+        await db.collection("gem_buyers").insertMany(sanitized);
+      }
+      return NextResponse.json({ success: true });
+    }
+
+    // Scoped upsert-by-id for a single listing (add or edit) - replaces the
+    // old whole-collection "save_listings" (deleteMany + insertMany of every
+    // listing the calling tab knew about). That pattern let one tab's stale
+    // in-memory snapshot silently wipe out listings another teammate had just
+    // added/edited, or a Sync Checklist tick the gem-bill-submit browser
+    // extension had just applied (via mark_listing_synced below) moments
+    // earlier - confirmed live: one user's items marked Synced kept reverting
+    // to Pending, and a second user's login still showed them as Pending with
+    // "the list unchanged", because whichever tab saved next overwrote the
+    // entire collection with its own outdated copy.
+    if (action === "upsert_listing") {
+      const listing = sanitizeBody([body])[0];
+      if (!listing?.id) {
+        return NextResponse.json({ error: "listing.id is required" }, { status: 400 });
+      }
+      await db.collection("gem_listings").updateOne({ id: listing.id }, { $set: listing }, { upsert: true });
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "delete_listing") {
+      const id = (body.id || "").toString().trim();
+      if (!id) {
+        return NextResponse.json({ error: "id is required" }, { status: 400 });
+      }
+      await db.collection("gem_listings").deleteOne({ id });
+      return NextResponse.json({ success: true });
+    }
+
+    // Deletes ONLY the specific listing ids the caller passed - always the
+    // ones the user actually reviewed via ?previewDuplicates=1 first (see
+    // deduplicateListings' comment on why an un-reviewed recompute-and-
+    // delete-everything here is unsafe). No ids means nothing is deleted.
+    if (action === "cleanup_duplicates") {
+      const ids: string[] = Array.isArray(body.ids)
+        ? body.ids.filter((x: any) => typeof x === "string" && x)
+        : [];
+      if (ids.length === 0) {
+        return NextResponse.json({ error: "No duplicate ids given to delete" }, { status: 400 });
+      }
+      await db.collection("gem_listings").deleteMany({ id: { $in: ids } });
+      return NextResponse.json({ success: true, removedCount: ids.length });
+    }
+
+    if (action === "save_history") {
+      await db.collection("gem_rate_history").deleteMany({});
+      const sanitized = sanitizeBody(body);
+      if (sanitized.length > 0) {
+        await db.collection("gem_rate_history").insertMany(sanitized);
+      }
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "save_custom_items") {
+      await db.collection("gem_custom_items").deleteMany({});
+      const sanitized = sanitizeBody(body);
+      if (sanitized.length > 0) {
+        await db.collection("gem_custom_items").insertMany(sanitized);
+      }
+      return NextResponse.json({ success: true });
+    }
+
+    // Master Rate Sheet - one row per item, each carrying up to 4 rate types
+    // (A/B/C/D). Whole-collection replace, same pattern as save_custom_items -
+    // this stays small (one row per distinct item, not per sheet/firm).
+    if (action === "save_master_rates") {
+      await db.collection("gem_master_rates").deleteMany({});
+      const sanitized = sanitizeBody(body);
+      if (sanitized.length > 0) {
+        await db.collection("gem_master_rates").insertMany(sanitized);
+      }
+      return NextResponse.json({ success: true });
+    }
+
+    // Append-only log of every Requirement Mapping Console row action (OK
+    // Link / Update Stock / New Link) - powers the GeM Sync report on the
+    // Summary dashboard. Never overwritten/deleted by normal use, so counts
+    // are a durable all-time record, not tied to any one sheet or session.
+    if (action === "log_gem_action") {
+      const type = body.type;
+      const validTypes = ["ok_link", "update_stock", "new_link", "sync_stock_update", "sync_new_link"];
+      if (!validTypes.includes(type)) {
+        return NextResponse.json({ error: `type must be one of: ${validTypes.join(", ")}` }, { status: 400 });
+      }
+      await db.collection("gem_action_log").insertOne({
+        id: "action_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+        type,
+        itemName: body.itemName || "",
+        firmCode: body.firmCode || "",
+        requiredQty: body.requiredQty ?? null,
+        rate: body.rate ?? null,
+        by: body.by || "",
+        sheetFileName: body.sheetFileName || "",
+        timestamp: new Date().toISOString(),
+      });
+      return NextResponse.json({ success: true });
+    }
+
+    // Called by the gem-bill-submit browser extension once it's actually
+    // pushed a Rate/Stock/Min Qty update through to GeM's own catalogue - no
+    // OMS login session available from there, so this is a plain POST action
+    // keyed by the listing's own id, same pattern as
+    // save_stock_fields/save_catalogue_links.
+    if (action === "mark_listing_synced") {
+      const id = (body.id || "").toString().trim();
+      if (!id) {
+        return NextResponse.json({ error: "id is required" }, { status: 400 });
+      }
+      const doc = await db.collection("gem_listings").findOne({ id });
+      if (!doc) {
+        return NextResponse.json({ error: `No listing found for id=${id}.` }, { status: 404 });
+      }
+      await db.collection("gem_listings").updateOne({ id }, { $set: promoteListingSetClause(doc) });
+      return NextResponse.json({ success: true });
+    }
+
+    // Called by the extension's bulk Sync Checklist run when a single item's
+    // automation gives up on it (captcha kept coming back wrong, a field
+    // wasn't found, etc.) - leaves status/pendingRevision untouched (still
+    // Pending, still needs a real sync) but records why, so the Sync
+    // Checklist can show a visible warning on that specific row instead of
+    // it just silently staying Pending with no explanation.
+    if (action === "mark_listing_sync_failed") {
+      const id = (body.id || "").toString().trim();
+      const reason = (body.reason || "").toString().trim();
+      if (!id) {
+        return NextResponse.json({ error: "id is required" }, { status: 400 });
+      }
+      await db.collection("gem_listings").updateOne(
+        { id },
+        { $set: { lastSyncError: reason || "Unknown error", lastSyncErrorAt: new Date().toISOString() } }
+      );
+      return NextResponse.json({ success: true });
+    }
+
+    // Called by the extension once a brand-new catalogue has actually been
+    // published on GeM (SELL THIS ITEM -> pair -> offering -> publish -> OTP).
+    // Graduates the New Upload Link entry into a real Master List listing, the
+    // same thing "Push to Stock" does by hand - done here rather than in the
+    // page because the browser tab driving the automation is GeM's, not OMS's.
+    if (action === "mark_new_link_published") {
+      const id = (body.id || "").toString().trim();
+      if (!id) {
+        return NextResponse.json({ error: "id is required" }, { status: 400 });
+      }
+
+      const entry = await db.collection("gem_new_link_checklist").findOne({ id });
+      if (!entry) {
+        return NextResponse.json({ error: `No New Upload Link entry found for id=${id}.` }, { status: 404 });
+      }
+
+      const gemLink = (entry.gemLink || "").toString().trim();
+      // A re-run of the automation must not create a second listing for the
+      // same product under the same firm - Master List is buyer-agnostic (a
+      // firm's item->GeM-link mapping, reusable for any buyer's quote), so
+      // this deliberately doesn't filter by entry.buyerId.
+      const existing = gemLink
+        ? await db.collection("gem_listings").findOne({ firmCode: entry.firmCode, gemLink })
+        : null;
+
+      let listingId = existing?.id as string | undefined;
+      if (!existing) {
+        listingId = "listing_" + Date.now() + "_published";
+        await db.collection("gem_listings").insertOne({
+          id: listingId,
+          firmCode: entry.firmCode,
+          itemId: entry.mappedItemId || "",
+          itemName: entry.itemName,
+          gemLink,
+          rate: Number(entry.rate) || 0,
+          availGemStock: Number(entry.availGemStock) || 0,
+          minQty: Number(entry.minQty) || 1,
+          // Published WITH these exact rate/stock/min-qty values a moment ago,
+          // so there is nothing left to push to GeM - Pending would just be
+          // asking someone to redo work that is already done.
+          status: "Synced",
+          everSynced: true,
+          buyerId: entry.buyerId,
+          date: new Date().toISOString(),
+          spec: entry.spec,
+          remark: entry.remark,
+          requiredQty: entry.requiredQty,
+          unit: entry.unit,
+          sheetName: entry.sheetName,
+          sheetId: entry.sheetId,
+        });
+      } else {
+        // A listing already existed for this gemLink (e.g. "Push to Stock"
+        // was used by hand first, with its own pendingRevision still
+        // staged) - this automation run confirms it's genuinely live now,
+        // same promotion as mark_listing_synced above.
+        await db.collection("gem_listings").updateOne({ id: existing.id }, { $set: promoteListingSetClause(existing) });
+      }
+
+      await db.collection("gem_new_link_checklist").updateOne(
+        { id },
+        { $set: { status: "Synced", pushedListingId: listingId } }
+      );
+
+      return NextResponse.json({ success: true, listingId });
+    }
+
+    // Scoped upsert-by-id for a single New Upload Link entry (add or edit) -
+    // replaces the old whole-collection "save_new_link_checklist" (deleteMany
+    // + insertMany of every entry the calling tab knew about). That pattern
+    // had the exact same bug already fixed for gem_listings (see
+    // upsert_listing above): one tab's stale in-memory snapshot could
+    // silently resurrect an entry another tab (or this same tab, moments
+    // later) had just deleted, since deleting it here only ever removed it
+    // from THAT tab's local array before resending the whole thing - any
+    // other still-open tab's next unrelated save would re-insert it wholesale.
+    if (action === "upsert_new_link_entry") {
+      const entry = sanitizeBody([body])[0];
+      if (!entry?.id) {
+        return NextResponse.json({ error: "entry.id is required" }, { status: 400 });
+      }
+      await db.collection("gem_new_link_checklist").updateOne({ id: entry.id }, { $set: entry }, { upsert: true });
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "delete_new_link_entry") {
+      const id = (body.id || "").toString().trim();
+      if (!id) {
+        return NextResponse.json({ error: "id is required" }, { status: 400 });
+      }
+      await db.collection("gem_new_link_checklist").deleteOne({ id });
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "save_sheet") {
+      if (!body.id) {
+        return NextResponse.json({ error: "Sheet ID is required" }, { status: 400 });
+      }
+
+      // Two distinct callers hit this action: the active-sheet auto-save (which
+      // always has the full uploadedRows/originalExcelData in memory) and
+      // metadata-only updates like toggling "completed" or changing the
+      // associated buyer (which only ever have the lightweight Sheet Library
+      // row, not the sheet's content). Only touch R2/counts/mappings when real
+      // content was actually sent — otherwise a buyer-change or completed-toggle
+      // on ANY sheet would silently overwrite its real data with an empty array.
+      const hasContent = Array.isArray(body.uploadedRows);
+
+      const metadataSet: any = {
+        id: body.id,
+        fileName: body.fileName || "",
+        selectedBuyerId: body.selectedBuyerId || "",
+        isCompleted: body.isCompleted !== undefined ? !!body.isCompleted : false,
+        lastEditedBy: body.lastEditedBy || "",
+        updatedAt: new Date().toISOString()
+      };
+
+      let sanitizedRows: any[] = [];
+      let persistContent = hasContent;
+      if (hasContent) {
+        sanitizedRows = sanitizeBody(body.uploadedRows);
+
+        // A racy auto-save (debounced effect firing on stale/still-loading
+        // state — see page.tsx) can land here with fewer rows than the sheet
+        // already has saved, right down to a completely empty array.
+        // Confirmed live: several Sheet Library rows got permanently stuck
+        // at "0" total items this way. No legitimate flow in this app ever
+        // shrinks an EXISTING sheet id's row count — a fresh upload/rebuild
+        // always gets a brand-new id (Date.now()-based), and there's no
+        // per-row delete once a sheet is uploaded — so a save carrying fewer
+        // rows than what's on file is always a stale/racy write, never a
+        // deliberate edit. Once a sheet has N rows saved, the only way its
+        // content actually shrinks is the user pressing Delete Sheet
+        // (action=delete_sheet, its own explicit confirm() step below) —
+        // never a silent auto-save.
+        const existing = await db.collection("gem_sheets").findOne({ id: body.id }, { projection: { totalRows: 1 } });
+        if (existing && sanitizedRows.length < (existing.totalRows || 0)) {
+          persistContent = false;
+        }
+      }
+
+      if (persistContent) {
+        const originalExcelData = body.originalExcelData || [];
+
+        // The heavy payload lives in R2, keyed by sheet id — Mongo only ever
+        // stores lightweight metadata + derived counts + this pointer, so the
+        // document's size never grows with the size of the uploaded Excel file.
+        const r2Key = sheetR2Key(body.id);
+        try {
+          await uploadFileToR2(
+            Buffer.from(JSON.stringify({ uploadedRows: sanitizedRows, originalExcelData })),
+            r2Key,
+            "application/json"
+          );
+        } catch (err) {
+          console.error("Failed to upload sheet content to R2:", err);
+          return NextResponse.json({ error: "Save failed — check R2 connection" }, { status: 502 });
+        }
+        metadataSet.totalRows = sanitizedRows.length;
+        metadataSet.completedRows = sanitizedRows.filter((r: any) => r.isCompleted).length;
+        metadataSet.linkIssueCount = sanitizedRows.filter((r: any) => r.linkIssueStatus === "flagged").length;
+        metadataSet.r2Key = r2Key;
+      }
+
+      await db.collection("gem_sheets").updateOne(
+        { id: body.id },
+        {
+          $set: metadataSet,
+          // Only stamped the very first time this sheet id is created (the actual
+          // upload event) — never overwritten by later edits/saves, unlike lastEditedBy.
+          $setOnInsert: {
+            uploadedBy: body.uploadedBy || "",
+            uploadedAt: new Date().toISOString()
+          },
+          // Clean up any pre-migration doc that still had the heavy fields embedded.
+          ...(persistContent ? { $unset: { uploadedRows: "", originalExcelData: "" } } : {})
+        },
+        { upsert: true }
+      );
+
+      if (persistContent) {
+        // Keep this sheet's stripped mapping-history in sync too — only the two
+        // fields "Quick Fill from Master List" actually needs, not the full row.
+        const mappings = sanitizedRows
+          .filter((r: any) => r.originalName && r.mappedItemId)
+          .map((r: any) => ({ originalName: r.originalName, mappedItemId: r.mappedItemId }));
+        await db.collection("gem_row_mappings").updateOne(
+          { sheetId: body.id },
+          { $set: { sheetId: body.id, mappings } },
+          { upsert: true }
+        );
+      }
+
+      return NextResponse.json({ success: true });
+    }
+
+    if (action === "delete_sheet") {
+      if (!body.id) {
+        return NextResponse.json({ error: "Sheet ID is required" }, { status: 400 });
+      }
+      try {
+        await deleteFileFromR2(sheetR2Key(body.id));
+      } catch (err) {
+        console.error("Failed to delete sheet content from R2 (continuing):", err);
+      }
+      await db.collection("gem_sheets").deleteOne({ id: body.id });
+      await db.collection("gem_row_mappings").deleteOne({ sheetId: body.id });
+      return NextResponse.json({ success: true });
+    }
+
+    // Links one GeM Catalogue row to an internal inventory item, creating a
+    // new Master List (gem_listings) entry. Uses gemCatalogueId+firmCode as
+    // the identity (not itemId+firmCode+buyerId like the general listings
+    // dedup does) so the auto-sync below can find this entry again on every
+    // future catalogue/stock re-fetch, purely from GeM's own product id -
+    // no buyer/requirement context needed for that.
+    if (action === "add_to_master_list") {
+      const gemCatalogueId = (body.gemCatalogueId || "").toString().trim();
+      const firmCode = (body.firmCode || "").toString().trim();
+      const itemId = (body.itemId || "").toString().trim();
+
+      if (!gemCatalogueId || !firmCode || !itemId) {
+        return NextResponse.json({ error: "gemCatalogueId, firmCode and itemId are required" }, { status: 400 });
+      }
+
+      const existing = await db.collection("gem_listings").findOne({
+        gemCatalogueId: { $regex: `^${gemCatalogueId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+        firmCode,
+      });
+      if (existing) {
+        return NextResponse.json({ error: "This product is already in the Master List for this firm." }, { status: 409 });
+      }
+
+      const newListing = {
+        id: "listing_" + Date.now(),
+        gemCatalogueId,
+        firmCode,
+        itemId,
+        itemName: body.itemName || "",
+        gemLink: body.gemLink || "",
+        rate: Number(body.rate) || 0,
+        availGemStock: Number(body.availGemStock) || 0,
+        minQty: Number(body.minQty) || 1,
+        status: "Synced",
+        everSynced: true,
+        buyerId: "",
+        date: new Date().toISOString(),
+      };
+      await db.collection("gem_listings").insertOne(newListing);
+      return NextResponse.json({ success: true, listing: newListing });
+    }
+
+    // Bulk-matches every GeM Catalogue row against the Master List by EXACT
+    // identity only - GeM's own Product ID (the "Gem Catalogue Id"/ProductID
+    // field, e.g. "5116877-82744993124" from a URL like
+    // .../p-5116877-82744993124-cat.html) plus firmCode. No name-similarity
+    // guessing here - a listing only gets matched if it's already tagged
+    // with this exact product id for this exact firm (via "Add to Master
+    // List" or a past run of this action), so there is zero risk of two
+    // different products getting cross-matched.
+    if (action === "sync_master_list_from_catalogue") {
+      const [catalogueLinks, listings] = await Promise.all([
+        db.collection("gem_catalogue_links").find({}).toArray(),
+        db.collection("gem_listings").find({ gemCatalogueId: { $exists: true, $ne: "" } }).toArray(),
+      ]);
+
+      const listingByKey = new Map<string, any>();
+      for (const listing of listings) {
+        const key = `${listing.gemCatalogueId.toString().trim().toLowerCase()}::${(listing.firmCode || "").toString().trim().toLowerCase()}`;
+        listingByKey.set(key, listing);
+      }
+
+      let updated = 0;
+      let unmatched = 0;
+
+      for (const row of catalogueLinks) {
+        const catalogueId = (row["Gem Catalogue Id"]?.text || row["ProductID"]?.text || "").toString().trim();
+        const firmCode = (row.firmCode || "").toString().trim();
+        if (!catalogueId || !firmCode) { unmatched++; continue; }
+
+        const listing = listingByKey.get(`${catalogueId.toLowerCase()}::${firmCode.toLowerCase()}`);
+        if (!listing) { unmatched++; continue; }
+
+        const setFields: any = {};
+        const priceText = row["Offer Price"]?.text;
+        const rate = priceText ? parseFloat(String(priceText).replace(/[^0-9.]/g, "")) : NaN;
+        if (!isNaN(rate)) setFields.rate = rate;
+        if (row.currentStock !== undefined && row.currentStock !== null) setFields.availGemStock = row.currentStock;
+        if (row.minQtyPerConsignee !== undefined && row.minQtyPerConsignee !== null) setFields.minQty = row.minQtyPerConsignee;
+
+        if (Object.keys(setFields).length > 0) {
+          await db.collection("gem_listings").updateOne({ id: listing.id }, { $set: setFields });
+          updated++;
+        }
+      }
+
+      return NextResponse.json({
+        success: true,
+        updated,
+        unmatched,
+        totalCatalogueRows: catalogueLinks.length,
+      });
+    }
+
+    if (action === "save_catalogue_links") {
+      const firmCode = (body.firmCode || "").toString().trim().toUpperCase();
+      if (!firmCode) {
+        return NextResponse.json({ error: "firmCode is required" }, { status: 400 });
+      }
+
+      const rows = Array.isArray(body) ? body : body.rows;
+      const sanitized = sanitizeBody(rows).map((row: any) => ({
+        ...row,
+        firmCode,
+        fetchedAt: new Date().toISOString()
+      }));
+
+      // De-duplicate within this firm's batch, keyed by the product's GeM
+      // Catalogue Id (falls back to ProductID/Name) - same firm should never
+      // have two rows for the same product. Duplicates across different
+      // firms are fine and expected (each firm has its own listing).
+      const seen = new Map<string, any>();
+      for (const row of sanitized) {
+        const key = (row["Gem Catalogue Id"]?.text || row["ProductID"]?.text || row["Name"]?.text || "")
+          .toString().trim().toLowerCase();
+        if (key) seen.set(key, row);
+      }
+      const deduped = Array.from(seen.values());
+
+      // Preserve previously-fetched stock/min-qty ("Fetch All Stock") data across
+      // this re-scan, since the catalogue scrape itself never carries those fields -
+      // without this, every "Send to Sync Console" run would wipe them back to empty.
+      const existingLinks = await db.collection("gem_catalogue_links").find({ firmCode }).toArray();
+      const existingByKey = new Map<string, any>();
+      for (const doc of existingLinks) {
+        const key = (doc["Gem Catalogue Id"]?.text || doc["ProductID"]?.text || doc["Name"]?.text || "")
+          .toString().trim().toLowerCase();
+        if (key) existingByKey.set(key, doc);
+      }
+      for (const row of deduped) {
+        const key = (row["Gem Catalogue Id"]?.text || row["ProductID"]?.text || row["Name"]?.text || "")
+          .toString().trim().toLowerCase();
+        const prior = existingByKey.get(key);
+        if (prior) {
+          if (prior.currentStock !== undefined) row.currentStock = prior.currentStock;
+          if (prior.minQtyPerConsignee !== undefined) row.minQtyPerConsignee = prior.minQtyPerConsignee;
+          if (prior.stockFetchedAt !== undefined) row.stockFetchedAt = prior.stockFetchedAt;
+        }
+      }
+
+      // Only replace this firm's previously synced links - other firms' data stays intact
+      await db.collection("gem_catalogue_links").deleteMany({ firmCode });
+      if (deduped.length > 0) {
+        await db.collection("gem_catalogue_links").insertMany(deduped);
+      }
+
+      // Append-only fetch history - gem_catalogue_links itself gets wholesale
+      // replaced on every fetch (old fetchedAt values are gone once that
+      // happens), so this is the only place "when did we last fetch, and how
+      // many times before that" survives. Powers the Catalogue page's History popup.
+      await db.collection("gem_catalogue_fetch_log").insertOne({
+        firmCode,
+        itemCount: deduped.length,
+        fetchedAt: new Date(),
+      });
+
+      // Auto-sync: any Master List entry already linked to one of these
+      // products (via "Add to Master List" on the Catalogue page) gets its
+      // price refreshed from this fresh scrape - never itemId/itemName/other
+      // fields, since those represent a human's inventory mapping decision,
+      // not scraped data.
+      for (const row of deduped) {
+        const catalogueId = (row["Gem Catalogue Id"]?.text || row["ProductID"]?.text || "").toString().trim();
+        const priceText = row["Offer Price"]?.text;
+        const rate = priceText ? parseFloat(String(priceText).replace(/[^0-9.]/g, "")) : NaN;
+        if (catalogueId && !isNaN(rate)) {
+          await db.collection("gem_listings").updateMany({ gemCatalogueId: catalogueId, firmCode }, { $set: { rate } });
+        }
+      }
+
+      return NextResponse.json({ success: true, count: deduped.length, firmCode });
+    }
+
+    if (action === "save_stock_fields") {
+      const firmCode = (body.firmCode || "").toString().trim().toUpperCase();
+      const productId = (body.productId || "").toString().trim();
+      const catalogueId = (body.catalogueId || "").toString().trim();
+
+      if (!firmCode || (!productId && !catalogueId)) {
+        return NextResponse.json({ error: "firmCode and productId/catalogueId are required" }, { status: 400 });
+      }
+
+      // Match the catalogue link row this stock page belongs to (same firm,
+      // same product), keyed by whichever id we managed to scrape from the page.
+      const idFilters: any[] = [];
+      if (productId) idFilters.push({ "ProductID.text": productId });
+      if (catalogueId) idFilters.push({ "Gem Catalogue Id.text": catalogueId });
+
+      const stockFields = {
+        currentStock: body.currentStock ?? null,
+        minQtyPerConsignee: body.minQtyPerConsignee ?? null,
+        stockFetchedAt: new Date().toISOString()
+      };
+
+      const result = await db.collection("gem_catalogue_links").updateMany(
+        { firmCode, $or: idFilters },
+        { $set: stockFields }
+      );
+
+      // Nothing matched - most likely this product's row was never created via
+      // "Send to Sync Console" (or the scraped id doesn't exactly match the
+      // stored ProductID/Gem Catalogue Id text). Don't silently drop the fetched
+      // data - insert a minimal row so it still shows up in OMS.
+      let inserted = false;
+      if (result.matchedCount === 0) {
+        await db.collection("gem_catalogue_links").insertOne({
+          firmCode,
+          ...(productId ? { ProductID: { text: productId, href: null } } : {}),
+          ...(catalogueId ? { "Gem Catalogue Id": { text: catalogueId, href: null } } : {}),
+          ...stockFields,
+          fetchedAt: new Date().toISOString()
+        });
+        inserted = true;
+      }
+
+      // Auto-sync: refresh availGemStock/minQty on any Master List entry
+      // already linked to this product - same rule as save_catalogue_links
+      // above (only these scraped fields, never the inventory mapping).
+      const syncKey = catalogueId || productId;
+      if (syncKey) {
+        const setFields: any = {};
+        if (body.currentStock !== undefined && body.currentStock !== null) setFields.availGemStock = body.currentStock;
+        if (body.minQtyPerConsignee !== undefined && body.minQtyPerConsignee !== null) setFields.minQty = body.minQtyPerConsignee;
+        if (Object.keys(setFields).length > 0) {
+          await db.collection("gem_listings").updateMany({ gemCatalogueId: syncKey, firmCode }, { $set: setFields });
+        }
+      }
+
+      return NextResponse.json({ success: true, matched: result.matchedCount, modified: result.modifiedCount, inserted });
+    }
+
+    if (action === "cleanup_unfirmed_catalogue_links") {
+      // Removes catalogue links synced before firm-tagging existed (no firmCode)
+      const result = await db.collection("gem_catalogue_links").deleteMany({
+        $or: [{ firmCode: { $exists: false } }, { firmCode: "" }, { firmCode: null }]
+      });
+      return NextResponse.json({ success: true, removedCount: result.deletedCount });
+    }
+
+    return NextResponse.json({ error: "Invalid action" }, { status: 400 });
+  } catch (error) {
+    console.error("POST gem-sync error:", error);
+    return NextResponse.json({ error: "Failed to save state" }, { status: 500 });
+  }
+}

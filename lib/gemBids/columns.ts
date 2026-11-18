@@ -1,0 +1,194 @@
+// Shared column/field metadata for the GeM Bids module — safe to import from both
+// client components (table rendering, xlsx header matching) and server routes
+// (diff engine field list). Single source of truth for the 17-column schema.
+
+export type FilterType = "text" | "dateRange" | "dropdown";
+
+export interface BidColumn {
+  key: string;
+  header: string; // display label shown in the table header (not necessarily the extension's raw export header text — see buyerAddedBidSpecificAtcUrl)
+  filterType: FilterType;
+  // True for a field that's still scraped/stored/diffed/editable as normal,
+  // just not rendered as its own table column — either dropped from view
+  // entirely (startDate) or folded into another column's cell instead
+  // (address/departmentNameAndAddress render stacked inside one merged
+  // "Address" column — see GemBidTable.tsx's ADDRESS_DEPARTMENT_KEY).
+  hiddenInTable?: boolean;
+}
+
+// Display/table order (Bid No first — pinned, key column; Tag renders even
+// further left, before Bid No, per the table component).
+// "Document required from seller" is kept as the last column (wasn't in the
+// originally requested sequence, but dropping a stored/diffed field
+// silently seemed worse than just placing it last).
+export const BID_COLUMNS: BidColumn[] = [
+  { key: "bidNo", header: "Bid No", filterType: "text" },
+  { key: "bidLink", header: "Bid Link", filterType: "text" },
+  { key: "startDate", header: "Start Date", filterType: "dateRange", hiddenInTable: true },
+  // Stacked under the Bid No cell in the table (its own, still-visible
+  // filter box is unaffected - that's a separately hand-written
+  // filterField() in GemBidTable.tsx, not generated from this list).
+  { key: "bidEndDateTime", header: "Bid End Date/Time", filterType: "dateRange", hiddenInTable: true },
+  // Folded into the Address column's cell (stacked as the third line, under
+  // Department) and its filter dropdown stacked into that same header cell.
+  { key: "consigneeCity", header: "Consignee City", filterType: "dropdown", hiddenInTable: true },
+  { key: "items", header: "Items", filterType: "text" },
+  { key: "quantityListing", header: "QTY", filterType: "text" },
+  { key: "address", header: "Address", filterType: "text" },
+  { key: "departmentNameAndAddress", header: "Department Name And Address", filterType: "text", hiddenInTable: true },
+  { key: "bidToRaEnabled", header: "BID TO RA", filterType: "dropdown" },
+  // Folded into the BID TO RA column's cell (stacked below it) and its
+  // filter dropdown (was a text search box, now a select - request was for
+  // a scrollable pick-list instead of typing).
+  { key: "raQualificationRule", header: "RA", filterType: "dropdown", hiddenInTable: true },
+  { key: "typeOfBid", header: "Type of Bid", filterType: "dropdown" },
+  { key: "evaluationMethod", header: "Evaluation", filterType: "dropdown" },
+  // Folded into the Evaluation column's cell (stacked below it).
+  { key: "emdAmount", header: "EMD Amount", filterType: "text", hiddenInTable: true },
+  // Note the exact source header is "Beneficiary :" (trailing space + colon) — verified
+  // against the extension's own export code, not assumed. hiddenInTable per
+  // spec - still scraped/stored/diffed/editable, just not its own column.
+  { key: "beneficiary", header: "Beneficiary :", filterType: "text", hiddenInTable: true },
+  // Folded into the Document required from seller column's cell (stacked
+  // below it, each as its own hyperlink line, when the bid's PDF had a real
+  // link for it - see content.js's SPEC_LABEL/BOQ_LABEL comment, same "not
+  // every bid has one" caveat as ATC) and filter box.
+  { key: "buyerAddedBidSpecificAtcUrl", header: "ATC", filterType: "text", hiddenInTable: true },
+  { key: "specificationDocumentUrl", header: "Specification Document", filterType: "text", hiddenInTable: true },
+  { key: "boqDetailDocumentUrl", header: "BOQ Detail Document", filterType: "text", hiddenInTable: true },
+  { key: "documentRequiredFromSeller", header: "Document required from seller", filterType: "text" },
+];
+
+// Some long/verbose scraped values are shown shortened in the table cell
+// only — the full original text is untouched in storage, in the Edit Bid
+// form, and in the cell's title tooltip (hover to see it in full).
+export const CELL_DISPLAY_FORMATTERS: Record<string, (value: string) => string> = {
+  raQualificationRule: (v) => {
+    const val = (v || "").trim();
+    if (!val) return val;
+    const pct = val.match(/^(\d+%)/);
+    if (pct) return pct[1];
+    const h = val.match(/^(H\d+)\b/i);
+    if (h) return h[1].toUpperCase();
+    return val;
+  },
+  typeOfBid: (v) => {
+    const val = (v || "").trim();
+    if (/^two\b/i.test(val)) return "TWO";
+    if (/^single\b/i.test(val)) return "SINGLE";
+    return val;
+  },
+  evaluationMethod: (v) => {
+    const val = (v || "").trim().toLowerCase();
+    if (val === "total value wise evaluation") return "TOTAL";
+    if (val === "item wise evaluation") return "ITEM WISE";
+    if (val === "item wise consignee wise evaluation") return "ITEM-CON";
+    return v || "";
+  },
+};
+
+// Fields the scrape gets reliably right (or that other automated logic
+// depends on staying exactly as scraped) - locked out of the Edit Bid
+// modal entirely. Everything else is freely, repeatedly editable - there's
+// no longer a one-time limit (the PATCH handler in app/api/gem-bids/route.ts
+// just records who/when on every edit instead of rejecting a second one).
+export const LOCKED_FIELD_KEYS = [
+  "bidLink",
+  "startDate",
+  "bidEndDateTime",
+  "items",
+  "quantityListing",
+  "consigneeCity",
+  "evaluationMethod",
+  "bidToRaEnabled",
+  "raQualificationRule",
+];
+
+// Fields the Edit Bid modal offers - every data column except the identity
+// key (bidNo) and the locked ones above.
+export const EDITABLE_FIELD_KEYS = BID_COLUMNS.filter(
+  (c) => c.key !== "bidNo" && !LOCKED_FIELD_KEYS.includes(c.key)
+).map((c) => c.key);
+
+export const DATA_FIELD_KEYS = BID_COLUMNS.filter((c) => c.key !== "bidNo").map((c) => c.key);
+
+export const HEADER_TO_FIELD: Record<string, string> = Object.fromEntries(
+  BID_COLUMNS.map((c) => [c.header, c.key])
+);
+
+// "Bids Can Be Filled" and "Bid Document Maker" were removed as workflow
+// stages by request (both were empty - nothing migrated). "Open Document
+// Maker" is still a page/link (document-maker/page.tsx), just no longer a
+// section a bid lives in. "All Bids" (a combined search-everything view,
+// not a real stage a bid can be *in*) is handled separately in the UI, not
+// listed here — see GemBidsPage's tab list.
+export const SECTIONS = [
+  { key: "new_bids", label: "New Bids" },
+  { key: "fetched_bid_data", label: "Fetched Bid Data" },
+  { key: "bids_to_fill", label: "Bids to Fill" },
+  { key: "submitted_bids", label: "Submitted Bids" },
+] as const;
+
+export type SectionKey = (typeof SECTIONS)[number]["key"];
+export const SECTION_KEYS = SECTIONS.map((s) => s.key) as SectionKey[];
+
+// Sections a bid moves into automatically (New Bids on first sight) or that carry
+// their own dedicated workflow (Submitted Bids status tracking) rather than being
+// a free manual "Send to" target from every other section.
+export const AUTO_ONLY_SECTIONS: SectionKey[] = ["new_bids"];
+
+// Sections where a bid is still raw scraped data - nobody's picked a party,
+// fetched documents, or filled anything in yet. Used (a) by GemBidTable's
+// "Send to" bar to decide the one sensible manual-move target for a bid
+// still at this stage (straight to Bids to Fill), and (b) by applyImport's
+// un-expire logic to decide whether un-expiring a bid should reset it to
+// New Bids (true here) or leave it exactly where it already was (false -
+// Bids to Fill/Submitted means real work already happened, which a GeM
+// deadline moving doesn't undo).
+export const RAW_DATA_SECTIONS: SectionKey[] = ["new_bids", "fetched_bid_data"];
+
+// Sections where an expired bid (Bid End Date/Time in the past) gets
+// auto-moved to Expired Bids by the periodic background check (see
+// lib/gemBids/expireBidsJob.ts). Submitted Bids is deliberately excluded,
+// even though every other section is covered - once a bid has actually
+// been submitted, only a manual action (Edit Bid, Bid Status, Delete, or
+// a manual "Send to") should ever move or touch it again; a GeM deadline
+// passing shouldn't relocate it out of Submitted Bids on its own. This was
+// briefly expanded to include Submitted Bids too and reverted after real
+// use showed that wasn't wanted.
+export const AUTO_DELETE_EXPIRED_SECTIONS: SectionKey[] = SECTION_KEYS.filter((k) => k !== "submitted_bids");
+
+// Submitted Bids is protected from every automated touch a sync run makes
+// (see applyImport.ts) - once a bid is here, only a manual action in the
+// OMS itself (Edit Bid, the Bid Status field, or a manual Delete) can
+// change it. A fresh sync will still leave it alone even if GeM's own
+// listing for it changed or disappeared.
+export const SYNC_PROTECTED_SECTIONS: SectionKey[] = ["submitted_bids"];
+
+export const SUBMITTED_STATUSES = [
+  "Active",
+  "Cancelled",
+  "Technical Evaluation",
+  "Financial Evaluation",
+  "Awarded",
+] as const;
+export type SubmittedStatus = (typeof SUBMITTED_STATUSES)[number];
+
+const HIGHLIGHT_ITEM_TERM = "paper-based printing services";
+/** Mirrors the extension's own yellow-highlight rule exactly (case-insensitive substring on Items). */
+export function computeHighlight(items?: string | null): boolean {
+  return (items || "").toLowerCase().includes(HIGHLIGHT_ITEM_TERM);
+}
+
+// Category keywords a bid's Items text is checked against on every sync - matches
+// are dropped before ever reaching gem_bids. Kept in an editable JSON file (not
+// inline) per spec, so the list can be tuned without a code change/deploy.
+import exclusionKeywordsRaw from "./exclusionKeywords.json";
+export const EXCLUSION_KEYWORDS: string[] = exclusionKeywordsRaw as string[];
+
+/** Case-insensitive partial match against the exclusion keyword list. */
+export function isExcludedByCategory(items?: string | null): boolean {
+  const text = (items || "").toLowerCase();
+  if (!text) return false;
+  return EXCLUSION_KEYWORDS.some((kw) => text.includes(kw.toLowerCase()));
+}

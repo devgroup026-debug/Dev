@@ -1,0 +1,2614 @@
+"use client";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import Link from "next/link";
+import {
+  FiArrowLeft,
+  FiCheckSquare,
+  FiCheckCircle,
+  FiXCircle,
+  FiRotateCcw,
+  FiInfo,
+  FiRefreshCw,
+  FiX,
+  FiAlertTriangle,
+  FiLayers,
+  FiFileText,
+  FiSearch,
+  FiArrowUp,
+  FiArrowDown,
+} from "react-icons/fi";
+import BlockGuard from "@/components/BlockGuard";
+import { buildClusters, OrderCluster } from "@/lib/reconciliation/clusterEngine";
+import { parseDateToSortable } from "@/lib/reconciliation/matchingEngine";
+
+interface Match {
+  _id: string;
+  firmCode: string;
+  statementId?: string;
+  transactionDate: string;
+  transactionDescription: string;
+  creditedAmount: number;
+  instituteName: string | null;
+  sellerId: string | null;
+  billIds: string[];
+  billNos: string[];
+  billAmount: number;
+  deductionAmount: number;
+  deductionType: string | null;
+  deductionReason: string;
+  matchedKeyword: string | null;
+  confidence: number;
+  confidenceLabel: "high" | "low" | "new";
+  status: "pending" | "confirmed" | "rejected" | "excluded";
+  suggestedType: string | null;
+  correctedType: string | null;
+  confirmedAt?: string;
+  confirmedBy?: string;
+  tag?: string | null;
+  taggedBy?: string;
+  isAmbiguous?: boolean;
+  ambiguousCandidates?: {
+    sellerId: string;
+    instituteName: string;
+    score: number;
+    amountFit: boolean;
+    dateFit: boolean;
+    matchedBillNos?: string[];
+  }[];
+  highConfidence?: boolean;
+}
+
+interface BillLineDetail {
+  _id: string;
+  orderNo: string;
+  itemName: string;
+  reQty: number;
+  unit?: string;
+  rate: number;
+  totalAmount: number;
+  paidAmount?: number;
+  contractDate?: string;
+  contractNo?: string;
+}
+
+interface CorrectionAlert {
+  _id: string;
+  firmCode?: string;
+  instituteName: string;
+  sellerId: string;
+  leftoverMatchId: string;
+  suspectMatchId: string;
+  reason: string;
+  status: "pending" | "accepted" | "rejected";
+}
+
+interface AliasMetaRow {
+  keyword: string;
+  confidence: number;
+  source?: string;
+}
+interface NegativeKeywordRow {
+  keyword: string;
+  rejectedCount: number;
+}
+interface DeductionProfile {
+  tdsOnlyCount: number;
+  tdsGstCount: number;
+  kasarCount: number;
+  kasarRange: { min: number | null; max: number | null };
+  lastConfirmedType: string | null;
+}
+interface SellerRecord {
+  _id: string;
+  instituteName: string;
+  statementDescriptionName?: string[];
+  aliasMeta?: AliasMetaRow[];
+  negativeKeywords?: NegativeKeywordRow[];
+  deductionProfile?: DeductionProfile;
+  autoApproveTrusted?: boolean;
+}
+
+interface OrderLite {
+  _id: string;
+  orderNo: string;
+  firmCode: string;
+  instituteName: string;
+  itemName?: string;
+  contractDate?: string;
+  createdAt?: string;
+  totalAmount: number;
+  paidAmount?: number;
+  deductionAmount?: number;
+  isPaid?: boolean;
+  status: string;
+  billExemptReason?: "ALREADY_BILLED_EXTERNAL" | "NOT_REQUIRED" | null;
+}
+
+// Compact order-ledger table shown while manually matching - lets the user
+// compare the bank entry's amount/date/narration against an institute's
+// actual open orders (item, date, amount) instead of guessing from a name
+// alone. Rows whose remaining amount matches the credited amount (within a
+// rupee, for rounding) are highlighted since that's usually the deciding
+// signal. Capped and amount-matches-first so an institute with a long open
+// backlog doesn't turn every row into a huge table.
+const LEDGER_ROW_CAP = 8;
+const LEDGER_ROW_CAP_FULL = 30;
+
+// A Partial Ship or Return split (see app/api/seller-orders/[id]/route.ts)
+// breaks one real order into several SellerOrder docs ("OD123", "OD123-P1",
+// ...) that are still, in practice, one delivery paid together - mirrors
+// matchingEngine.ts's groupSplitOrders so the manual picker and the
+// auto-matching engine group bills the exact same way. Deliberately NOT
+// grouped by Contract No: one GeM contract can cover dozens of genuinely
+// separate line items paid individually over time, not as one lump sum.
+const baseOrderNo = (orderNo: string) => (orderNo || "").replace(/-(P\d+|Re\d+|RE-N\d+)$/i, "");
+
+function OrderLedgerMini({
+  orders,
+  highlightAmount,
+  highlightOrderNos,
+  fullWidth,
+  selectedIds,
+  onToggle,
+  elsewhereIds,
+  onToggleAll,
+}: {
+  orders: OrderLite[];
+  highlightAmount?: number;
+  // Specific order numbers that make up a COMBO match (several orders
+  // together, no single one equal to the credited amount) - takes priority
+  // over highlightAmount, since an amount-only check can never find them
+  // individually (confirmed live: a 4-order combo showed no highlight at
+  // all under the old amount-only logic).
+  highlightOrderNos?: string[];
+  fullWidth?: boolean;
+  // When provided, renders a checkbox per row so the user can manually pick
+  // any combination of bills (not just what the engine auto-detected) -
+  // the credited amount may cover any number of this institute's open
+  // orders, so a single-select dropdown can't represent every real case.
+  selectedIds?: Set<string>;
+  onToggle?: (id: string) => void;
+  // Bill ids already picked (saved or just locally chosen) by some OTHER
+  // pending transaction - flagged so the user can avoid double-claiming a
+  // bill before hitting the backend's overpayment guard at confirm time.
+  elsewhereIds?: Set<string>;
+  // Header checkbox that selects/clears every open order at once (not just
+  // the ones currently shown under the row cap).
+  onToggleAll?: () => void;
+}) {
+  if (orders.length === 0) {
+    return <p className="text-[9px] text-slate-400 italic px-1 py-1">No open orders for this institute.</p>;
+  }
+  // Base order numbers shared by more than one open order here (a "-P1"/
+  // "-Re1" split) - ticking one such row auto-ticks the rest (see onToggle
+  // below), so flag them.
+  const baseCounts = new Map<string, number>();
+  orders.forEach((o) => {
+    const base = baseOrderNo(o.orderNo);
+    baseCounts.set(base, (baseCounts.get(base) || 0) + 1);
+  });
+  const highlightSet = new Set((highlightOrderNos || []).map((n) => n.trim().toUpperCase()));
+  const isHighlighted = (o: OrderLite, remaining: number) =>
+    highlightSet.size > 0
+      ? highlightSet.has((o.orderNo || "").trim().toUpperCase())
+      : highlightAmount != null && Math.abs(remaining - highlightAmount) < 1;
+
+  const withRemaining = orders.map((o) => ({
+    o,
+    remaining: (o.totalAmount || 0) - (o.paidAmount || 0) - (o.deductionAmount || 0),
+  }));
+  const sorted = [...withRemaining].sort((a, b) => {
+    const aMatch = isHighlighted(a.o, a.remaining);
+    const bMatch = isHighlighted(b.o, b.remaining);
+    if (aMatch !== bMatch) return aMatch ? -1 : 1;
+    const aDate = a.o.contractDate || a.o.createdAt || "";
+    const bDate = b.o.contractDate || b.o.createdAt || "";
+    return bDate.localeCompare(aDate);
+  });
+  const cap = fullWidth ? LEDGER_ROW_CAP_FULL : LEDGER_ROW_CAP;
+  const shown = sorted.slice(0, cap);
+  const rowText = fullWidth ? "text-xs" : "text-[9px]";
+  const selectable = !!onToggle;
+  const allSelected = selectable && orders.length > 0 && orders.every((o) => selectedIds?.has(o._id));
+  return (
+    <div className={`border border-slate-200 rounded-lg overflow-hidden mt-1 ${fullWidth ? "" : "max-w-[420px]"}`}>
+      <table className={`w-full ${rowText}`}>
+        <thead>
+          <tr className="bg-slate-50 text-slate-400 font-bold uppercase">
+            {selectable && (
+              <th className="px-2 py-1.5 w-6">
+                {onToggleAll && (
+                  <input
+                    type="checkbox"
+                    checked={allSelected}
+                    onChange={onToggleAll}
+                    title={allSelected ? "Clear all" : "Select all"}
+                    className="w-3.5 h-3.5 accent-blue-600"
+                  />
+                )}
+              </th>
+            )}
+            <th className="px-2 py-1.5 text-left">Order</th>
+            <th className="px-2 py-1.5 text-left">Item</th>
+            <th className="px-2 py-1.5 text-left">Date</th>
+            <th className="px-2 py-1.5 text-right">Amount</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {shown.map(({ o, remaining }) => {
+            const isMatch = isHighlighted(o, remaining);
+            const checked = !!selectedIds?.has(o._id);
+            const claimedElsewhere = !!elsewhereIds?.has(o._id);
+            return (
+              <tr
+                key={o._id}
+                className={`${isMatch ? "bg-emerald-50" : ""} ${checked ? "bg-blue-50" : ""} ${claimedElsewhere ? "bg-amber-50" : ""} ${selectable ? "cursor-pointer" : ""}`}
+                onClick={selectable ? () => onToggle!(o._id) : undefined}
+              >
+                {selectable && (
+                  <td className="px-2 py-1.5">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => onToggle!(o._id)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="w-3.5 h-3.5 accent-blue-600"
+                    />
+                  </td>
+                )}
+                <td className="px-2 py-1.5 font-mono text-slate-700 whitespace-nowrap">
+                  {o.orderNo}
+                  {(baseCounts.get(baseOrderNo(o.orderNo)) || 0) > 1 && (
+                    <span className="block text-[8px] font-black uppercase text-blue-500" title="Split order - selected together with its sibling(s)">
+                      ⛓ split order
+                    </span>
+                  )}
+                  {claimedElsewhere && (
+                    <span className="block text-[8px] font-black uppercase text-amber-600" title="Already picked in another pending transaction">
+                      ⚠ picked elsewhere
+                    </span>
+                  )}
+                </td>
+                <td className={`px-2 py-1.5 text-slate-600 truncate ${fullWidth ? "max-w-[220px]" : "max-w-[140px]"}`} title={o.itemName}>
+                  {o.itemName || "—"}
+                </td>
+                <td className="px-2 py-1.5 font-mono text-slate-500 whitespace-nowrap">{o.contractDate || (o.createdAt ? o.createdAt.slice(0, 10) : "—")}</td>
+                <td className={`px-2 py-1.5 text-right font-mono font-bold whitespace-nowrap ${isMatch ? "text-emerald-700" : "text-slate-700"}`}>
+                  {isMatch && "✓ "}₹{formatMoney(remaining)}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {sorted.length > cap && (
+        <p className="text-[8px] text-slate-400 text-center py-1 bg-slate-50">+{sorted.length - cap} more open order(s)</p>
+      )}
+    </div>
+  );
+}
+
+const RETURN_FAMILY = new Set(["CANCELL ORDER", "RETURN ORDER", "RETURN RECEIVED"]);
+const DEDUCTION_TYPES = ["TDS", "TDS+GST", "Kasar"];
+// TDS = 2% income-tax TDS only. TDS+GST = that same 2% plus the 2% GST-TDS
+// (1% CGST + 1% SGST) that applies on top of it, i.e. 4% total - auto-filled
+// instead of typed by hand so it always matches whatever bills are actually
+// picked (single or combo) rather than drifting out of sync.
+const DEDUCTION_RATES: Record<string, number> = { TDS: 0.02, "TDS+GST": 0.04 };
+
+const selectedBillsTotal = (bills: OrderLite[], man: { billId: string; comboBillIds: string[] }) => {
+  if (man.comboBillIds.length > 0) {
+    return bills
+      .filter((b) => man.comboBillIds.includes(b._id))
+      .reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0);
+  }
+  if (man.billId) {
+    const b = bills.find((x) => x._id === man.billId);
+    return b ? b.totalAmount - (b.paidAmount || 0) : 0;
+  }
+  return 0;
+};
+
+// Reasons a credited transaction is never going to be a bill payment at all -
+// tagging one of these moves it out of auto-matching entirely instead of it
+// resurfacing as "unmatched" on every Run Matching pass.
+const TAG_OPTIONS: { value: string; label: string }[] = [
+  { value: "LAST_FY", label: "Last Financial Year" },
+  { value: "TDS", label: "TDS Refund" },
+  { value: "DIVIDEND_INTEREST", label: "Dividend / Interest" },
+  { value: "DD_CANCELLED", label: "DD Cancelled" },
+  { value: "OTHER", label: "Other (Non-Bill)" },
+];
+const tagLabel = (tag?: string | null) => TAG_OPTIONS.find((t) => t.value === tag)?.label || tag || "—";
+
+const formatMoney = (n: number) =>
+  (n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const confidencePill = (label: string) => {
+  if (label === "high")
+    return "bg-emerald-50 border-emerald-200 text-emerald-700";
+  if (label === "low") return "bg-amber-50 border-amber-200 text-amber-700";
+  return "bg-slate-50 border-slate-200 text-slate-500";
+};
+
+type Tab = "pending" | "confirmed" | "rejected" | "excluded";
+
+export default function ReconciliationPage() {
+  const [companies, setCompanies] = useState<any[]>([]);
+  const [sellers, setSellers] = useState<SellerRecord[]>([]);
+  const [orders, setOrders] = useState<OrderLite[]>([]);
+  const [firmFilter, setFirmFilter] = useState("");
+  const [tab, setTab] = useState<Tab>("pending");
+  const [matches, setMatches] = useState<Match[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [currentUsername, setCurrentUsername] = useState("");
+  const [patternsFor, setPatternsFor] = useState<string | null>(null);
+  const [clusterViewFor, setClusterViewFor] = useState<string | null>(null);
+  const [clusterViewConfirmed, setClusterViewConfirmed] = useState<Match[]>([]);
+  const [correctionAlerts, setCorrectionAlerts] = useState<CorrectionAlert[]>([]);
+  const [correctionBusyId, setCorrectionBusyId] = useState<string | null>(null);
+  const [showCorrectionModal, setShowCorrectionModal] = useState(false);
+  // Which institute's order ledger is expanded, per row - keyed by
+  // `${matchId}|${sellerId}` so each row/candidate toggles independently.
+  // Opens the order-ledger popup for one (transaction, candidate institute)
+  // pair - shown alongside the full bank statement entry so the two can be
+  // compared side by side instead of a cramped inline table.
+  const [ledgerModalFor, setLedgerModalFor] = useState<{
+    match: Match;
+    sellerId: string;
+    instituteName: string;
+    matchedBillNos?: string[];
+  } | null>(null);
+  // Bills checked in the ledger modal's manual multi-select - seeded from
+  // whatever's already picked for this match (comboBillIds / billId / the
+  // engine's matchedBillNos) whenever the modal opens, so re-opening it to
+  // tweak a selection doesn't lose what was already chosen.
+  const [ledgerSelectedIds, setLedgerSelectedIds] = useState<Set<string>>(new Set());
+  const [runningMatching, setRunningMatching] = useState(false);
+  // "firm X of N" while an all-firms Run Matching is working through the
+  // list one request at a time - null outside of that (single-firm runs
+  // don't need it, they're already one request).
+  const [runningMatchingProgress, setRunningMatchingProgress] = useState<string | null>(null);
+  const [detailsFor, setDetailsFor] = useState<Match | null>(null);
+  const [detailsBills, setDetailsBills] = useState<BillLineDetail[]>([]);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  // Checked rows in the Pending Review (institute+bill already assigned)
+  // table, for bulk Confirm/Reject - cleared whenever the underlying list
+  // changes shape (tab/firm switch) so a stale selection can't silently
+  // apply to rows the user never looked at.
+  const [selectedResolvedIds, setSelectedResolvedIds] = useState<Set<string>>(new Set());
+  // Checked rows in the Unmatched Transactions table, for bulk Tag - a
+  // single shared dropdown picks the reason applied to every selected row.
+  const [selectedUnresolvedIds, setSelectedUnresolvedIds] = useState<Set<string>>(new Set());
+  const [bulkTagValue, setBulkTagValue] = useState("");
+  const [bulkBusy, setBulkBusy] = useState(false);
+  // Filters the Unmatched Transactions table by description or any
+  // candidate/assigned institute name - this list is long enough (hundreds
+  // of rows) that finding one specific transaction by scrolling wasn't
+  // practical.
+  const [unresolvedSearch, setUnresolvedSearch] = useState("");
+
+  // Not A Bill tab: per-column search (description, tag, credited amount)
+  // and click-to-sort column headers - same pattern as the Stock page.
+  const [excludedDescSearch, setExcludedDescSearch] = useState("");
+  const [excludedTagSearch, setExcludedTagSearch] = useState("");
+  const [excludedAmountSearch, setExcludedAmountSearch] = useState("");
+  const [excludedSort, setExcludedSort] = useState<{ key: string | null; direction: "asc" | "desc" }>({
+    key: null,
+    direction: "asc",
+  });
+
+  // Confirmed tab: per-column search (date, bill no, institute, firm, credited amount)
+  const [confirmedDateSearch, setConfirmedDateSearch] = useState("");
+  const [confirmedBillSearch, setConfirmedBillSearch] = useState("");
+  const [confirmedInstituteSearch, setConfirmedInstituteSearch] = useState("");
+  const [confirmedFirmSearch, setConfirmedFirmSearch] = useState("");
+  const [confirmedAmountSearch, setConfirmedAmountSearch] = useState("");
+
+  const [editState, setEditState] = useState<
+    Record<string, { correctedType: string; deductionAmount: string; deductionReason: string }>
+  >({});
+  const [manualState, setManualState] = useState<
+    Record<
+      string,
+      {
+        sellerId: string;
+        billId: string;
+        // Set instead of billId when the picked candidate was a COMBO match
+        // (several bills together, none individually equal to the credited
+        // amount) - the single-select Bill dropdown can't represent that, so
+        // picking a combo candidate locks these in directly rather than
+        // leaving the user to manually re-guess which bills to pick.
+        comboBillIds: string[];
+        comboBillNos: string[];
+        deductionType: string;
+        deductionAmount: string;
+        deductionReason: string;
+      }
+    >
+  >({});
+  const [tagState, setTagState] = useState<Record<string, string>>({});
+  // Same firm can have several bank accounts open at once (e.g. DEV ENTERPRISE
+  // has both an HDFC and a Mehsana Co-op account) - the firm code alone
+  // doesn't say which one a given statement entry came from, so the last 4
+  // account digits are shown alongside it everywhere Firm appears below.
+  const [accountLast4ByStatementId, setAccountLast4ByStatementId] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("oms_user");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.username) setCurrentUsername(parsed.username);
+      }
+    } catch (err) {
+      console.error("Failed to read logged-in user", err);
+    }
+
+    fetch("/api/companies")
+      .then((res) => res.json())
+      .then((data) => setCompanies(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load firms", err));
+
+    refreshOrders();
+
+    fetch("/api/account-statements")
+      .then((res) => res.json())
+      .then((data) => {
+        const map: Record<string, string> = {};
+        (Array.isArray(data) ? data : []).forEach((s: any) => {
+          const digits = String(s.accountNumber || "").replace(/\D/g, "");
+          if (digits) map[String(s._id)] = digits.slice(-4);
+        });
+        setAccountLast4ByStatementId(map);
+      })
+      .catch((err) => console.error("Failed to load statement account numbers", err));
+
+    refreshSellers();
+  }, []);
+
+  const refreshSellers = () => {
+    fetch("/api/sellers")
+      .then((res) => res.json())
+      .then((data) => setSellers(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load sellers", err));
+  };
+
+  // Re-fetched after every confirm/reverse (see runAction/handleSaveManual/
+  // runBulkAction) - `orders` was only ever loaded once on page load, so a
+  // bill that just got paid (isPaid now true server-side) kept showing up as
+  // "open" and pickable in every OTHER transaction's Order Ledger/Bill
+  // dropdown for the rest of the session, since nothing ever refreshed the
+  // local copy. Confirmed live.
+  const refreshOrders = () => {
+    // ?all=1 - reconciliation exists specifically to clear old backlog, so it
+    // needs every open order, not just the system-wide most-recent-250 the
+    // Orders board defaults to. Without this, any institute whose unpaid
+    // orders are all older than that recent-250 window (common - the whole
+    // point here is catching up on a backlog) silently showed "no open
+    // orders" even when real matching bills existed.
+    // &light=1 skips the Orders-dashboard-only PR/OP/stock enrichment this
+    // endpoint otherwise does on every order - Reconciliation only ever
+    // reads the plain bill fields (see OrderLite), and that enrichment work
+    // was most of why this fetch was so slow (5.6MB full response vs well
+    // under 1MB light, for the same ~6k orders).
+    fetch("/api/seller-orders?all=1&light=1")
+      .then((res) => res.json())
+      .then((data) => setOrders(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load orders", err));
+  };
+
+  const fetchMatches = useCallback(() => {
+    setLoading(true);
+    const params = new URLSearchParams({ status: tab });
+    if (firmFilter) params.set("firmCode", firmFilter);
+    fetch(`/api/reconciliation/matches?${params.toString()}`)
+      .then((res) => res.json())
+      .then((data) => setMatches(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load matches", err))
+      .finally(() => setLoading(false));
+  }, [tab, firmFilter]);
+
+  const fetchCorrectionAlerts = useCallback(() => {
+    const params = new URLSearchParams({ status: "pending" });
+    if (firmFilter) params.set("firmCode", firmFilter);
+    fetch(`/api/reconciliation/corrections?${params.toString()}`)
+      .then((res) => res.json())
+      .then((data) => setCorrectionAlerts(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load correction alerts", err));
+  }, [firmFilter]);
+
+  useEffect(() => {
+    fetchMatches();
+    fetchCorrectionAlerts();
+    setSelectedResolvedIds(new Set());
+    setSelectedUnresolvedIds(new Set());
+  }, [fetchMatches, fetchCorrectionAlerts]);
+
+  // Matching used to re-run automatically inside every fetchMatches() call,
+  // which meant just opening this page re-scanned every statement against
+  // every seller. It's now only triggered here, explicitly.
+  //
+  // One request covering every firm at once got big enough to blow through
+  // the server's own time limit (confirmed live in production -
+  // FUNCTION_INVOCATION_TIMEOUT, "Matching run failed", repeatably) once
+  // there was enough data across every firm's statements. Split into one
+  // request per firm instead when no single firm is selected - each firm's
+  // own data is comfortably small enough on its own, so this is the fix
+  // regardless of any one request's internal efficiency, and it'll keep
+  // working as more firms/statements get added over time.
+  const handleRunMatching = async () => {
+    setRunningMatching(true);
+    try {
+      const firmCodes = firmFilter
+        ? [firmFilter]
+        : [...new Set(companies.map((c) => c.firmCode).filter(Boolean))];
+      if (firmCodes.length === 0) throw new Error("Firms haven't loaded yet - try again in a moment");
+      for (let i = 0; i < firmCodes.length; i++) {
+        const code = firmCodes[i];
+        if (firmCodes.length > 1) setRunningMatchingProgress(`${i + 1}/${firmCodes.length}: ${code}`);
+        const res = await fetch("/api/reconciliation/matches", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "generate", firmCode: code }),
+        });
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(`${code}: ${data?.error || "Matching run failed"}`);
+        }
+      }
+      fetchMatches();
+      fetchCorrectionAlerts();
+    } catch (err: any) {
+      alert(err.message || "Matching run failed");
+    } finally {
+      setRunningMatching(false);
+      setRunningMatchingProgress(null);
+    }
+  };
+
+  const resolveCorrectionAlert = async (alertId: string, action: "accept" | "reject") => {
+    setCorrectionBusyId(alertId);
+    try {
+      const res = await fetch(`/api/reconciliation/corrections/${alertId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action, userName: currentUsername }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Action failed");
+      fetchCorrectionAlerts();
+      fetchMatches();
+      if (action === "accept") refreshOrders();
+    } catch (err: any) {
+      alert(err.message || "Action failed");
+    } finally {
+      setCorrectionBusyId(null);
+    }
+  };
+
+  const sellerById = useMemo(() => {
+    const map: Record<string, SellerRecord> = {};
+    sellers.forEach((s) => (map[s._id] = s));
+    return map;
+  }, [sellers]);
+
+  const firmNameByCode = useMemo(() => {
+    const map: Record<string, string> = {};
+    companies.forEach((c) => {
+      if (c.firmCode) map[c.firmCode] = c.firmName || c.firmCode;
+    });
+    return map;
+  }, [companies]);
+
+  // Which bill is already claimed by which OTHER pending transaction -
+  // either already saved on that match's own billIds (an earlier Run
+  // Matching/manual save), or only picked locally so far in manualState
+  // (not yet saved). The backend's overpayment guard already stops a second
+  // confirm from silently double-paying a bill, but surfacing the conflict
+  // here lets the user avoid it before hitting that error.
+  const billPickedBy = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of matches) {
+      for (const id of m.billIds || []) {
+        if (!map.has(id)) map.set(id, m._id);
+      }
+      const man = manualState[m._id];
+      if (man) {
+        const ids = man.comboBillIds.length > 0 ? man.comboBillIds : man.billId ? [man.billId] : [];
+        for (const id of ids) {
+          if (!map.has(id)) map.set(id, m._id);
+        }
+      }
+    }
+    return map;
+  }, [matches, manualState]);
+  const pickedElsewhere = (billId: string, currentMatchId: string) => {
+    const owner = billPickedBy.get(billId);
+    return !!owner && owner !== currentMatchId;
+  };
+
+  const openBillsFor = useCallback(
+    // creditDate: the transaction's own date (Match.transactionDate) - when
+    // given, a bill dated AFTER it is excluded. A payment can only ever be
+    // for an order that already existed when the money was credited, so a
+    // later-dated bill can never be the right match. Bills with no date at
+    // all are kept (nothing to disprove them on).
+    (instituteName: string | null, firmCode: string, creditDate?: string) => {
+      if (!instituteName) return [];
+      const creditSortable = creditDate ? parseDateToSortable(creditDate) : 0;
+      return orders.filter(
+        (o) =>
+          o.instituteName === instituteName &&
+          o.firmCode === firmCode &&
+          // Real remaining balance, not the `isPaid` flag - that flag is only
+          // ever set by applyPaymentToBill (lib/reconciliation/paymentEngine.ts)
+          // at the moment a payment is confirmed, so a handful of older orders
+          // whose paidAmount was set before that logic existed stayed `isPaid:
+          // false` forever despite being fully settled - confirmed live via
+          // the DB (OD6021/OD3972/OD0816-RE-N1 etc.), showing as ₹0.00 "open"
+          // orders here. Deriving straight from the amounts can't go stale.
+          (o.totalAmount || 0) - (o.paidAmount || 0) - (o.deductionAmount || 0) > 0.5 &&
+          !RETURN_FAMILY.has(o.status) &&
+          // "No bill needed for this at all" orders aren't a real receivable -
+          // a payment can never belong to one, so they're excluded from the
+          // manual Bill picker. "Already billed outside OMS (e.g. Miracle)"
+          // orders stay pickable - they were legitimately billed, just not
+          // via OMS's Generate Bill, so a payment should still link to them.
+          o.billExemptReason !== "NOT_REQUIRED" &&
+          (() => {
+            if (!creditSortable) return true;
+            const billSortable = parseDateToSortable(o.contractDate);
+            return !billSortable || billSortable <= creditSortable;
+          })()
+      );
+    },
+    [orders]
+  );
+
+  // Cluster View — every (non-cancelled/returned) order for an institute, open or
+  // already settled, so the view reads as a full history of its date-bursts.
+  const ordersForCluster = useMemo(() => {
+    if (!clusterViewFor) return [];
+    const instituteName = sellerById[clusterViewFor]?.instituteName;
+    if (!instituteName) return [];
+    return orders.filter((o) => o.instituteName === instituteName && !RETURN_FAMILY.has(o.status));
+  }, [clusterViewFor, sellerById, orders]);
+
+  const clusters: OrderCluster[] = useMemo(
+    () => (ordersForCluster.length > 0 ? buildClusters(ordersForCluster as any) : []),
+    [ordersForCluster]
+  );
+
+  useEffect(() => {
+    if (!clusterViewFor) {
+      setClusterViewConfirmed([]);
+      return;
+    }
+    const instituteName = sellerById[clusterViewFor]?.instituteName;
+    if (!instituteName) return;
+    fetch(`/api/reconciliation/matches?status=confirmed&instituteName=${encodeURIComponent(instituteName)}`)
+      .then((res) => res.json())
+      .then((data) => setClusterViewConfirmed(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load confirmed matches for cluster view", err));
+  }, [clusterViewFor, sellerById]);
+
+  const paymentsForCluster = useCallback(
+    (cluster: OrderCluster) => {
+      const orderIds = new Set(cluster.orders.map((o: any) => String(o._id)));
+      return clusterViewConfirmed.filter((m) => m.billIds.some((id) => orderIds.has(id)));
+    },
+    [clusterViewConfirmed]
+  );
+
+  const getEdit = (m: Match) =>
+    editState[m._id] || {
+      correctedType: m.suggestedType || "",
+      deductionAmount: String(m.deductionAmount || 0),
+      deductionReason: m.deductionReason || "",
+    };
+
+  const setEdit = (id: string, patch: Partial<{ correctedType: string; deductionAmount: string; deductionReason: string }>) => {
+    setEditState((prev) => ({ ...prev, [id]: { ...getEditRaw(prev, id), ...patch } }));
+  };
+  const getEditRaw = (
+    state: Record<string, { correctedType: string; deductionAmount: string; deductionReason: string }>,
+    id: string
+  ) => state[id] || { correctedType: "", deductionAmount: "0", deductionReason: "" };
+
+  // Seeded from the match's own sellerId/billIds when nothing's been picked
+  // locally yet - a transaction can already have a confident, server-matched
+  // institute (sometimes even a bill) with nothing more needed than Confirm,
+  // and previously defaulting to "" here made that row LOOK completely
+  // unmatched (empty "Select Institute..." dropdown) even though Run
+  // Matching had already found it correctly - confirmed live on a "high"
+  // confidence DIET VADODARA match that only lacked an open bill to attach.
+  const getManual = (m: Match) =>
+    manualState[m._id] || {
+      sellerId: m.sellerId || "",
+      billId: m.billIds.length === 1 ? m.billIds[0] : "",
+      comboBillIds: m.billIds.length > 1 ? m.billIds : ([] as string[]),
+      comboBillNos: m.billIds.length > 1 ? m.billNos : ([] as string[]),
+      deductionType: "",
+      deductionAmount: "0",
+      deductionReason: "",
+    };
+  const setManual = (m: Match, patch: Partial<ReturnType<typeof getManual>>) => {
+    setManualState((prev) => ({ ...prev, [m._id]: { ...getManual(m), ...patch } }));
+  };
+
+  // Picking an ambiguous candidate that the engine already found a COMBO
+  // match for (matchedBillNos has 2+ orders) locks those specific bills in
+  // directly, since the single-select Bill dropdown has no way to represent
+  // picking several bills at once - previously this silently left billId
+  // empty/wrong, so confirming never actually applied the combo the card
+  // was showing. A single-order match auto-selects that one bill too.
+  const selectCandidate = (m: Match, c: { sellerId: string; instituteName: string; matchedBillNos?: string[] }) => {
+    const man = getManual(m);
+    // If a TDS/TDS+GST deduction is already picked, keep the deduction
+    // amount in sync with whatever bill(s) this selection resolves to - zero
+    // when none resolve, recalculated at that type's rate otherwise.
+    const rate = DEDUCTION_RATES[man.deductionType];
+    const dedPatch = (total: number) => (rate ? { deductionAmount: (total * rate).toFixed(2) } : {});
+    const billNos = c.matchedBillNos || [];
+    if (billNos.length === 0) {
+      setManual(m, { sellerId: c.sellerId, billId: "", comboBillIds: [], comboBillNos: [], ...dedPatch(0) });
+      return;
+    }
+    const openBills = openBillsFor(c.instituteName, m.firmCode, m.transactionDate);
+    const resolved = billNos
+      .map((no) => openBills.find((b) => b.orderNo === no))
+      .filter((b): b is OrderLite => !!b);
+    if (resolved.length !== billNos.length) {
+      // Couldn't resolve every matched order to an open bill (stale list) -
+      // fall back to plain manual pick rather than locking in a partial/wrong set.
+      setManual(m, { sellerId: c.sellerId, billId: "", comboBillIds: [], comboBillNos: [], ...dedPatch(0) });
+      return;
+    }
+    const total = resolved.reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0);
+    if (resolved.length === 1) {
+      setManual(m, { sellerId: c.sellerId, billId: resolved[0]._id, comboBillIds: [], comboBillNos: [], ...dedPatch(total) });
+    } else {
+      setManual(m, {
+        sellerId: c.sellerId,
+        billId: "",
+        comboBillIds: resolved.map((b) => b._id),
+        comboBillNos: resolved.map((b) => b.orderNo),
+        ...dedPatch(total),
+      });
+    }
+  };
+
+  // Opens the order-ledger modal and seeds its checkbox selection from
+  // whatever bill(s) are already picked for this match, so the modal always
+  // reflects (and lets the user adjust) the current selection rather than
+  // starting blank every time.
+  const openLedgerModal = (
+    m: Match,
+    sellerId: string,
+    instituteName: string,
+    matchedBillNos?: string[]
+  ) => {
+    const man = getManual(m);
+    let initial: string[] = [];
+    if (man.sellerId === sellerId && man.comboBillIds.length > 0) {
+      initial = man.comboBillIds;
+    } else if (man.sellerId === sellerId && man.billId) {
+      initial = [man.billId];
+    } else if (matchedBillNos && matchedBillNos.length > 0) {
+      const openBills = openBillsFor(instituteName, m.firmCode, m.transactionDate);
+      initial = matchedBillNos
+        .map((no) => openBills.find((b) => b.orderNo === no)?._id)
+        .filter((id): id is string => !!id);
+    }
+    setLedgerSelectedIds(new Set(initial));
+    setLedgerModalFor({ match: m, sellerId, instituteName, matchedBillNos });
+  };
+
+  // Applies the modal's checkbox selection to the match's manual state -
+  // zero picks clears to link-only, one pick uses the plain billId field,
+  // two or more lock in as a combo (the single-select dropdown can't
+  // represent more than one bill).
+  const applyLedgerSelection = () => {
+    if (!ledgerModalFor) return;
+    const { match: m, sellerId, instituteName } = ledgerModalFor;
+    const openBills = openBillsFor(instituteName, m.firmCode, m.transactionDate);
+    const picked = openBills.filter((b) => ledgerSelectedIds.has(b._id));
+    const man = getManual(m);
+    const total = picked.reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0);
+    const rate = DEDUCTION_RATES[man.deductionType];
+    const dedPatch = rate ? { deductionAmount: (total * rate).toFixed(2) } : {};
+    if (picked.length === 0) {
+      setManual(m, { sellerId, billId: "", comboBillIds: [], comboBillNos: [], ...dedPatch });
+    } else if (picked.length === 1) {
+      setManual(m, { sellerId, billId: picked[0]._id, comboBillIds: [], comboBillNos: [], ...dedPatch });
+    } else {
+      setManual(m, {
+        sellerId,
+        billId: "",
+        comboBillIds: picked.map((b) => b._id),
+        comboBillNos: picked.map((b) => b.orderNo),
+        ...dedPatch,
+      });
+    }
+    setLedgerModalFor(null);
+  };
+
+  const runAction = async (id: string, url: string, body: any) => {
+    setBusyId(id);
+    try {
+      const res = await fetch(url, {
+        method: body.method || "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Action failed");
+      // Drop the row locally instead of calling fetchMatches() (which flips
+      // `loading` and blanks the whole table with a spinner) - confirm/reject/
+      // reverse all move this row's status away from whichever tab is
+      // currently open, so it no longer belongs in this list either way.
+      setMatches((prev) => prev.filter((match) => match._id !== id));
+      refreshSellers();
+      refreshOrders();
+    } catch (err: any) {
+      alert(err.message || "Action failed");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleConfirm = (m: Match) => {
+    const edit = getEdit(m);
+    if (!m.sellerId) {
+      alert("Assign an institute before confirming.");
+      return;
+    }
+    runAction(m._id, `/api/reconciliation/matches/${m._id}`, {
+      action: "confirm",
+      correctedType: edit.correctedType || null,
+      deductionAmount: Number(edit.deductionAmount) || 0,
+      deductionReason: edit.deductionReason,
+      userName: currentUsername,
+    });
+  };
+
+  const handleReject = (m: Match) => {
+    if (!confirm("Reject this suggested match?")) return;
+    runAction(m._id, `/api/reconciliation/matches/${m._id}`, { action: "reject", userName: currentUsername });
+  };
+
+  const toggleSelectResolved = (id: string) => {
+    setSelectedResolvedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllResolved = () => {
+    setSelectedResolvedIds((prev) =>
+      prev.size === pendingResolved.length ? new Set() : new Set(pendingResolved.map((m) => m._id))
+    );
+  };
+
+  const toggleSelectUnresolved = (id: string) => {
+    setSelectedUnresolvedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleSelectAllUnresolved = () => {
+    setSelectedUnresolvedIds((prev) =>
+      prev.size === filteredPendingUnresolved.length ? new Set() : new Set(filteredPendingUnresolved.map((m) => m._id))
+    );
+  };
+
+  // Shared by both bulk actions - PATCHes one match, no per-row confirm/alert
+  // (the caller shows one combined dialog/summary for the whole batch
+  // instead of N stacked browser popups). Resolves the id on success so the
+  // caller can remove exactly the ones that actually succeeded.
+  const patchMatch = async (id: string, body: any): Promise<string> => {
+    const res = await fetch(`/api/reconciliation/matches/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || "Action failed");
+    return id;
+  };
+
+  // Shared by every bulk action regardless of which table/selection it comes
+  // from - PATCHes every selected row in parallel, removes exactly the ones
+  // that succeeded, and reports a combined success/failure summary instead
+  // of N stacked alerts.
+  const runBulkAction = async (
+    label: string,
+    selected: Match[],
+    confirmMessage: string,
+    bodyFor: (m: Match) => any,
+    clearSelection: () => void
+  ) => {
+    if (selected.length === 0) return;
+    if (!confirm(confirmMessage.replace("{n}", String(selected.length)))) return;
+
+    setBulkBusy(true);
+    const results = await Promise.allSettled(selected.map((m) => patchMatch(m._id, bodyFor(m))));
+    const succeededIds = new Set(
+      results.filter((r): r is PromiseFulfilledResult<string> => r.status === "fulfilled").map((r) => r.value)
+    );
+    const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+
+    if (succeededIds.size > 0) {
+      setMatches((prev) => prev.filter((m) => !succeededIds.has(m._id)));
+      refreshSellers();
+      refreshOrders();
+    }
+    clearSelection();
+    setBulkBusy(false);
+
+    if (failures.length > 0) {
+      alert(
+        `${succeededIds.size} ${label}, ${failures.length} failed:\n` +
+          failures.map((f) => f.reason?.message || "Unknown error").join("\n")
+      );
+    }
+  };
+
+  const handleBulkConfirm = () =>
+    runBulkAction(
+      "confirmed",
+      pendingResolved.filter((m) => selectedResolvedIds.has(m._id)),
+      "Confirm {n} selected match(es)?",
+      (m) => {
+        const edit = getEdit(m);
+        return {
+          action: "confirm",
+          correctedType: edit.correctedType || null,
+          deductionAmount: Number(edit.deductionAmount) || 0,
+          deductionReason: edit.deductionReason,
+          userName: currentUsername,
+        };
+      },
+      () => setSelectedResolvedIds(new Set())
+    );
+
+  const handleBulkReject = () =>
+    runBulkAction(
+      "rejected",
+      pendingResolved.filter((m) => selectedResolvedIds.has(m._id)),
+      "Reject {n} selected match(es)?",
+      () => ({ action: "reject", userName: currentUsername }),
+      () => setSelectedResolvedIds(new Set())
+    );
+
+  const handleBulkTag = () => {
+    if (!bulkTagValue) {
+      alert("Pick a reason first.");
+      return;
+    }
+    const tagOption = TAG_OPTIONS.find((t) => t.value === bulkTagValue);
+    runBulkAction(
+      `tagged "${tagOption?.label || bulkTagValue}"`,
+      pendingUnresolved.filter((m) => selectedUnresolvedIds.has(m._id)),
+      `Tag {n} selected transaction(s) as "${tagOption?.label || bulkTagValue}"?`,
+      () => ({ action: "tag", tag: bulkTagValue, userName: currentUsername }),
+      () => {
+        setSelectedUnresolvedIds(new Set());
+        setBulkTagValue("");
+      }
+    );
+  };
+
+  const handleReverse = (m: Match) => {
+    if (!confirm("Reverse this confirmed match? The bill's payment status will be rolled back.")) return;
+    runAction(m._id, `/api/reconciliation/matches/${m._id}`, { action: "reverse", userName: currentUsername });
+  };
+
+  const handleTag = (m: Match, tag: string) => {
+    if (!tag) {
+      alert("Pick a reason first.");
+      return;
+    }
+    runAction(m._id, `/api/reconciliation/matches/${m._id}`, { action: "tag", tag, userName: currentUsername });
+  };
+
+  const handleUntag = (m: Match) => {
+    if (!confirm("Send this back to Pending Review for matching?")) return;
+    runAction(m._id, `/api/reconciliation/matches/${m._id}`, { action: "untag", userName: currentUsername });
+  };
+
+  // Assigns institute (+ bill, if picked) AND immediately confirms it in the
+  // same click - a manual pick here already IS the user's deliberate
+  // decision, so a second separate "now click Confirm" step was just
+  // friction (and for a link-only pick with no bill chosen, there was no
+  // Confirm option at all - it sat in Unmatched forever with no visible way
+  // forward, reading as "the button does nothing").
+  const handleSaveManual = async (m: Match) => {
+    const man = getManual(m);
+    if (!man.sellerId) {
+      alert("Select an institute first.");
+      return;
+    }
+    setBusyId(m._id);
+    try {
+      const res = await fetch("/api/reconciliation/matches", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          matchId: m._id,
+          sellerId: man.sellerId,
+          billId: man.comboBillIds.length > 0 ? undefined : man.billId || undefined,
+          billIds: man.comboBillIds.length > 0 ? man.comboBillIds : undefined,
+          deductionType: man.deductionType || undefined,
+          deductionAmount: man.deductionAmount ? Number(man.deductionAmount) : undefined,
+          deductionReason: man.deductionReason,
+          userName: currentUsername,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed to save");
+
+      const confirmRes = await fetch(`/api/reconciliation/matches/${m._id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "confirm",
+          correctedType: man.deductionType || null,
+          deductionAmount: man.deductionAmount ? Number(man.deductionAmount) : 0,
+          deductionReason: man.deductionReason,
+          userName: currentUsername,
+        }),
+      });
+      const confirmData = await confirmRes.json();
+      if (!confirmRes.ok) throw new Error(confirmData?.error || "Saved the match but failed to confirm it");
+
+      // Drop the row locally instead of fetchMatches() - same reasoning as
+      // runAction above: a full re-fetch flips `loading` and blanks the whole
+      // table with a spinner, and re-sorts/re-shuffles every other row mid-
+      // workflow while confirming several entries back to back. This row just
+      // moved to "confirmed" either way, so it no longer belongs here.
+      setMatches((prev) => prev.filter((match) => match._id !== m._id));
+      refreshSellers();
+      refreshOrders();
+    } catch (err: any) {
+      alert(err.message || "Failed to save");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const toggleAutoApprove = async (seller: SellerRecord) => {
+    try {
+      await fetch("/api/sellers", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ _id: seller._id, autoApproveTrusted: !seller.autoApproveTrusted }),
+      });
+      refreshSellers();
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const pendingResolved = matches.filter((m) => m.status === "pending" && m.sellerId && m.billIds.length > 0);
+  // A rejected match always lands here (regardless of whatever stale
+  // sellerId/billIds it still carries from before) - that institute/bill
+  // pairing was explicitly marked wrong, so it always needs a fresh manual
+  // pick rather than showing up ready to Confirm again.
+  const pendingUnresolved = matches.filter(
+    (m) => (m.status === "pending" && (!m.sellerId || m.billIds.length === 0)) || m.status === "rejected"
+  );
+  const filteredPendingUnresolved = (() => {
+    const q = unresolvedSearch.trim().toLowerCase();
+    if (!q) return pendingUnresolved;
+    return pendingUnresolved.filter((m) => {
+      if ((m.transactionDescription || "").toLowerCase().includes(q)) return true;
+      if ((m.instituteName || "").toLowerCase().includes(q)) return true;
+      const manualInstitute = manualState[m._id]?.sellerId ? sellerById[manualState[m._id].sellerId]?.instituteName : "";
+      if ((manualInstitute || "").toLowerCase().includes(q)) return true;
+      return (m.ambiguousCandidates || []).some((c) => c.instituteName.toLowerCase().includes(q));
+    });
+  })();
+
+  const handleExcludedSort = (key: string) => {
+    setExcludedSort((prev) => ({
+      key,
+      direction: prev.key === key && prev.direction === "asc" ? "desc" : "asc",
+    }));
+  };
+
+  const getExcludedSortIcon = (col: string) => {
+    if (excludedSort.key !== col)
+      return <FiArrowDown size={9} className="inline ml-1 opacity-25 group-hover:opacity-60 transition-opacity" />;
+    return excludedSort.direction === "asc" ? (
+      <FiArrowUp size={9} className="inline ml-1 text-blue-500" />
+    ) : (
+      <FiArrowDown size={9} className="inline ml-1 text-blue-500" />
+    );
+  };
+
+  // Not A Bill tab: filtered then sorted on top of `matches` (already
+  // server-scoped to the active tab).
+  const filteredExcludedMatches = (() => {
+    const descQ = excludedDescSearch.trim().toLowerCase();
+    const tagQ = excludedTagSearch.trim().toLowerCase();
+    const amountQ = excludedAmountSearch.trim().toLowerCase();
+    return matches.filter((m) => {
+      if (descQ && !(m.transactionDescription || "").toLowerCase().includes(descQ)) return false;
+      if (tagQ && !tagLabel(m.tag).toLowerCase().includes(tagQ)) return false;
+      if (amountQ && !formatMoney(m.creditedAmount).toLowerCase().includes(amountQ)) return false;
+      return true;
+    });
+  })();
+
+  const sortedExcludedMatches = (() => {
+    if (!excludedSort.key) return filteredExcludedMatches;
+    const key = excludedSort.key;
+    return [...filteredExcludedMatches].sort((a, b) => {
+      let aVal: any;
+      let bVal: any;
+      if (key === "credited") {
+        aVal = a.creditedAmount || 0;
+        bVal = b.creditedAmount || 0;
+      } else if (key === "date") {
+        aVal = parseDateToSortable(a.transactionDate) || 0;
+        bVal = parseDateToSortable(b.transactionDate) || 0;
+      } else if (key === "tag") {
+        aVal = tagLabel(a.tag).toLowerCase();
+        bVal = tagLabel(b.tag).toLowerCase();
+      } else {
+        aVal = (a.transactionDescription || "").toLowerCase();
+        bVal = (b.transactionDescription || "").toLowerCase();
+      }
+      if (typeof aVal === "number" && typeof bVal === "number") {
+        return excludedSort.direction === "asc" ? aVal - bVal : bVal - aVal;
+      }
+      if (aVal < bVal) return excludedSort.direction === "asc" ? -1 : 1;
+      if (aVal > bVal) return excludedSort.direction === "asc" ? 1 : -1;
+      return 0;
+    });
+  })();
+
+  // Confirmed tab: filtered on top of `matches` (already server-scoped to confirmed).
+  const filteredConfirmedMatches = (() => {
+    const dateQ = confirmedDateSearch.trim().toLowerCase();
+    const billQ = confirmedBillSearch.trim().toLowerCase();
+    const instituteQ = confirmedInstituteSearch.trim().toLowerCase();
+    const firmQ = confirmedFirmSearch.trim().toLowerCase();
+    const amountQ = confirmedAmountSearch.trim().toLowerCase();
+    return matches.filter((m) => {
+      if (dateQ && !(m.transactionDate || "").toLowerCase().includes(dateQ)) return false;
+      if (billQ && !(m.billNos || []).join(", ").toLowerCase().includes(billQ)) return false;
+      if (instituteQ && !(m.instituteName || "").toLowerCase().includes(instituteQ)) return false;
+      if (firmQ) {
+        const firmName = (firmNameByCode[m.firmCode] || m.firmCode || "").toLowerCase();
+        if (!firmName.includes(firmQ) && !(m.firmCode || "").toLowerCase().includes(firmQ)) return false;
+      }
+      if (amountQ && !formatMoney(m.creditedAmount).toLowerCase().includes(amountQ)) return false;
+      return true;
+    });
+  })();
+
+  const patternsSeller = patternsFor ? sellerById[patternsFor] : null;
+
+  const openDetails = (m: Match) => {
+    setDetailsFor(m);
+    setDetailsBills([]);
+    setDetailsLoading(true);
+    fetch(`/api/reconciliation/matches/${m._id}`)
+      .then((res) => res.json())
+      .then((data) => setDetailsBills(Array.isArray(data?.bills) ? data.bills : []))
+      .catch((err) => console.error("Failed to load match detail", err))
+      .finally(() => setDetailsLoading(false));
+  };
+  const detailsBillTotal = detailsBills.reduce((sum, b) => sum + (b.totalAmount || 0), 0);
+
+  return (
+    <BlockGuard
+      permission="bankReconciliation"
+      fallback={
+        <div className="flex flex-col items-center gap-2 m-4 p-4 border border-red-200 rounded-xl bg-red-50 text-center">
+          <p className="text-red-500 font-bold uppercase">You have no Access for this Page.</p>
+          <Link
+            href="/dashboard"
+            className="text-sm bg-slate-900 text-white px-4 py-2 mt-4 rounded-lg hover:bg-slate-800 transition-all"
+          >
+            Go to Dashboard
+          </Link>
+        </div>
+      }
+    >
+      <div className="p-4 md:p-8 bg-slate-50 min-h-screen">
+        <div className="max-w-7xl mx-auto flex flex-col gap-6">
+          {/* Header */}
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <Link href="/dashboard/account" className="flex items-center gap-2 text-slate-500 hover:text-blue-600 text-xs mb-2 transition-colors w-fit">
+                <FiArrowLeft /> Back to Account
+              </Link>
+              <h1 className="text-2xl font-black uppercase tracking-tight text-slate-900 flex items-center gap-2">
+                <FiCheckSquare className="text-blue-600" /> Bank Reconciliation
+              </h1>
+              <p className="text-slate-500 text-[10px] uppercase font-bold tracking-widest mt-0.5">
+                Review & Confirm Auto-Matched Payments
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={fetchMatches}
+                className="flex items-center gap-1.5 bg-white hover:bg-slate-100 border border-slate-200 rounded-xl py-2 px-3 text-[11px] font-bold text-slate-600 transition-colors"
+              >
+                <FiRefreshCw size={12} /> Refresh
+              </button>
+              {correctionAlerts.length > 0 && (
+                <button
+                  onClick={() => setShowCorrectionModal(true)}
+                  className="flex items-center gap-1.5 bg-amber-50 hover:bg-amber-100 border border-amber-300 rounded-xl py-2 px-3 text-[11px] font-bold text-amber-800 transition-colors"
+                >
+                  <FiAlertTriangle size={12} /> Correction Alerts
+                  <span className="bg-amber-200 text-amber-800 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                    {correctionAlerts.length}
+                  </span>
+                </button>
+              )}
+              <button
+                onClick={handleRunMatching}
+                disabled={runningMatching}
+                title="Scan statements for new/unmatched payments and (re)generate suggestions"
+                className="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2 px-4 text-[11px] font-black uppercase tracking-wide transition-colors"
+              >
+                <FiRefreshCw size={12} className={runningMatching ? "animate-spin" : ""} />
+                {runningMatching ? runningMatchingProgress || "Running..." : "Run Matching"}
+              </button>
+            </div>
+          </div>
+
+          {/* Filters + Tabs */}
+          <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-4 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-xl p-1">
+              {(["pending", "confirmed", "rejected", "excluded"] as Tab[]).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setTab(t)}
+                  className={`px-4 py-2 rounded-lg text-[11px] font-black uppercase tracking-wide transition-colors ${
+                    tab === t ? "bg-blue-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
+                  }`}
+                >
+                  {t === "pending" ? "Pending Review" : t === "excluded" ? "Not A Bill" : t}
+                </button>
+              ))}
+            </div>
+            <select
+              value={firmFilter}
+              onChange={(e) => setFirmFilter(e.target.value)}
+              className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs text-slate-700 focus:outline-none focus:border-blue-500 font-bold"
+            >
+              <option value="">All Firms</option>
+              {companies.map((c) => (
+                <option key={c._id} value={c.firmCode}>
+                  {c.firmName} {c.firmCode ? `(${c.firmCode})` : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {loading ? (
+            <div className="flex justify-center items-center py-12">
+              <div className="animate-spin rounded-full h-6 w-6 border-t-2 border-blue-500"></div>
+            </div>
+          ) : tab === "pending" || tab === "rejected" ? (
+            <>
+
+              {/* Pending Review table - N/A on the Rejected tab, since a
+                  rejected match always needs a fresh manual pick (see
+                  pendingUnresolved below) and never lands here. */}
+              {tab === "pending" && (
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+                <div className="p-5 border-b border-slate-100 flex items-center justify-between flex-wrap gap-3">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                    <FiCheckCircle className="text-blue-600" size={14} /> Pending Review
+                    <span className="bg-slate-100 text-slate-600 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                      {pendingResolved.length}
+                    </span>
+                  </h3>
+                  {selectedResolvedIds.size > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-black uppercase text-slate-500 tracking-wide">
+                        {selectedResolvedIds.size} selected
+                      </span>
+                      <button
+                        disabled={bulkBusy}
+                        onClick={handleBulkConfirm}
+                        className="flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                      >
+                        <FiCheckCircle size={12} /> Confirm Selected
+                      </button>
+                      <button
+                        disabled={bulkBusy}
+                        onClick={handleBulkReject}
+                        className="flex items-center gap-1 bg-red-50 hover:bg-red-100 disabled:opacity-40 text-red-600 border border-red-200 font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                      >
+                        <FiXCircle size={12} /> Reject Selected
+                      </button>
+                      <button
+                        disabled={bulkBusy}
+                        onClick={() => setSelectedResolvedIds(new Set())}
+                        className="text-[10px] font-black uppercase text-slate-400 hover:text-slate-700 tracking-wide px-2"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {pendingResolved.length === 0 ? (
+                  <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">
+                    Nothing to review
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+                          <th className="py-2.5 px-3">
+                            <input
+                              type="checkbox"
+                              checked={pendingResolved.length > 0 && selectedResolvedIds.size === pendingResolved.length}
+                              onChange={toggleSelectAllResolved}
+                              className="w-3.5 h-3.5 accent-blue-600 cursor-pointer"
+                              title="Select all"
+                            />
+                          </th>
+                          <th className="py-2.5 px-3">Firm</th>
+                          <th className="py-2.5 px-3">Bill No</th>
+                          <th className="py-2.5 px-3">Institute</th>
+                          <th className="py-2.5 px-3 text-right">Bill Amt</th>
+                          <th className="py-2.5 px-3 text-right">Credited Amt</th>
+                          <th className="py-2.5 px-3 text-right">Deduction</th>
+                          <th className="py-2.5 px-3">Type</th>
+                          <th className="py-2.5 px-3">Confidence</th>
+                          <th className="py-2.5 px-3 text-center">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {pendingResolved.map((m) => {
+                          const edit = getEdit(m);
+                          const isKasar = edit.correctedType === "Kasar";
+                          return (
+                            <tr
+                              key={m._id}
+                              className={`transition-colors align-top ${
+                                selectedResolvedIds.has(m._id) ? "bg-blue-50" : "hover:bg-blue-50/40"
+                              }`}
+                            >
+                              <td className="py-2.5 px-3">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedResolvedIds.has(m._id)}
+                                  onChange={() => toggleSelectResolved(m._id)}
+                                  className="w-3.5 h-3.5 accent-blue-600 cursor-pointer"
+                                />
+                              </td>
+                              <td className="py-2.5 px-3 font-black text-slate-700 uppercase">
+                                {m.firmCode}
+                                {m.statementId && accountLast4ByStatementId[m.statementId] && (
+                                  <span className="block text-[9px] font-bold text-slate-400 normal-case">
+                                    a/c •{accountLast4ByStatementId[m.statementId]}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-slate-700">
+                                {m.billNos.join(", ") || "—"}
+                                {m.billIds.length > 1 && (
+                                  <span className="block text-[9px] text-purple-600 font-bold uppercase">combo match</span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <div className="flex items-center gap-1">
+                                  <button
+                                    onClick={() => setPatternsFor(m.sellerId)}
+                                    className="text-blue-700 font-bold hover:underline text-left"
+                                  >
+                                    {m.instituteName}
+                                  </button>
+                                  <button
+                                    onClick={() => setClusterViewFor(m.sellerId)}
+                                    title="View order clusters"
+                                    className="text-slate-400 hover:text-purple-600 transition-colors"
+                                  >
+                                    <FiLayers size={11} />
+                                  </button>
+                                </div>
+                                <div className="text-[9px] text-slate-400 truncate max-w-[180px]" title={m.transactionDescription}>
+                                  {m.transactionDescription}
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono">₹{formatMoney(m.billAmount)}</td>
+                              <td className="py-2.5 px-3 text-right font-mono text-emerald-700">₹{formatMoney(m.creditedAmount)}</td>
+                              <td className="py-2.5 px-3 text-right">
+                                <input
+                                  type="number"
+                                  value={edit.deductionAmount}
+                                  onChange={(e) => setEdit(m._id, { deductionAmount: e.target.value })}
+                                  className="w-24 bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-right font-mono text-xs focus:outline-none focus:border-blue-500"
+                                />
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <select
+                                  value={edit.correctedType}
+                                  onChange={(e) => setEdit(m._id, { correctedType: e.target.value })}
+                                  className="bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-xs font-bold focus:outline-none focus:border-blue-500"
+                                >
+                                  <option value="">None</option>
+                                  {DEDUCTION_TYPES.map((t) => (
+                                    <option key={t} value={t}>{t}</option>
+                                  ))}
+                                </select>
+                                {isKasar && (
+                                  <input
+                                    type="text"
+                                    placeholder="Reason..."
+                                    value={edit.deductionReason}
+                                    onChange={(e) => setEdit(m._id, { deductionReason: e.target.value })}
+                                    className="mt-1 w-32 bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-[10px] focus:outline-none focus:border-blue-500"
+                                  />
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <span className={`inline-block border text-[9px] font-black uppercase px-2 py-0.5 rounded-full ${confidencePill(m.confidenceLabel)}`}>
+                                  {m.confidenceLabel}
+                                </span>
+                                {m.highConfidence && (
+                                  <span
+                                    title="Amount, date and keyword all match this institute's learned pattern — still needs your Confirm click."
+                                    className="ml-1 inline-block border border-purple-200 bg-purple-50 text-purple-700 text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full"
+                                  >
+                                    ⚡ fast-track
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <div className="flex items-center justify-center gap-1.5">
+                                  <button
+                                    onClick={() => openDetails(m)}
+                                    className="p-2 rounded-lg bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200 transition-colors"
+                                    title="View credited transaction + bill details"
+                                  >
+                                    <FiFileText size={13} />
+                                  </button>
+                                  <button
+                                    disabled={busyId === m._id}
+                                    onClick={() => handleConfirm(m)}
+                                    className="p-2 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-colors disabled:opacity-40"
+                                    title="Confirm"
+                                  >
+                                    <FiCheckCircle size={13} />
+                                  </button>
+                                  <button
+                                    disabled={busyId === m._id}
+                                    onClick={() => handleReject(m)}
+                                    className="p-2 rounded-lg bg-red-50 hover:bg-red-100 text-red-600 border border-red-200 transition-colors disabled:opacity-40"
+                                    title="Reject"
+                                  >
+                                    <FiXCircle size={13} />
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+              )}
+
+              {/* Unmatched Transactions - also holds Rejected-tab rows, since
+                  those always need a fresh manual institute/bill pick. */}
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+                <div className="p-5 border-b border-slate-100 flex items-center justify-between flex-wrap gap-3">
+                  <div>
+                    <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                      <FiAlertTriangle className="text-amber-500" size={14} /> {tab === "rejected" ? "Rejected — Pick A Different Bill" : "Unmatched Transactions"}
+                      <span className="bg-slate-100 text-slate-600 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                        {filteredPendingUnresolved.length}
+                        {unresolvedSearch.trim() && ` / ${pendingUnresolved.length}`}
+                      </span>
+                    </h3>
+                    <p className="text-[10px] text-slate-400 mt-1">
+                      {tab === "rejected"
+                        ? "The earlier suggestion for these was wrong - pick the correct institute + bill below."
+                        : "Assign an institute + bill manually — the description's keyword is learned as a new alias for next time."}
+                    </p>
+                  </div>
+                  <div className="relative flex-1 min-w-[220px] max-w-sm">
+                    <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
+                    <input
+                      type="text"
+                      value={unresolvedSearch}
+                      onChange={(e) => setUnresolvedSearch(e.target.value)}
+                      placeholder="Search description or institute..."
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg py-2 pl-8 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                    />
+                    {unresolvedSearch && (
+                      <button
+                        type="button"
+                        onClick={() => setUnresolvedSearch("")}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-700"
+                      >
+                        <FiX size={13} />
+                      </button>
+                    )}
+                  </div>
+                  {selectedUnresolvedIds.size > 0 && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] font-black uppercase text-slate-500 tracking-wide">
+                        {selectedUnresolvedIds.size} selected
+                      </span>
+                      <select
+                        value={bulkTagValue}
+                        onChange={(e) => setBulkTagValue(e.target.value)}
+                        className="bg-slate-50 border border-slate-200 rounded-lg py-2 px-2 text-[10px] font-bold focus:outline-none focus:border-rose-400"
+                      >
+                        <option value="">Not a bill…</option>
+                        {TAG_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                        ))}
+                      </select>
+                      <button
+                        disabled={bulkBusy || !bulkTagValue}
+                        onClick={handleBulkTag}
+                        className="flex items-center gap-1 bg-rose-50 hover:bg-rose-100 disabled:opacity-40 text-rose-700 border border-rose-200 font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                      >
+                        Tag Selected
+                      </button>
+                      <button
+                        disabled={bulkBusy}
+                        onClick={() => { setSelectedUnresolvedIds(new Set()); setBulkTagValue(""); }}
+                        className="text-[10px] font-black uppercase text-slate-400 hover:text-slate-700 tracking-wide px-2"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {filteredPendingUnresolved.length === 0 ? (
+                  <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">
+                    {unresolvedSearch.trim() ? "No matches for this search" : "Nothing unmatched"}
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+                          <th className="py-2.5 px-3">
+                            <input
+                              type="checkbox"
+                              checked={filteredPendingUnresolved.length > 0 && selectedUnresolvedIds.size === filteredPendingUnresolved.length}
+                              onChange={toggleSelectAllUnresolved}
+                              className="w-3.5 h-3.5 accent-blue-600 cursor-pointer"
+                              title="Select all"
+                            />
+                          </th>
+                          <th className="py-2.5 px-3">Date</th>
+                          <th className="py-2.5 px-3">Firm</th>
+                          <th className="py-2.5 px-3">Description</th>
+                          <th className="py-2.5 px-3 text-right">Credited</th>
+                          <th className="py-2.5 px-3">Institute</th>
+                          <th className="py-2.5 px-3">Bill</th>
+                          <th className="py-2.5 px-3">Deduction</th>
+                          <th className="py-2.5 px-3 text-center">Save</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {filteredPendingUnresolved.map((m) => {
+                          const man = getManual(m);
+                          const bills = openBillsFor(sellerById[man.sellerId]?.instituteName || null, m.firmCode, m.transactionDate);
+                          return (
+                            <tr
+                              key={m._id}
+                              className={`transition-colors align-top ${
+                                selectedUnresolvedIds.has(m._id) ? "bg-blue-50" : "hover:bg-amber-50/30"
+                              }`}
+                            >
+                              <td className="py-2.5 px-3">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedUnresolvedIds.has(m._id)}
+                                  onChange={() => toggleSelectUnresolved(m._id)}
+                                  className="w-3.5 h-3.5 accent-blue-600 cursor-pointer"
+                                />
+                              </td>
+                              <td className="py-2.5 px-3 font-mono text-slate-600">{m.transactionDate}</td>
+                              <td className="py-2.5 px-3 font-black text-slate-700 uppercase">
+                                {m.firmCode}
+                                {m.statementId && accountLast4ByStatementId[m.statementId] && (
+                                  <span className="block text-[9px] font-bold text-slate-400 normal-case">
+                                    a/c •{accountLast4ByStatementId[m.statementId]}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-700 max-w-[280px] whitespace-normal break-words">
+                                {m.transactionDescription}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono text-emerald-700">₹{formatMoney(m.creditedAmount)}</td>
+                              <td className="py-2.5 px-3">
+                                {m.isAmbiguous && (() => {
+                                  // An institute with zero open orders can never be the right
+                                  // match for a bill-needing payment - no point cluttering the
+                                  // suggestion list with it (confirmed live: GORWA MAHILA ITI's
+                                  // row buried its one real candidate under 5 empty ones). It's
+                                  // still reachable via the plain "Select Institute..." dropdown
+                                  // below if genuinely needed (e.g. link-only, no bill).
+                                  const visibleCandidates = (m.ambiguousCandidates || []).filter(
+                                    (c) => openBillsFor(c.instituteName, m.firmCode, m.transactionDate).length > 0
+                                  );
+                                  if (visibleCandidates.length === 0) return null;
+                                  return (
+                                  <div className="flex flex-col gap-1 mb-1.5 max-w-[240px]">
+                                    <span className="text-[9px] font-black uppercase text-amber-600 flex items-center gap-1">
+                                      <FiAlertTriangle size={10} /> Ambiguous — pick one
+                                    </span>
+                                    {visibleCandidates.map((c) => {
+                                      const candidateBills = openBillsFor(c.instituteName, m.firmCode, m.transactionDate);
+                                      // Sum of the specific matched bills' remaining amounts, so the
+                                      // user can sanity-check the combo against the credited amount
+                                      // right here instead of opening View Orders to add it up.
+                                      const matchedTotal =
+                                        c.matchedBillNos && c.matchedBillNos.length > 0
+                                          ? candidateBills
+                                              .filter((b) => c.matchedBillNos!.includes(b.orderNo))
+                                              .reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0)
+                                          : null;
+                                      // Even selecting EVERY open order for this institute wouldn't
+                                      // reach the credited amount - no possible combo can explain this
+                                      // payment, so flag it rather than let the user discover that
+                                      // only after opening View Orders.
+                                      const candidateBillsTotal = candidateBills.reduce(
+                                        (sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)),
+                                        0
+                                      );
+                                      const insufficientBills = candidateBillsTotal < m.creditedAmount;
+                                      return (
+                                      <div
+                                        key={c.sellerId}
+                                        className={`border rounded-lg overflow-hidden transition-colors ${
+                                          man.sellerId === c.sellerId
+                                            ? "bg-blue-50 border-blue-400"
+                                            : insufficientBills
+                                            ? "bg-slate-50 border-slate-200 opacity-70"
+                                            : "bg-white border-slate-200 hover:border-blue-300"
+                                        }`}
+                                      >
+                                        <div className="flex items-start justify-between gap-1 px-2 py-1">
+                                          <button
+                                            type="button"
+                                            onClick={() => selectCandidate(m, c)}
+                                            className="text-left flex-1 min-w-0"
+                                          >
+                                            <span className="block text-[10px] font-bold text-slate-800">{c.instituteName}</span>
+                                            {insufficientBills ? (
+                                              <span className="block text-[9px] font-bold text-red-500">
+                                                Open orders total ₹{formatMoney(candidateBillsTotal)} — less than credited
+                                              </span>
+                                            ) : (
+                                              <span className="text-[9px] text-slate-400">
+                                                {c.amountFit ? "amount fits" : "amount unclear"} · {c.dateFit ? "date fits" : "date unclear"}
+                                              </span>
+                                            )}
+                                            {c.matchedBillNos && c.matchedBillNos.length > 0 && (
+                                              <span className="block text-[9px] font-bold text-emerald-700">
+                                                ✓ matches {c.matchedBillNos.join(", ")}
+                                                {matchedTotal != null && ` — ₹${formatMoney(matchedTotal)}`}
+                                              </span>
+                                            )}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => openLedgerModal(m, c.sellerId, c.instituteName, c.matchedBillNos)}
+                                            className="shrink-0 text-[8px] font-black uppercase text-blue-600 hover:text-blue-800 whitespace-nowrap"
+                                          >
+                                            View Orders ▾
+                                          </button>
+                                        </div>
+                                      </div>
+                                      );
+                                    })}
+                                  </div>
+                                  );
+                                })()}
+                                <select
+                                  value={man.sellerId}
+                                  onChange={(e) => setManual(m, { sellerId: e.target.value, billId: "", comboBillIds: [], comboBillNos: [] })}
+                                  className="bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-xs font-bold focus:outline-none focus:border-blue-500 max-w-[160px]"
+                                >
+                                  <option value="">Select Institute...</option>
+                                  {sellers.map((s) => (
+                                    <option key={s._id} value={s._id}>{s.instituteName}</option>
+                                  ))}
+                                </select>
+                                {man.sellerId && (() => {
+                                  const selectedInstituteName = sellerById[man.sellerId]?.instituteName || "";
+                                  return (
+                                    <button
+                                      type="button"
+                                      onClick={() => openLedgerModal(m, man.sellerId, selectedInstituteName)}
+                                      className="block mt-1 text-[8px] font-black uppercase text-blue-600 hover:text-blue-800"
+                                    >
+                                      View Orders ▾
+                                    </button>
+                                  );
+                                })()}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                {man.comboBillIds.length > 0 ? (
+                                  <div className="flex flex-col gap-1 max-w-[180px]">
+                                    <span className="inline-block bg-purple-50 border border-purple-200 text-purple-700 text-[9px] font-black px-2 py-1 rounded-lg">
+                                      {man.comboBillIds.length} bills (combo): {man.comboBillNos.join(", ")}
+                                      {" — ₹"}
+                                      {formatMoney(
+                                        bills
+                                          .filter((b) => man.comboBillIds.includes(b._id))
+                                          .reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0)
+                                      )}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        man.sellerId &&
+                                        openLedgerModal(m, man.sellerId, sellerById[man.sellerId]?.instituteName || "", man.comboBillNos)
+                                      }
+                                      className="text-[8px] font-black uppercase text-blue-600 hover:text-blue-800 self-start"
+                                    >
+                                      Change Selection
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="flex flex-col gap-1 max-w-[180px]">
+                                    <select
+                                      value={man.billId}
+                                      onChange={(e) => {
+                                        const billId = e.target.value;
+                                        const rate = DEDUCTION_RATES[man.deductionType];
+                                        setManual(m, {
+                                          billId,
+                                          ...(rate
+                                            ? { deductionAmount: (selectedBillsTotal(bills, { billId, comboBillIds: [] }) * rate).toFixed(2) }
+                                            : {}),
+                                        });
+                                      }}
+                                      disabled={!man.sellerId}
+                                      className="bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-xs font-bold focus:outline-none focus:border-blue-500 max-w-[160px] disabled:opacity-40"
+                                    >
+                                      <option value="">No bill (link only)</option>
+                                      {bills.map((b) => (
+                                        <option key={b._id} value={b._id}>
+                                          {b.orderNo} — ₹{formatMoney(b.totalAmount - (b.paidAmount || 0))}
+                                          {b.billExemptReason === "ALREADY_BILLED_EXTERNAL" ? " (Already billed outside OMS)" : ""}
+                                          {pickedElsewhere(b._id, m._id) ? " ⚠ picked elsewhere" : ""}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    {man.sellerId && (
+                                      <button
+                                        type="button"
+                                        onClick={() => openLedgerModal(m, man.sellerId, sellerById[man.sellerId]?.instituteName || "")}
+                                        className="text-[8px] font-black uppercase text-blue-600 hover:text-blue-800 self-start"
+                                      >
+                                        Select Multiple Bills...
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <div className="flex flex-col gap-1">
+                                  <select
+                                    value={man.deductionType}
+                                    onChange={(e) => {
+                                      const deductionType = e.target.value;
+                                      const rate = DEDUCTION_RATES[deductionType];
+                                      setManual(m, {
+                                        deductionType,
+                                        ...(rate ? { deductionAmount: (selectedBillsTotal(bills, man) * rate).toFixed(2) } : {}),
+                                      });
+                                    }}
+                                    className="bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-xs font-bold focus:outline-none focus:border-blue-500"
+                                  >
+                                    <option value="">None</option>
+                                    {DEDUCTION_TYPES.map((t) => (
+                                      <option key={t} value={t}>{t}</option>
+                                    ))}
+                                  </select>
+                                  <input
+                                    type="number"
+                                    placeholder="Amt"
+                                    value={man.deductionAmount}
+                                    onChange={(e) => setManual(m, { deductionAmount: e.target.value })}
+                                    className="w-24 bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-xs font-mono focus:outline-none focus:border-blue-500"
+                                  />
+                                  {(() => {
+                                    // Remaining = what's left of the CREDITED (bank) amount after
+                                    // applying it to the selected bill(s), net of the deduction - not
+                                    // the bill's own due amount, since the point is to catch a bank
+                                    // shortfall/overpayment against what was actually credited. The
+                                    // deduction is ADDED back, not subtracted again: a TDS/Kasar
+                                    // deduction is why the bill total is already bigger than what got
+                                    // credited (credited = billTotal - deduction when it's a clean
+                                    // match), so subtracting it a second time here double-counted it -
+                                    // confirmed live: a ₹79,195 combo with ₹1,583.90 TDS (2%) against a
+                                    // ₹77,611 credit is a clean match (nets to ~₹0), but the old minus
+                                    // formula showed a confusing ₹-3,167.90 "remaining".
+                                    const total = selectedBillsTotal(bills, man);
+                                    const remaining = m.creditedAmount - total + (Number(man.deductionAmount) || 0);
+                                    if (total <= 0 || Math.abs(remaining) < 0.01) return null;
+                                    return (
+                                      <span className={`text-[9px] font-black font-mono ${remaining < 0 ? "text-red-600" : "text-amber-600"}`}>
+                                        Remaining: ₹{formatMoney(remaining)}
+                                      </span>
+                                    );
+                                  })()}
+                                </div>
+                              </td>
+                              <td className="py-2.5 px-3 text-center">
+                                <div className="flex flex-col items-center gap-1.5">
+                                  <button
+                                    disabled={busyId === m._id || !man.sellerId}
+                                    onClick={() => handleSaveManual(m)}
+                                    title={!man.sellerId ? "Select an institute first" : undefined}
+                                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                                  >
+                                    Save & Confirm
+                                  </button>
+                                  {m.status !== "rejected" && (
+                                    <button
+                                      disabled={busyId === m._id}
+                                      onClick={() => handleReject(m)}
+                                      title="No institute/bill applies here (e.g. a personal transfer) - remove it from this list without touching any order"
+                                      className="w-full bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-500 font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                                    >
+                                      Dismiss
+                                    </button>
+                                  )}
+                                  <div className="w-full border-t border-slate-100 mt-1 pt-1.5 flex flex-col gap-1">
+                                    <select
+                                      value={tagState[m._id] || ""}
+                                      onChange={(e) => setTagState((prev) => ({ ...prev, [m._id]: e.target.value }))}
+                                      title="Not a bill payment at all (TDS refund, DD cancellation, interest, a prior year's leftover, etc.) - tagging it stops it reappearing here on every Run Matching pass"
+                                      className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1 px-1.5 text-[10px] font-bold focus:outline-none focus:border-rose-400"
+                                    >
+                                      <option value="">Not a bill…</option>
+                                      {TAG_OPTIONS.map((opt) => (
+                                        <option key={opt.value} value={opt.value}>{opt.label}</option>
+                                      ))}
+                                    </select>
+                                    <button
+                                      disabled={busyId === m._id || !tagState[m._id]}
+                                      onClick={() => handleTag(m, tagState[m._id])}
+                                      className="w-full bg-rose-50 hover:bg-rose-100 disabled:opacity-40 text-rose-700 border border-rose-200 font-black uppercase text-[10px] tracking-wide py-1.5 px-3 rounded-lg transition-colors"
+                                    >
+                                      Tag
+                                    </button>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 border-b border-slate-100">
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 capitalize">
+                  {tab === "excluded" ? "Not A Bill" : `${tab} Matches`}
+                  <span className="ml-2 bg-slate-100 text-slate-600 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                    {tab === "excluded" ? sortedExcludedMatches.length : tab === "confirmed" ? filteredConfirmedMatches.length : matches.length}
+                    {tab === "excluded" &&
+                      (excludedDescSearch.trim() || excludedTagSearch.trim() || excludedAmountSearch.trim()) &&
+                      ` / ${matches.length}`}
+                    {tab === "confirmed" &&
+                      (confirmedDateSearch.trim() || confirmedBillSearch.trim() || confirmedInstituteSearch.trim() || confirmedFirmSearch.trim() || confirmedAmountSearch.trim()) &&
+                      ` / ${matches.length}`}
+                  </span>
+                  {tab === "confirmed" && matches.some((m) => m.highConfidence) && (
+                    <span className="ml-2 bg-purple-50 border border-purple-200 text-purple-700 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                      ⚡ {matches.filter((m) => m.highConfidence).length} fast-tracked
+                    </span>
+                  )}
+                </h3>
+                {tab === "excluded" && (
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    <div className="relative flex-1 min-w-[160px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={excludedDescSearch}
+                        onChange={(e) => setExcludedDescSearch(e.target.value)}
+                        placeholder="Search description..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[160px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={excludedTagSearch}
+                        onChange={(e) => setExcludedTagSearch(e.target.value)}
+                        placeholder="Search tag..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[160px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={excludedAmountSearch}
+                        onChange={(e) => setExcludedAmountSearch(e.target.value)}
+                        placeholder="Search credited amount..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                  </div>
+                )}
+                {tab === "confirmed" && (
+                  <div className="flex flex-wrap gap-2 mt-3">
+                    <div className="relative flex-1 min-w-[140px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={confirmedDateSearch}
+                        onChange={(e) => setConfirmedDateSearch(e.target.value)}
+                        placeholder="Search date..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[140px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={confirmedBillSearch}
+                        onChange={(e) => setConfirmedBillSearch(e.target.value)}
+                        placeholder="Search bill no..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[140px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={confirmedInstituteSearch}
+                        onChange={(e) => setConfirmedInstituteSearch(e.target.value)}
+                        placeholder="Search institute..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[140px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={confirmedFirmSearch}
+                        onChange={(e) => setConfirmedFirmSearch(e.target.value)}
+                        placeholder="Search firm..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                    <div className="relative flex-1 min-w-[140px] max-w-xs">
+                      <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={12} />
+                      <input
+                        type="text"
+                        value={confirmedAmountSearch}
+                        onChange={(e) => setConfirmedAmountSearch(e.target.value)}
+                        placeholder="Search credited amount..."
+                        className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 pl-7 pr-3 text-[11px] font-bold focus:outline-none focus:border-blue-400"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+              {matches.length === 0 ? (
+                <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">No records</div>
+              ) : tab === "excluded" && sortedExcludedMatches.length === 0 ? (
+                <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">No matches for this search</div>
+              ) : tab === "confirmed" && filteredConfirmedMatches.length === 0 ? (
+                <div className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">No matches for this search</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+                        <th
+                          className={`py-2.5 px-3 ${tab === "excluded" ? "cursor-pointer select-none hover:bg-slate-100 group" : ""}`}
+                          onClick={tab === "excluded" ? () => handleExcludedSort("date") : undefined}
+                        >
+                          Date {tab === "excluded" && getExcludedSortIcon("date")}
+                        </th>
+                        {tab === "excluded" ? (
+                          <>
+                            <th
+                              className="py-2.5 px-3 cursor-pointer select-none hover:bg-slate-100 group"
+                              onClick={() => handleExcludedSort("description")}
+                            >
+                              Description {getExcludedSortIcon("description")}
+                            </th>
+                            <th
+                              className="py-2.5 px-3 cursor-pointer select-none hover:bg-slate-100 group"
+                              onClick={() => handleExcludedSort("tag")}
+                            >
+                              Tag {getExcludedSortIcon("tag")}
+                            </th>
+                          </>
+                        ) : (
+                          <>
+                            <th className="py-2.5 px-3">Bill No</th>
+                            <th className="py-2.5 px-3">Institute</th>
+                            {tab === "confirmed" && <th className="py-2.5 px-3">Firm</th>}
+                          </>
+                        )}
+                        <th
+                          className={`py-2.5 px-3 text-right ${tab === "excluded" ? "cursor-pointer select-none hover:bg-slate-100 group" : ""}`}
+                          onClick={tab === "excluded" ? () => handleExcludedSort("credited") : undefined}
+                        >
+                          Credited {tab === "excluded" && getExcludedSortIcon("credited")}
+                        </th>
+                        {tab !== "excluded" && <th className="py-2.5 px-3 text-right">Deduction</th>}
+                        {tab !== "excluded" && <th className="py-2.5 px-3">Type</th>}
+                        {tab === "confirmed" && <th className="py-2.5 px-3 text-center">Fast-track</th>}
+                        {(tab === "confirmed" || tab === "excluded") && <th className="py-2.5 px-3 text-center">Actions</th>}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {(tab === "excluded" ? sortedExcludedMatches : tab === "confirmed" ? filteredConfirmedMatches : matches).map((m) => (
+                        <tr key={m._id} className="hover:bg-slate-50 transition-colors">
+                          <td className="py-2.5 px-3 font-mono text-slate-600">{m.transactionDate}</td>
+                          {tab === "excluded" ? (
+                            <>
+                              <td className="py-2.5 px-3 text-slate-700 max-w-[320px] whitespace-normal break-words">
+                                {m.transactionDescription}
+                              </td>
+                              <td className="py-2.5 px-3">
+                                <span className="inline-block bg-rose-50 border border-rose-200 text-rose-700 text-[10px] font-black uppercase px-2 py-0.5 rounded-full">
+                                  {tagLabel(m.tag)}
+                                </span>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="py-2.5 px-3 font-mono text-slate-700">{m.billNos.join(", ") || "—"}</td>
+                              <td className="py-2.5 px-3 text-slate-700">{m.instituteName || "—"}</td>
+                              {tab === "confirmed" && (
+                                <td className="py-2.5 px-3 text-slate-700">{firmNameByCode[m.firmCode] || m.firmCode || "—"}</td>
+                              )}
+                            </>
+                          )}
+                          <td className="py-2.5 px-3 text-right font-mono text-emerald-700">₹{formatMoney(m.creditedAmount)}</td>
+                          {tab !== "excluded" && (
+                            <td className="py-2.5 px-3 text-right font-mono text-red-600">
+                              {m.deductionAmount ? `₹${formatMoney(m.deductionAmount)}` : "—"}
+                            </td>
+                          )}
+                          {tab !== "excluded" && <td className="py-2.5 px-3">{m.correctedType || m.deductionType || "—"}</td>}
+                          {tab === "confirmed" && (
+                            <td className="py-2.5 px-3 text-center">{m.highConfidence ? "⚡" : "—"}</td>
+                          )}
+                          {tab === "confirmed" && (
+                            <td className="py-2.5 px-3 text-center">
+                              <div className="flex items-center justify-center gap-1.5">
+                                <button
+                                  onClick={() => openDetails(m)}
+                                  className="p-2 rounded-lg bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200 transition-colors"
+                                  title="View credited transaction + per-bill amount breakdown"
+                                >
+                                  <FiFileText size={13} />
+                                </button>
+                                <button
+                                  disabled={busyId === m._id}
+                                  onClick={() => handleReverse(m)}
+                                  className="inline-flex items-center gap-1 p-2 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 transition-colors disabled:opacity-40"
+                                  title="Reverse"
+                                >
+                                  <FiRotateCcw size={13} />
+                                </button>
+                              </div>
+                            </td>
+                          )}
+                          {tab === "excluded" && (
+                            <td className="py-2.5 px-3 text-center">
+                              <button
+                                disabled={busyId === m._id}
+                                onClick={() => handleUntag(m)}
+                                className="inline-flex items-center gap-1 p-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200 transition-colors disabled:opacity-40"
+                                title="Send back to Pending Review"
+                              >
+                                <FiRotateCcw size={13} />
+                              </button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Correction Alerts modal — leftover-entry-triggered recheck (Addition
+          4). Never auto-reverts anything; always waits for an explicit
+          accept/reject. Opened from the "Correction Alerts" button up top. */}
+      {showCorrectionModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-3xl max-h-[85vh] overflow-hidden shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-amber-100 bg-amber-50/50 flex items-center justify-between">
+              <div>
+                <h3 className="text-xs font-black uppercase tracking-wider text-amber-800 flex items-center gap-1.5">
+                  <FiAlertTriangle className="text-amber-600" size={14} /> Correction Alerts
+                  <span className="bg-amber-100 text-amber-700 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                    {correctionAlerts.length}
+                  </span>
+                </h3>
+                <p className="text-[10px] text-amber-700/80 mt-1">
+                  A payment was left with nothing to match, which suggests an earlier confirmed match in the same
+                  institute picked the wrong bill. Review the suggested swap below — nothing changes until you decide.
+                </p>
+              </div>
+              <button onClick={() => setShowCorrectionModal(false)} className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors shrink-0">
+                <FiX size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto divide-y divide-amber-100">
+              {correctionAlerts.map((a) => (
+                <div key={a._id} className="p-4 flex flex-wrap items-center justify-between gap-3">
+                  <div className="max-w-xl">
+                    <span className="text-[11px] font-bold text-slate-800">{a.instituteName}</span>
+                    <p className="text-[11px] text-slate-600 mt-0.5">{a.reason}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      disabled={correctionBusyId === a._id}
+                      onClick={() => resolveCorrectionAlert(a._id, "accept")}
+                      className="flex items-center gap-1 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                    >
+                      <FiCheckCircle size={12} /> Revert & Apply
+                    </button>
+                    <button
+                      disabled={correctionBusyId === a._id}
+                      onClick={() => resolveCorrectionAlert(a._id, "reject")}
+                      className="flex items-center gap-1 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 text-slate-700 font-black uppercase text-[10px] tracking-wide py-2 px-3 rounded-lg transition-colors"
+                    >
+                      <FiXCircle size={12} /> Keep Original
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Order Ledger popup - the bank statement entry alongside the picked
+          institute's full order ledger (item/date/amount), so the two can be
+          compared side by side before committing to a match. */}
+      {ledgerModalFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                  <FiInfo className="text-blue-600" /> {ledgerModalFor.instituteName}
+                </h3>
+                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">Order Ledger</p>
+              </div>
+              <button onClick={() => setLedgerModalFor(null)} className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors">
+                <FiX size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              <div>
+                <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-2">Bank Statement Entry</span>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-mono text-slate-600">{ledgerModalFor.match.transactionDate}</span>
+                    <span className="font-mono font-bold text-emerald-700">₹{formatMoney(ledgerModalFor.match.creditedAmount)}</span>
+                  </div>
+                  <p className="text-[11px] text-slate-700 break-words">{ledgerModalFor.match.transactionDescription}</p>
+                </div>
+              </div>
+              <div>
+                {(() => {
+                  const modalOrders = openBillsFor(
+                    ledgerModalFor.instituteName,
+                    ledgerModalFor.match.firmCode,
+                    ledgerModalFor.match.transactionDate
+                  );
+                  const allSelected = modalOrders.length > 0 && modalOrders.every((o) => ledgerSelectedIds.has(o._id));
+                  const modalOrdersTotal = modalOrders.reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0);
+                  const insufficientForCredit = modalOrders.length > 0 && modalOrdersTotal < ledgerModalFor.match.creditedAmount;
+                  return (
+                  <>
+                    {insufficientForCredit && (
+                      <div className="mb-2 text-[10px] font-bold text-red-600 bg-red-50 border border-red-200 rounded-lg px-2 py-1.5">
+                        ⚠ Even all open orders together (₹{formatMoney(modalOrdersTotal)}) are less than the credited amount
+                        (₹{formatMoney(ledgerModalFor.match.creditedAmount)}) — this institute likely isn't the right match.
+                      </div>
+                    )}
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">
+                        {ledgerModalFor.instituteName}'s Open Orders
+                      </span>
+                      <span className="text-[9px] font-bold text-slate-400">Tick any bill(s) to select</span>
+                    </div>
+                    <OrderLedgerMini
+                      orders={modalOrders}
+                      highlightAmount={ledgerModalFor.match.creditedAmount}
+                      highlightOrderNos={ledgerModalFor.matchedBillNos}
+                      selectedIds={ledgerSelectedIds}
+                      onToggleAll={() =>
+                        setLedgerSelectedIds(allSelected ? new Set() : new Set(modalOrders.map((o) => o._id)))
+                      }
+                      onToggle={(id) => {
+                        // A Partial Ship or Return split ("OD123" + its
+                        // "-P1"/"-Re1" sibling) is still one real delivery
+                        // paid together, so ticking any one of them always
+                        // ticks every other open order in the same split
+                        // group too, rather than letting part of it be
+                        // picked while the rest is left behind. Deliberately
+                        // NOT grouped by Contract No - see baseOrderNo.
+                        const target = modalOrders.find((o) => o._id === id);
+                        const targetBase = target ? baseOrderNo(target.orderNo) : null;
+                        const groupIds = targetBase
+                          ? modalOrders.filter((o) => baseOrderNo(o.orderNo) === targetBase).map((o) => o._id)
+                          : [id];
+                        setLedgerSelectedIds((prev) => {
+                          const next = new Set(prev);
+                          const willSelect = !next.has(id);
+                          for (const gid of groupIds) {
+                            if (willSelect) next.add(gid);
+                            else next.delete(gid);
+                          }
+                          return next;
+                        });
+                      }}
+                      elsewhereIds={
+                        new Set([...billPickedBy.keys()].filter((id) => pickedElsewhere(id, ledgerModalFor.match._id)))
+                      }
+                      fullWidth
+                    />
+                  </>
+                  );
+                })()}
+              </div>
+            </div>
+            <div className="p-4 border-t border-slate-100 space-y-2">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold text-slate-500 uppercase text-[10px] tracking-wide">
+                  {ledgerSelectedIds.size} bill{ledgerSelectedIds.size === 1 ? "" : "s"} selected
+                </span>
+                <span className="font-mono font-black text-slate-900">
+                  ₹
+                  {formatMoney(
+                    openBillsFor(ledgerModalFor.instituteName, ledgerModalFor.match.firmCode, ledgerModalFor.match.transactionDate)
+                      .filter((b) => ledgerSelectedIds.has(b._id))
+                      .reduce((sum, b) => sum + (b.totalAmount - (b.paidAmount || 0)), 0)
+                  )}
+                </span>
+              </div>
+              <button
+                onClick={applyLedgerSelection}
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-black uppercase text-[10px] tracking-wide py-2.5 px-4 rounded-lg transition-colors"
+              >
+                {ledgerSelectedIds.size > 0
+                  ? `Select ${ledgerSelectedIds.size} Bill${ledgerSelectedIds.size === 1 ? "" : "s"} for ${ledgerModalFor.instituteName}`
+                  : `Select ${ledgerModalFor.instituteName} (link only, no bill)`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Learned Patterns drawer */}
+      {patternsSeller && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-lg max-h-[85vh] overflow-hidden shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                  <FiInfo className="text-blue-600" /> Learned Patterns
+                </h3>
+                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">{patternsSeller.instituteName}</p>
+              </div>
+              <button onClick={() => setPatternsFor(null)} className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors">
+                <FiX size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider">Keyword Aliases</span>
+                  <label className="flex items-center gap-1.5 text-[10px] font-bold text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={!!patternsSeller.autoApproveTrusted}
+                      onChange={() => toggleAutoApprove(patternsSeller)}
+                    />
+                    Auto-approve trusted matches
+                  </label>
+                </div>
+                <div className="space-y-1.5">
+                  {(patternsSeller.statementDescriptionName || []).length === 0 && (
+                    <p className="text-[11px] text-slate-400">No aliases learned yet.</p>
+                  )}
+                  {(patternsSeller.statementDescriptionName || []).map((kw) => {
+                    const meta = (patternsSeller.aliasMeta || []).find(
+                      (a) => a.keyword.trim().toLowerCase() === kw.trim().toLowerCase()
+                    );
+                    return (
+                      <div key={kw} className="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5">
+                        <span className="text-[11px] font-bold text-slate-700">{kw}</span>
+                        <span className="flex items-center gap-1.5">
+                          <span className={`text-[9px] font-black uppercase px-1.5 py-0.5 rounded-full border ${confidencePill(meta && meta.confidence >= 3 ? "high" : meta ? "low" : "new")}`}>
+                            conf {meta?.confidence ?? 1}
+                          </span>
+                          <span className="text-[9px] text-slate-400 uppercase">{meta?.source || "manual_seed"}</span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {(patternsSeller.negativeKeywords || []).length > 0 && (
+                <div>
+                  <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-2">Rejected Keywords</span>
+                  <div className="space-y-1.5">
+                    {(patternsSeller.negativeKeywords || []).map((n) => (
+                      <div key={n.keyword} className="flex items-center justify-between bg-red-50 border border-red-200 rounded-lg px-2.5 py-1.5">
+                        <span className="text-[11px] font-bold text-red-700">{n.keyword}</span>
+                        <span className="text-[9px] text-red-500 font-black">×{n.rejectedCount}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-2">Deduction History</span>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                    <span className="text-[9px] font-black uppercase text-slate-400 block">TDS</span>
+                    <span className="text-sm font-black text-slate-800">{patternsSeller.deductionProfile?.tdsOnlyCount || 0}</span>
+                  </div>
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                    <span className="text-[9px] font-black uppercase text-slate-400 block">TDS+GST</span>
+                    <span className="text-sm font-black text-slate-800">{patternsSeller.deductionProfile?.tdsGstCount || 0}</span>
+                  </div>
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                    <span className="text-[9px] font-black uppercase text-slate-400 block">Kasar</span>
+                    <span className="text-sm font-black text-slate-800">{patternsSeller.deductionProfile?.kasarCount || 0}</span>
+                  </div>
+                </div>
+                {patternsSeller.deductionProfile?.kasarRange?.min !== null &&
+                  patternsSeller.deductionProfile?.kasarRange?.min !== undefined && (
+                    <p className="text-[10px] text-slate-500 mt-2">
+                      Typical Kasar range: {patternsSeller.deductionProfile.kasarRange.min?.toFixed(2)}% – {patternsSeller.deductionProfile.kasarRange.max?.toFixed(2)}%
+                    </p>
+                  )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cluster View — institute's orders grouped into date-burst clusters */}
+      {clusterViewFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-3xl max-h-[85vh] overflow-hidden shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                  <FiLayers className="text-purple-600" /> Order Clusters
+                </h3>
+                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">
+                  {sellerById[clusterViewFor]?.instituteName}
+                </p>
+              </div>
+              <button
+                onClick={() => setClusterViewFor(null)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+              >
+                <FiX size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5 space-y-4">
+              <div className="grid grid-cols-3 gap-2">
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                  <span className="text-[9px] font-black uppercase text-slate-400 block">Clusters</span>
+                  <span className="text-sm font-black text-slate-800">{clusters.length}</span>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                  <span className="text-[9px] font-black uppercase text-slate-400 block">Orders</span>
+                  <span className="text-sm font-black text-slate-800">{ordersForCluster.length}</span>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-center">
+                  <span className="text-[9px] font-black uppercase text-slate-400 block">Confirmed Payments</span>
+                  <span className="text-sm font-black text-slate-800">{clusterViewConfirmed.length}</span>
+                </div>
+              </div>
+
+              {clusters.length === 0 ? (
+                <p className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">
+                  No orders for this institute yet
+                </p>
+              ) : (
+                clusters.map((cluster, i) => {
+                  const payments = paymentsForCluster(cluster);
+                  return (
+                    <div key={i} className="border border-slate-200 rounded-xl overflow-hidden">
+                      <div className="bg-slate-50 px-3 py-2 flex items-center justify-between border-b border-slate-200">
+                        <span className="text-[11px] font-black text-slate-700">
+                          Cluster {i + 1}
+                          <span className="ml-2 font-mono font-normal text-slate-500">
+                            {cluster.startDate || "—"} → {cluster.endDate || "—"}
+                          </span>
+                        </span>
+                        <span className="text-[9px] font-bold text-slate-400 uppercase">{cluster.orders.length} order(s)</span>
+                      </div>
+                      <table className="w-full text-left text-[11px] border-collapse">
+                        <tbody className="divide-y divide-slate-100">
+                          {cluster.orders.map((o: any) => (
+                            <tr key={o._id}>
+                              <td className="py-1.5 px-3 font-mono text-slate-600">{o.orderNo}</td>
+                              <td className="py-1.5 px-3 text-slate-500">{o.contractDate || "—"}</td>
+                              <td className="py-1.5 px-3 text-right font-mono text-slate-700">₹{formatMoney(o.totalAmount)}</td>
+                              <td className="py-1.5 px-3 text-slate-400">{o.status}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {payments.length > 0 && (
+                        <div className="bg-emerald-50/50 border-t border-emerald-100 px-3 py-2">
+                          <span className="text-[9px] font-black uppercase text-emerald-700 block mb-1">Matched Payment(s)</span>
+                          {payments.map((p) => (
+                            <div key={p._id} className="text-[10px] text-emerald-800 flex items-center justify-between">
+                              <span>{p.transactionDate} — {p.billIds.length > 1 ? "combo" : "single"}</span>
+                              <span className="font-mono">₹{formatMoney(p.creditedAmount)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Match Details drawer — credited transaction info + full line-item
+          breakdown for every bill the match resolves to (a combo match
+          resolves to more than one). */}
+      {detailsFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden shadow-2xl flex flex-col">
+            <div className="p-5 border-b border-slate-100 flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                  <FiFileText className="text-blue-600" /> Match Details
+                </h3>
+                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">
+                  {detailsFor.instituteName || "—"}
+                </p>
+              </div>
+              <button
+                onClick={() => setDetailsFor(null)}
+                className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors"
+              >
+                <FiX size={18} />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5 space-y-5">
+              <div>
+                <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider block mb-2">
+                  Credited Transaction
+                </span>
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-slate-500 font-bold uppercase">Date</span>
+                    <span className="font-mono text-slate-800">{detailsFor.transactionDate}</span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] gap-3">
+                    <span className="text-slate-500 font-bold uppercase shrink-0">Credited</span>
+                    <span className="font-mono text-emerald-700 font-bold">₹{formatMoney(detailsFor.creditedAmount)}</span>
+                  </div>
+                  <div className="text-[11px] pt-1 border-t border-slate-200">
+                    <span className="text-slate-500 font-bold uppercase block mb-0.5">Description</span>
+                    <span className="text-slate-700 break-words">{detailsFor.transactionDescription}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <span className="text-[10px] font-black uppercase text-slate-400 tracking-wider flex items-center gap-1.5 mb-2">
+                  Matched Bill{detailsBills.length > 1 ? "s" : ""}
+                  {detailsBills.length > 1 && (
+                    <span className="bg-purple-50 border border-purple-200 text-purple-700 text-[9px] font-black px-1.5 py-0.5 rounded-full leading-none">
+                      combo · {detailsBills.length}
+                    </span>
+                  )}
+                </span>
+                {detailsLoading ? (
+                  <div className="flex justify-center py-8">
+                    <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-blue-500"></div>
+                  </div>
+                ) : detailsBills.length === 0 ? (
+                  <p className="text-center py-6 text-slate-400 text-xs font-bold uppercase tracking-widest">
+                    No linked bill (link-only match)
+                  </p>
+                ) : (
+                  <div className="border border-slate-200 rounded-xl overflow-hidden">
+                    <table className="w-full text-left text-[11px] border-collapse">
+                      <thead>
+                        <tr className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+                          <th className="py-2 px-3">Bill No</th>
+                          <th className="py-2 px-3">Item</th>
+                          <th className="py-2 px-3 text-right">Qty</th>
+                          <th className="py-2 px-3 text-right">Rate</th>
+                          <th className="py-2 px-3 text-right">Total</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {detailsBills.map((b) => (
+                          <tr key={b._id}>
+                            <td className="py-2 px-3 font-mono text-slate-700">
+                              {b.orderNo}
+                              {b.contractDate && (
+                                <span className="block text-[9px] text-slate-400 font-normal">{b.contractDate}</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-slate-700">{b.itemName}</td>
+                            <td className="py-2 px-3 text-right font-mono text-slate-600">
+                              {b.reQty} {b.unit || ""}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono text-slate-600">₹{formatMoney(b.rate)}</td>
+                            <td className="py-2 px-3 text-right font-mono font-bold text-slate-800">
+                              ₹{formatMoney(b.totalAmount)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      {detailsBills.length > 1 && (
+                        <tfoot>
+                          <tr className="bg-slate-50 border-t border-slate-200">
+                            <td colSpan={4} className="py-2 px-3 text-right font-black uppercase text-slate-500 text-[10px]">
+                              Combo Total
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono font-black text-slate-900">
+                              ₹{formatMoney(detailsBillTotal)}
+                            </td>
+                          </tr>
+                        </tfoot>
+                      )}
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </BlockGuard>
+  );
+}

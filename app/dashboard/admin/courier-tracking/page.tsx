@@ -1,0 +1,652 @@
+"use client";
+import { useEffect, useState } from "react";
+import { FiTruck, FiCheckCircle, FiAlertTriangle, FiRefreshCw, FiPackage, FiSend, FiEdit2 } from "react-icons/fi";
+
+interface MatchedParcel {
+  docketNo: string;
+  instituteName: string;
+  city: string;
+  receiverName: string;
+  score: number;
+  whatsappNumber?: string;
+  whatsappStatus?: "NOT_SENT" | "PENDING" | "SENT" | "FAILED" | "NO_NUMBER";
+  emailDate?: string;
+}
+
+interface ReviewParcel {
+  docketNo: string;
+  parsedCity: string;
+  parsedReceiverName: string;
+  bestGuessInstituteName?: string;
+  score: number;
+  reason: string;
+  emailDate?: string;
+}
+
+/** "YYYY-MM-DD" -> "DD/MM/YYYY" for display. */
+function formatEmailDate(d?: string): string {
+  if (!d) return "-";
+  const [y, m, day] = d.split("-");
+  return y && m && day ? `${day}/${m}/${y}` : d;
+}
+
+interface DcWhatsappRecord {
+  _id: string;
+  instituteName: string;
+  whatsappNumber: string;
+  orderNos: string[];
+  fileName: string;
+  status: "PENDING" | "SENT" | "FAILED";
+  requestedBy?: string;
+  requestedAt: string;
+  sentAt?: string | null;
+  errorMessage?: string | null;
+}
+
+interface CourierRunLog {
+  _id: string;
+  date: string;
+  status: "SUCCESS" | "FAILED" | "IN_PROGRESS";
+  totalParcels?: number;
+  matchedCount?: number;
+  needsReviewCount?: number;
+  matched?: MatchedParcel[];
+  needsReview?: ReviewParcel[];
+  timestamp: string;
+  error?: string;
+  triggeredBy?: string;
+}
+
+export default function CourierTrackingPage() {
+  const [runLoading, setRunLoading] = useState(false);
+  const [status, setStatus] = useState<{ type: "success" | "error" | null; message: string }>({
+    type: null,
+    message: "",
+  });
+  const [selectedDockets, setSelectedDockets] = useState<Set<string>>(new Set());
+  const [sending, setSending] = useState(false);
+  const [sellers, setSellers] = useState<{ _id: string; instituteName: string; place?: string }[]>([]);
+  const [dcWhatsappRecords, setDcWhatsappRecords] = useState<DcWhatsappRecord[]>([]);
+  const [bridgeStatus, setBridgeStatus] = useState<{ status: string; qrDataUrl: string | null; updatedAt: string | null }>({
+    status: "UNKNOWN",
+    qrDataUrl: null,
+    updatedAt: null,
+  });
+  const [editingDocket, setEditingDocket] = useState<string | null>(null);
+  const [savingInstitute, setSavingInstitute] = useState(false);
+
+  const [autoStatus, setAutoStatus] = useState<{
+    todayRunCompleted: boolean;
+    todayLog: CourierRunLog | null;
+    history: CourierRunLog[];
+    gmailConfigured: boolean;
+    courierSenderConfigured: boolean;
+  }>({
+    todayRunCompleted: false,
+    todayLog: null,
+    history: [],
+    gmailConfigured: false,
+    courierSenderConfigured: false,
+  });
+
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch("/api/courier/auto");
+      const data = await res.json();
+      if (res.ok) {
+        setAutoStatus({
+          todayRunCompleted: data.todayRunCompleted,
+          todayLog: data.todayLog,
+          history: data.history || [],
+          gmailConfigured: data.gmailConfigured,
+          courierSenderConfigured: data.courierSenderConfigured,
+        });
+      }
+    } catch (e) {
+      console.error("Failed to fetch courier run status", e);
+    }
+  };
+
+  const fetchDcWhatsappStatus = async () => {
+    try {
+      const res = await fetch("/api/delivery-challan/whatsapp-status");
+      const data = await res.json();
+      if (res.ok) setDcWhatsappRecords(data.records || []);
+    } catch (e) {
+      console.error("Failed to fetch Delivery Challan WhatsApp status", e);
+    }
+  };
+
+  const fetchBridgeStatus = async () => {
+    try {
+      const res = await fetch("/api/whatsapp-bridge/status");
+      const data = await res.json();
+      if (res.ok) setBridgeStatus({ status: data.status, qrDataUrl: data.qrDataUrl, updatedAt: data.updatedAt });
+    } catch (e) {
+      console.error("Failed to fetch WhatsApp bridge status", e);
+    }
+  };
+
+  // Polled every 10s while this page is open - a QR code expires after a
+  // short while and whatsapp-web.js issues a fresh one automatically, so the
+  // image shown here needs to keep itself current without a manual refresh.
+  useEffect(() => {
+    fetchBridgeStatus();
+    const interval = setInterval(fetchBridgeStatus, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    fetchStatus();
+    fetchDcWhatsappStatus();
+    fetch("/api/sellers")
+      .then((res) => res.json())
+      .then((data) => {
+        const list = (Array.isArray(data) ? data : [])
+          .map((s: any) => ({ _id: s._id, instituteName: s.instituteName, place: s.place }))
+          .filter((s: any) => s.instituteName)
+          .sort((a: any, b: any) => a.instituteName.localeCompare(b.instituteName));
+        setSellers(list);
+      })
+      .catch((e) => console.error("Failed to fetch sellers for institute correction", e));
+  }, []);
+
+  const handleRunNow = async () => {
+    if (runLoading) return;
+    setRunLoading(true);
+    setStatus({ type: null, message: "" });
+    try {
+      const res = await fetch("/api/courier/auto", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setStatus({ type: "success", message: data.message || "Courier run completed." });
+        setSelectedDockets(new Set());
+        await fetchStatus();
+      } else {
+        throw new Error(data.error || "Failed to trigger courier run");
+      }
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message });
+    } finally {
+      setRunLoading(false);
+    }
+  };
+
+  const todayLog = autoStatus.todayLog;
+
+  // Only NOT_SENT/FAILED parcels can be selected - PENDING is already
+  // queued (waiting on the bridge), SENT is done, NO_NUMBER has nothing to
+  // send to.
+  const selectableDockets = (todayLog?.matched || [])
+    .filter((m) => m.whatsappStatus === "NOT_SENT" || m.whatsappStatus === "FAILED")
+    .map((m) => m.docketNo);
+
+  const toggleDocket = (docketNo: string) => {
+    setSelectedDockets((prev) => {
+      const next = new Set(prev);
+      if (next.has(docketNo)) next.delete(docketNo);
+      else next.add(docketNo);
+      return next;
+    });
+  };
+
+  const toggleSelectAll = () => {
+    setSelectedDockets((prev) =>
+      prev.size === selectableDockets.length ? new Set() : new Set(selectableDockets)
+    );
+  };
+
+  const handleSendWhatsApp = async () => {
+    if (sending || selectedDockets.size === 0 || !todayLog) return;
+    setSending(true);
+    setStatus({ type: null, message: "" });
+    try {
+      const res = await fetch("/api/courier/queue-whatsapp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: todayLog.date, docketNos: [...selectedDockets] }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setStatus({
+          type: "success",
+          message: `Queued ${selectedDockets.size} WhatsApp message(s) - the bridge will send them shortly.`,
+        });
+        setSelectedDockets(new Set());
+        await fetchStatus();
+      } else {
+        throw new Error(data.error || "Failed to queue WhatsApp sends");
+      }
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message });
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const handleInstituteChange = async (docketNo: string, sellerId: string) => {
+    if (!sellerId || !todayLog) {
+      setEditingDocket(null);
+      return;
+    }
+    setSavingInstitute(true);
+    setStatus({ type: null, message: "" });
+    try {
+      const res = await fetch("/api/courier/update-matched-institute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date: todayLog.date, docketNo, sellerId }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setStatus({ type: "success", message: "Institute corrected." });
+        setEditingDocket(null);
+        await fetchStatus();
+      } else {
+        throw new Error(data.error || "Failed to update institute");
+      }
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message });
+    } finally {
+      setSavingInstitute(false);
+    }
+  };
+
+  return (
+      <div className="min-h-screen bg-slate-50 p-6 flex justify-center">
+        <div className="max-w-5xl w-full flex flex-col gap-6">
+          {/* Header Banner */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="bg-orange-50 p-4 rounded-xl text-orange-600">
+                <FiTruck size={28} />
+              </div>
+              <div>
+                <h1 className="text-xl font-black text-slate-900 uppercase tracking-tight">
+                  Courier Tracking Automation
+                </h1>
+                <p className="text-xs text-slate-500 font-bold uppercase tracking-wider">
+                  Dispatch register → institute matching
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap justify-end">
+              <span
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
+                  autoStatus.gmailConfigured
+                    ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                    : "bg-amber-100 text-amber-800 border border-amber-300"
+                }`}
+              >
+                {autoStatus.gmailConfigured ? "Gmail Connected" : "Gmail Setup Pending"}
+              </span>
+              <span
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
+                  autoStatus.courierSenderConfigured
+                    ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                    : "bg-amber-100 text-amber-800 border border-amber-300"
+                }`}
+              >
+                {autoStatus.courierSenderConfigured ? "Courier Sender Set" : "Courier Sender Pending"}
+              </span>
+              <span
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
+                  bridgeStatus.status === "CONNECTED"
+                    ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
+                    : "bg-red-100 text-red-800 border border-red-300"
+                }`}
+              >
+                {bridgeStatus.status === "CONNECTED"
+                  ? "WhatsApp Bridge Connected"
+                  : bridgeStatus.status === "NEEDS_QR"
+                  ? "WhatsApp Login Needed"
+                  : bridgeStatus.status === "DISCONNECTED"
+                  ? "WhatsApp Disconnected"
+                  : "WhatsApp Status Unknown"}
+              </span>
+            </div>
+          </div>
+
+          {/* WhatsApp re-login needed - scan right here, no PC/terminal access required */}
+          {(bridgeStatus.status === "NEEDS_QR" || bridgeStatus.status === "DISCONNECTED") && (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-6 flex flex-col sm:flex-row items-center gap-6">
+              <FiAlertTriangle size={28} className="text-red-600 shrink-0" />
+              <div className="flex-1">
+                <h3 className="text-sm font-black text-red-800 uppercase mb-1">WhatsApp session logged out</h3>
+                <p className="text-xs text-red-700 font-bold">
+                  Courier tracking aur Delivery Challan WhatsApp bhejna ruk gaya hai - dobara login karna hoga.
+                  {bridgeStatus.status === "NEEDS_QR"
+                    ? " Neeche diye QR code ko apne phone se WhatsApp → Settings → Linked Devices → Link a Device se scan karo."
+                    : " Login QR thodi der me yahan apne aap aa jayega - agar 30 second me nahi aaya, page refresh karo."}
+                </p>
+              </div>
+              {bridgeStatus.qrDataUrl && (
+                <img src={bridgeStatus.qrDataUrl} alt="WhatsApp login QR code" className="w-44 h-44 rounded-xl border border-red-200 bg-white p-2 shrink-0" />
+              )}
+            </div>
+          )}
+
+          {status.type === "success" && (
+            <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-xl flex items-start gap-3 text-emerald-800 text-xs font-bold leading-normal">
+              <FiCheckCircle size={16} className="text-emerald-600 shrink-0 mt-0.5" />
+              <span>{status.message}</span>
+            </div>
+          )}
+          {status.type === "error" && (
+            <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-start gap-3 text-red-800 text-xs font-bold leading-normal">
+              <FiAlertTriangle size={16} className="text-red-600 shrink-0 mt-0.5" />
+              <span>{status.message}</span>
+            </div>
+          )}
+
+          {/* Today's run summary + Run Now */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm flex flex-col justify-between">
+            <div>
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-xs font-black uppercase text-orange-600 bg-orange-50 px-2.5 py-1 rounded-lg">
+                  First-Login Auto-Run
+                </span>
+                <span className="text-xs text-slate-400 font-medium">Daily, once per calendar day</span>
+              </div>
+
+              <p className="text-slate-600 text-xs leading-relaxed mb-4">
+                Triggers automatically the first time OMS is opened each day - fetches every courier PDF mail
+                received since the last successful fetch (so a courier mail that arrives late or after a missed
+                day still gets picked up), parses each parcel, and matches it to an institute by receiver name +
+                city. Each entry shows the date of its own courier email. WhatsApp sending is always manual -
+                select the parcels you want to notify below and press &quot;Send WhatsApp&quot;; nothing gets
+                messaged on its own.
+              </p>
+
+              <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-100 mb-6 space-y-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-500 font-semibold">Today Status:</span>
+                  <span className={`font-black ${autoStatus.todayRunCompleted ? "text-emerald-600" : "text-amber-600"}`}>
+                    {autoStatus.todayRunCompleted ? "COMPLETED TODAY" : "PENDING / NOT RUN YET"}
+                  </span>
+                </div>
+                {todayLog && (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 font-semibold">Run Time:</span>
+                      <span className="text-slate-700 font-mono">{new Date(todayLog.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 font-semibold">Total Parcels:</span>
+                      <span className="text-slate-700 font-mono">{todayLog.totalParcels ?? 0}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 font-semibold">Matched:</span>
+                      <span className="text-emerald-700 font-mono">{todayLog.matchedCount ?? 0}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 font-semibold">Needs Review:</span>
+                      <span className="text-amber-700 font-mono">{todayLog.needsReviewCount ?? 0}</span>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={runLoading}
+              onClick={handleRunNow}
+              className="w-full flex items-center justify-center gap-2 bg-orange-600 text-white font-black uppercase text-xs tracking-wider py-3.5 rounded-xl transition-all hover:bg-orange-700 active:scale-[0.98] disabled:opacity-40"
+            >
+              {runLoading ? (
+                <>
+                  <FiRefreshCw size={14} className="animate-spin" />
+                  <span>Running...</span>
+                </>
+              ) : (
+                <>
+                  <FiPackage size={16} />
+                  <span>Run Now</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Matched */}
+          {todayLog?.matched && todayLog.matched.length > 0 && (
+            <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+              <div className="flex items-center justify-between flex-wrap gap-3 mb-4">
+                <h3 className="text-sm font-black text-slate-900 uppercase">Matched ({todayLog.matched.length})</h3>
+                <button
+                  type="button"
+                  disabled={selectedDockets.size === 0 || sending}
+                  onClick={handleSendWhatsApp}
+                  className="flex items-center gap-2 bg-emerald-600 text-white font-black uppercase text-[11px] tracking-wider px-4 py-2.5 rounded-xl transition-all hover:bg-emerald-700 active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {sending ? (
+                    <FiRefreshCw size={13} className="animate-spin" />
+                  ) : (
+                    <FiSend size={13} />
+                  )}
+                  {sending ? "Queueing..." : `Send WhatsApp (${selectedDockets.size} Selected)`}
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="text-slate-400 uppercase text-[10px] tracking-wide">
+                      <th className="pb-2 pr-3 w-8">
+                        <input
+                          type="checkbox"
+                          checked={selectableDockets.length > 0 && selectedDockets.size === selectableDockets.length}
+                          onChange={toggleSelectAll}
+                          disabled={selectableDockets.length === 0}
+                          className="w-3.5 h-3.5"
+                        />
+                      </th>
+                      <th className="pb-2 pr-4">Date</th>
+                      <th className="pb-2 pr-4">Docket No</th>
+                      <th className="pb-2 pr-4">Institute</th>
+                      <th className="pb-2 pr-4">City</th>
+                      <th className="pb-2 pr-4">Receiver</th>
+                      <th className="pb-2 pr-4">Score</th>
+                      <th className="pb-2">WhatsApp</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {todayLog.matched.map((m) => {
+                      const selectable = m.whatsappStatus === "NOT_SENT" || m.whatsappStatus === "FAILED";
+                      return (
+                        <tr key={m.docketNo}>
+                          <td className="py-2 pr-3">
+                            <input
+                              type="checkbox"
+                              checked={selectedDockets.has(m.docketNo)}
+                              onChange={() => toggleDocket(m.docketNo)}
+                              disabled={!selectable}
+                              className="w-3.5 h-3.5"
+                            />
+                          </td>
+                          <td className="py-2 pr-4 text-slate-500 font-mono whitespace-nowrap">{formatEmailDate(m.emailDate)}</td>
+                          <td className="py-2 pr-4 font-mono">{m.docketNo}</td>
+                          <td className="py-2 pr-4 font-bold text-slate-800">
+                            {editingDocket === m.docketNo ? (
+                              <select
+                                autoFocus
+                                defaultValue=""
+                                disabled={savingInstitute}
+                                onChange={(e) => handleInstituteChange(m.docketNo, e.target.value)}
+                                onBlur={() => setEditingDocket(null)}
+                                className="text-xs font-semibold border border-slate-300 rounded-lg px-2 py-1 max-w-[220px] bg-white"
+                              >
+                                <option value="" disabled>
+                                  -- Select correct institute --
+                                </option>
+                                {sellers.map((s) => (
+                                  <option key={s._id} value={s._id}>
+                                    {s.instituteName}
+                                    {s.place ? ` (${s.place})` : ""}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5">
+                                {m.instituteName}
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingDocket(m.docketNo)}
+                                  className="text-slate-300 hover:text-slate-600 transition-colors"
+                                  title="Fix wrong institute match"
+                                >
+                                  <FiEdit2 size={11} />
+                                </button>
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 pr-4 text-slate-500">{m.city}</td>
+                          <td className="py-2 pr-4 text-slate-500">{m.receiverName}</td>
+                          <td className="py-2 pr-4 text-emerald-700 font-mono">{m.score.toFixed(2)}</td>
+                          <td className="py-2">
+                            <span
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                                m.whatsappStatus === "SENT"
+                                  ? "bg-emerald-100 text-emerald-700"
+                                  : m.whatsappStatus === "FAILED"
+                                  ? "bg-red-100 text-red-700"
+                                  : m.whatsappStatus === "NO_NUMBER"
+                                  ? "bg-slate-100 text-slate-500"
+                                  : m.whatsappStatus === "PENDING"
+                                  ? "bg-amber-100 text-amber-700"
+                                  : "bg-blue-100 text-blue-700"
+                              }`}
+                            >
+                              {m.whatsappStatus === "NO_NUMBER"
+                                ? "No Number"
+                                : m.whatsappStatus === "NOT_SENT"
+                                ? "Not Sent"
+                                : m.whatsappStatus === "PENDING"
+                                ? "Queued"
+                                : m.whatsappStatus || "Not Sent"}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Needs Review */}
+          {todayLog?.needsReview && todayLog.needsReview.length > 0 && (
+            <div className="bg-white rounded-2xl border border-amber-200 p-6 shadow-sm">
+              <h3 className="text-sm font-black text-amber-700 uppercase mb-4">
+                Needs Review ({todayLog.needsReview.length})
+              </h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="text-slate-400 uppercase text-[10px] tracking-wide">
+                      <th className="pb-2 pr-4">Date</th>
+                      <th className="pb-2 pr-4">Docket No</th>
+                      <th className="pb-2 pr-4">Parsed City</th>
+                      <th className="pb-2 pr-4">Parsed Receiver</th>
+                      <th className="pb-2 pr-4">Best Guess</th>
+                      <th className="pb-2 pr-4">Score</th>
+                      <th className="pb-2">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {todayLog.needsReview.map((r) => (
+                      <tr key={r.docketNo}>
+                        <td className="py-2 pr-4 text-slate-500 font-mono whitespace-nowrap">{formatEmailDate(r.emailDate)}</td>
+                        <td className="py-2 pr-4 font-mono">{r.docketNo}</td>
+                        <td className="py-2 pr-4 text-slate-500">{r.parsedCity}</td>
+                        <td className="py-2 pr-4 text-slate-500">{r.parsedReceiverName}</td>
+                        <td className="py-2 pr-4 text-slate-700">{r.bestGuessInstituteName || "-"}</td>
+                        <td className="py-2 pr-4 text-amber-700 font-mono">{r.score.toFixed(2)}</td>
+                        <td className="py-2 text-slate-500">{r.reason}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {todayLog && !todayLog.matched?.length && !todayLog.needsReview?.length && (
+            <p className="text-xs font-bold text-slate-400 p-4 bg-slate-50 rounded-xl border border-slate-200 text-center">
+              {todayLog.error || "No parcels processed yet today."}
+            </p>
+          )}
+
+          {/* Delivery Challan WhatsApp Status - separate from the courier
+              dispatch-notification tracking above; this is the Orders page's
+              "Send DC WhatsApp" button's send status. */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-sm font-black text-slate-700 uppercase flex items-center gap-2">
+                <FiSend className="text-emerald-600" /> Delivery Challan WhatsApp Status
+              </h3>
+              <button
+                onClick={fetchDcWhatsappStatus}
+                className="p-2 rounded-lg text-slate-400 hover:text-blue-600 hover:bg-blue-50 transition-all"
+                title="Refresh"
+              >
+                <FiRefreshCw size={14} />
+              </button>
+            </div>
+            {dcWhatsappRecords.length === 0 ? (
+              <p className="text-xs font-bold text-slate-400 p-4 bg-slate-50 rounded-xl border border-slate-200 text-center">
+                No Delivery Challan WhatsApp sends yet.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="text-slate-400 uppercase text-[10px] tracking-wide">
+                      <th className="pb-2 pr-4">Requested</th>
+                      <th className="pb-2 pr-4">Institute</th>
+                      <th className="pb-2 pr-4">Order No(s)</th>
+                      <th className="pb-2 pr-4">WhatsApp No.</th>
+                      <th className="pb-2 pr-4">Requested By</th>
+                      <th className="pb-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {dcWhatsappRecords.map((r) => (
+                      <tr key={r._id}>
+                        <td className="py-2 pr-4 text-slate-500 font-mono whitespace-nowrap">
+                          {new Date(r.requestedAt).toLocaleString("en-GB", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" })}
+                        </td>
+                        <td className="py-2 pr-4 text-slate-700 font-bold">{r.instituteName}</td>
+                        <td className="py-2 pr-4 text-slate-500">{(r.orderNos || []).join(", ")}</td>
+                        <td className="py-2 pr-4 text-slate-500 font-mono">{r.whatsappNumber}</td>
+                        <td className="py-2 pr-4 text-slate-500">{r.requestedBy || "-"}</td>
+                        <td className="py-2">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                              r.status === "SENT"
+                                ? "bg-emerald-50 text-emerald-700"
+                                : r.status === "FAILED"
+                                ? "bg-red-50 text-red-700"
+                                : "bg-amber-50 text-amber-700"
+                            }`}
+                            title={r.status === "FAILED" ? r.errorMessage || "" : ""}
+                          >
+                            {r.status === "PENDING" ? "Queued" : r.status === "SENT" ? "Sent" : "Failed"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+  );
+}

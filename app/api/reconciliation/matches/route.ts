@@ -1,0 +1,545 @@
+import { NextResponse } from "next/server";
+import clientPromise from "@/lib/mongodb";
+import { ObjectId } from "mongodb";
+import mongoose from "mongoose";
+import dbConnect from "@/lib/dbConnect";
+import Seller from "@/models/Seller";
+import { txnKey, Transaction } from "@/app/api/account-statements/route";
+import {
+  findInstituteMatches,
+  scoreInstituteCandidates,
+  AMBIGUITY_SCORE_MARGIN,
+  findOpenBills,
+  findAmountMatch,
+  findCombinationMatch,
+  classifyDeduction,
+  isHighConfidenceMatch,
+  filterBillsByCutoffDate,
+  comboSignature,
+  parseDateToSortable,
+  buildConfirmedDatesBySeller,
+  buildSameDateConfirmedSellers,
+  extractKeywords,
+  SellerForMatching,
+  InstituteCandidate,
+} from "@/lib/reconciliation/matchingEngine";
+import { learnFromManualMatch } from "@/lib/reconciliation/learningEngine";
+import { buildClusters, findClusterCombinationMatch } from "@/lib/reconciliation/clusterEngine";
+import { recheckInstituteGroup } from "@/lib/reconciliation/correctionEngine";
+
+async function connectMongoose() {
+  await clientPromise;
+  await dbConnect();
+}
+
+// generateSuggestions does per-transaction DB round trips (findOpenBills,
+// scoreInstituteCandidates, the leftover recheck loop) - it used to run
+// automatically inside every GET, which meant just opening the Reconciliation
+// page re-ran the whole matching engine over every statement each time. It's
+// now only reachable via POST { action: "generate" }, triggered by the
+// page's "Run Matching" button.
+export const maxDuration = 60;
+
+// How many pending bulkWrite ops accumulate before being flushed early (see
+// the flush inside generateSuggestions' main loop) - bounds both memory and
+// how much work a mid-run timeout could still lose.
+const GENERATE_FLUSH_BATCH_SIZE = 150;
+
+// Builds (or refreshes, if still pending) a suggested match row for every credited
+// transaction across the given statements that doesn't already have a final
+// (confirmed/rejected) match on file.
+async function generateSuggestions(db: any, statements: any[], firmCode: string | null) {
+  const sellers = (await Seller.find({}).lean()) as unknown as SellerForMatching[];
+  const sellersById = new Map(sellers.map((s: any) => [String(s._id), s]));
+
+  const existing: any[] = await db
+    .collection("bank_reconciliation_matches")
+    .find(firmCode ? { firmCode } : {})
+    .project({ transactionKey: 1, status: 1, _id: 1, createdAt: 1, rejectedBillIds: 1, rejectedComboSignatures: 1 })
+    .toArray();
+  const existingByKey = new Map(existing.map((m: any) => [m.transactionKey, m]));
+
+  // Same-date tie-breaker lookup for scoreInstituteCandidates - built ONCE
+  // here (across every firm, not just this run's) instead of queried per
+  // candidate per ambiguous transaction inside it; that per-candidate query
+  // was slow enough in production to blow through Vercel's 60s function
+  // timeout on the all-firms Run Matching request. Confirmed live.
+  const confirmedForDateLookup = await db
+    .collection("bank_reconciliation_matches")
+    .find({ status: "confirmed" })
+    .project({ sellerId: 1, transactionDate: 1 })
+    .toArray();
+  const confirmedDatesBySeller = buildConfirmedDatesBySeller(confirmedForDateLookup);
+  // Same lookup, indexed the other way (date -> sellers) - see
+  // buildSameDateConfirmedSellers for why this exists.
+  const sameDateConfirmedSellers = buildSameDateConfirmedSellers(confirmedForDateLookup);
+
+  const ops: any[] = [];
+
+  // Several open bills can be amount-identical (e.g. 4 orders for the same
+  // item/price), and several pending transactions can carry the identical
+  // credited amount too - without this, every one of them independently
+  // picks the SAME best-fit bill (nothing here knew another transaction in
+  // this same run had already claimed it), leaving that one bill suggested
+  // four times over while its siblings never get suggested at all. Claimed
+  // here as each transaction is assigned, so the next one in this run excludes
+  // it and falls through to the next candidate instead.
+  const claimedBillIds = new Set<string>();
+
+  for (const statement of statements) {
+    const transactions: Transaction[] = statement.transactions || [];
+    for (const t of transactions) {
+      if (!t.credit || t.credit <= 0) continue;
+      const key = `${statement._id}|${txnKey(t)}`;
+      const existingMatch = existingByKey.get(key);
+      // Confirmed is final - already posted to a bill, never touched again.
+      // Excluded means a human already tagged this credit as not a bill
+      // payment at all (TDS refund, DD cancellation, bank interest, a prior
+      // financial year's leftover, etc.) - re-processing it every run would
+      // just put it right back in front of the user as "unmatched" forever.
+      // Rejected is NOT final - re-tried every run (excluding whichever
+      // bill(s) were rejected for it before) so a wrong suggestion doesn't
+      // permanently strand the transaction with no way to ever match it.
+      if (existingMatch && (existingMatch.status === "confirmed" || existingMatch.status === "excluded")) continue;
+      const rejectedBillIds: string[] = existingMatch?.rejectedBillIds || [];
+      // Exact combo sets already rejected for this transaction (see the
+      // reject handler) - a combo found below that matches one of these
+      // signatures is discarded rather than re-offered verbatim, but its
+      // individual member bills stay eligible for a genuinely different
+      // combo (unlike rejectedBillIds, which blacklists a single-bill
+      // rejection's bill outright).
+      const rejectedComboSignatures: string[] = existingMatch?.rejectedComboSignatures || [];
+
+      // A payer keyword can legitimately belong to more than one institute (shared
+      // district-treasury style names, or the same institute paying under a different
+      // procurement-mode name). Score every candidate on amount+date fit instead of
+      // silently picking the longest keyword match; only ask the user when it's close.
+      const candidates = findInstituteMatches(t.description, sellers);
+      let instituteMatch: InstituteCandidate | null = null;
+      let isAmbiguous = false;
+      let ambiguousCandidates: any[] = [];
+
+      if (candidates.length === 1) {
+        instituteMatch = candidates[0];
+      } else if (candidates.length > 1) {
+        const scored = await scoreInstituteCandidates(db, candidates, {
+          creditedAmount: t.credit,
+          transactionDate: t.date,
+          firmCode: statement.firmCode,
+          confirmedDatesBySeller,
+        });
+        const [top, second] = scored;
+        const clearWinner = !second || top.score - second.score > AMBIGUITY_SCORE_MARGIN;
+        if (clearWinner) {
+          instituteMatch = top;
+        } else {
+          isAmbiguous = true;
+          // Every institute whose registered keyword literally matched - not
+          // just the top 3 - since a lower-scoring candidate (e.g. one with
+          // no open bills yet, scored lower for that reason alone) can still
+          // be the right one; the user needs to see it to rule it out or
+          // pick it, not have it silently dropped.
+          ambiguousCandidates = scored.map((c) => ({
+            sellerId: String(c.sellerId),
+            instituteName: c.instituteName,
+            score: c.score,
+            amountFit: c.amountFit,
+            dateFit: c.dateFit,
+            matchedBillNos: c.matchedBillNos,
+          }));
+        }
+      }
+
+      // Same-day, any-firm fallback: no institute's registered keyword
+      // literally matched this description at all, but an institute already
+      // has a CONFIRMED match on this exact date under a different firm's
+      // statement (e.g. a district treasury paying out several of one
+      // institute's bills across different supplier firms the same day,
+      // under a narration that isn't registered as that institute's own
+      // alias yet). Keyword evidence is absent here, so unlike the branches
+      // above, this is only accepted when the credited amount ALSO fits one
+      // of that institute's open bills - "same date, no keyword, no amount
+      // fit" is too weak to attach an institute to blindly, and is left
+      // unmatched instead. Never fast-tracked either way (confidenceLabel
+      // "new" always fails isHighConfidenceMatch below) - always lands in
+      // Pending Review for a human to actually click Confirm.
+      // User-specified design, 2026-11-05.
+      if (candidates.length === 0) {
+        const sameDateSellerIds = sameDateConfirmedSellers.get(parseDateToSortable(t.date));
+        if (sameDateSellerIds && sameDateSellerIds.size > 0) {
+          const learnableKeyword = extractKeywords(t.description)[0];
+          const fallbackCandidates: InstituteCandidate[] = [...sameDateSellerIds]
+            .map((sid) => sellersById.get(sid))
+            .filter((s: any): s is SellerForMatching => !!s)
+            .map((s: any) => ({
+              instituteName: s.instituteName,
+              sellerId: s._id,
+              matchedKeyword: learnableKeyword || "",
+              confidence: 1,
+              confidenceLabel: "new" as const,
+              matchLength: 0,
+            }));
+          if (fallbackCandidates.length > 0) {
+            const scoredFallback = await scoreInstituteCandidates(db, fallbackCandidates, {
+              creditedAmount: t.credit,
+              transactionDate: t.date,
+              firmCode: statement.firmCode,
+              confirmedDatesBySeller,
+            });
+            const fitting = scoredFallback.filter((c) => c.amountFit);
+            if (fitting.length === 1) {
+              instituteMatch = fitting[0];
+            } else if (fitting.length > 1) {
+              isAmbiguous = true;
+              ambiguousCandidates = fitting.map((c) => ({
+                sellerId: String(c.sellerId),
+                instituteName: c.instituteName,
+                score: c.score,
+                amountFit: c.amountFit,
+                dateFit: c.dateFit,
+                matchedBillNos: c.matchedBillNos,
+              }));
+            }
+            // fitting.length === 0: no real evidence either way - stays unmatched.
+          }
+        }
+      }
+
+      const seller = instituteMatch ? sellersById.get(String(instituteMatch.sellerId)) : null;
+
+      let billIds: string[] = [];
+      let billNos: string[] = [];
+      let billAmount = 0;
+      let deductionAmount = 0;
+      let deductionType: string | null = null;
+      let matchTypeForConfidence: "exact" | "deduction" | "combination" | "combination-deduction" | null = null;
+      let deductionUsedHistory = false;
+
+      if (instituteMatch) {
+        const allOpenBills = await findOpenBills(db, {
+          instituteName: instituteMatch.instituteName,
+          firmCode: statement.firmCode,
+        });
+        // Never re-suggest a bill this same transaction's match was already
+        // rejected against - the rest of that institute's open bills still
+        // matches normally. Also exclude anything another transaction already
+        // claimed earlier in this same run (see claimedBillIds above).
+        const eligibleBills = allOpenBills.filter(
+          (b: any) => !rejectedBillIds.includes(String(b._id)) && !claimedBillIds.has(String(b._id))
+        );
+        // Never suggest a bill dated AFTER the money was actually credited -
+        // a payment can't be for an order that didn't exist yet. Applied per
+        // Contract No group (filterBillsByCutoffDate), not per line item, so
+        // a multi-line contract is excluded as a whole rather than matched
+        // on only its earlier-dated members.
+        const openBills = filterBillsByCutoffDate(eligibleBills, t.date);
+
+        const single = findAmountMatch(openBills, t.credit);
+        if (single) {
+          billIds = single.bills.map((b) => String(b._id));
+          billNos = single.bills.map((b) => b.orderNo);
+          billAmount = single.remainingAmount;
+          matchTypeForConfidence = single.matchType;
+          if (single.matchType === "deduction") {
+            const classification = classifyDeduction(single.remainingAmount, t.credit, seller);
+            deductionAmount = single.deductionAmount;
+            deductionType = classification.type;
+            deductionUsedHistory = classification.usedHistory;
+          }
+        } else {
+          // Cluster-scoped combination matching first — several orders in the same
+          // date-burst combining into one payment, deduction (if any) computed once
+          // on the combined total — trying the cluster nearest the payment date
+          // first; fall back to the whole open-bill pool (old behavior, no deduction)
+          // if nothing in any single cluster fits.
+          let combo:
+            | ReturnType<typeof findClusterCombinationMatch>
+            | ReturnType<typeof findCombinationMatch> = null;
+          const clusters = buildClusters(openBills as any);
+          const txnDate = t.date ? new Date(t.date) : null;
+          const txnDateValid = !!txnDate && !isNaN(txnDate.getTime());
+          const orderedClusters = txnDateValid
+            ? [...clusters].sort((a, b) => {
+                const distA = a.endDate ? Math.abs(txnDate!.getTime() - new Date(a.endDate).getTime()) : Infinity;
+                const distB = b.endDate ? Math.abs(txnDate!.getTime() - new Date(b.endDate).getTime()) : Infinity;
+                return distA - distB;
+              })
+            : clusters;
+
+          for (const cluster of orderedClusters) {
+            combo = findClusterCombinationMatch(cluster.orders, t.credit, seller);
+            if (combo) break;
+          }
+          if (!combo) {
+            combo = findCombinationMatch(openBills, t.credit);
+          }
+          // Discard a combo that's the exact same set already rejected for
+          // this transaction - re-offering it verbatim would just get
+          // rejected again. Its individual bills stay eligible (they were
+          // never added to rejectedBillIds for a combo), so a different,
+          // genuinely new combo can still be found as the open-bill data
+          // changes over time.
+          if (combo && rejectedComboSignatures.includes(comboSignature(combo.bills.map((b: any) => b._id)))) {
+            combo = null;
+          }
+
+          if (combo) {
+            billIds = combo.bills.map((b) => String(b._id));
+            billNos = combo.bills.map((b) => b.orderNo);
+            billAmount = combo.totalAmount;
+            matchTypeForConfidence = combo.matchType;
+            if ("deductionAmount" in combo && combo.deductionAmount) {
+              deductionAmount = combo.deductionAmount;
+              deductionType = combo.deductionType;
+              deductionUsedHistory = "deductionUsedHistory" in combo ? combo.deductionUsedHistory : false;
+            }
+          }
+        }
+
+        for (const id of billIds) claimedBillIds.add(id);
+      }
+
+      const highConfidence = instituteMatch
+        ? isHighConfidenceMatch({
+            confidenceLabel: instituteMatch.confidenceLabel,
+            matchType: matchTypeForConfidence,
+            deductionUsedHistory,
+          })
+        : false;
+
+      const doc = {
+        firmId: statement.firmId,
+        firmCode: statement.firmCode,
+        statementId: String(statement._id),
+        transactionKey: key,
+        transactionDate: t.date,
+        transactionDescription: t.description,
+        creditedAmount: t.credit,
+        instituteName: instituteMatch?.instituteName || null,
+        sellerId: instituteMatch?.sellerId ? String(instituteMatch.sellerId) : null,
+        billIds,
+        billNos,
+        billAmount,
+        deductionAmount,
+        deductionType,
+        deductionReason: "",
+        matchedKeyword: instituteMatch?.matchedKeyword || null,
+        confidence: instituteMatch?.confidence ?? 0,
+        confidenceLabel: instituteMatch?.confidenceLabel || "new",
+        isAmbiguous,
+        ambiguousCandidates,
+        highConfidence,
+        status: "pending",
+        suggestedType: deductionType,
+        correctedType: null,
+        updatedAt: new Date(),
+      };
+
+      if (existingMatch) {
+        ops.push({
+          updateOne: {
+            filter: { _id: existingMatch._id },
+            update: { $set: doc },
+          },
+        });
+      } else {
+        ops.push({
+          insertOne: { document: { ...doc, createdAt: new Date() } },
+        });
+      }
+
+      // Flushed periodically rather than only once at the very end - a
+      // function killed by its own timeout partway through a large run
+      // would otherwise lose every bit of work done so far, not just what
+      // didn't finish (confirmed live: an all-firms Run Matching request
+      // hit Vercel's 60s FUNCTION_INVOCATION_TIMEOUT and silently discarded
+      // everything, including statements/transactions already fully scored).
+      if (ops.length >= GENERATE_FLUSH_BATCH_SIZE) {
+        await db.collection("bank_reconciliation_matches").bulkWrite(ops);
+        ops.length = 0;
+      }
+    }
+  }
+
+  if (ops.length > 0) {
+    await db.collection("bank_reconciliation_matches").bulkWrite(ops);
+  }
+
+  // Addition 4: leftover-entry-triggered recheck — scoped to a pending payment
+  // whose institute is known but which has no valid bill/combo left to match.
+  // Only worth checking when that institute already has confirmed history to
+  // recheck against, and only once per leftover (skip if already proposed).
+  const leftovers = await db
+    .collection("bank_reconciliation_matches")
+    .find({
+      ...(firmCode ? { firmCode } : {}),
+      status: "pending",
+      sellerId: { $ne: null },
+      $or: [{ billIds: { $size: 0 } }, { billIds: { $exists: false } }],
+    })
+    .toArray();
+
+  for (const leftover of leftovers) {
+    const existingAlert = await db.collection("reconciliation_correction_alerts").findOne({
+      leftoverMatchId: String(leftover._id),
+      status: "pending",
+    });
+    if (existingAlert) continue;
+
+    const seller = sellersById.get(String(leftover.sellerId)) || null;
+    const proposal = await recheckInstituteGroup(db, String(leftover.sellerId), leftover, seller);
+    if (proposal) {
+      await db.collection("reconciliation_correction_alerts").insertOne({
+        ...proposal,
+        status: "pending",
+        createdAt: new Date(),
+      });
+    }
+  }
+}
+
+export async function GET(req: Request) {
+  try {
+    await connectMongoose();
+    const client = await clientPromise;
+    const db = client.db();
+
+    const { searchParams } = new URL(req.url);
+    const firmCode = searchParams.get("firmCode");
+    const status = searchParams.get("status");
+    const instituteName = searchParams.get("instituteName");
+
+    const matchFilter: any = {};
+    if (firmCode) matchFilter.firmCode = firmCode;
+    if (status) matchFilter.status = status;
+    if (instituteName) matchFilter.instituteName = instituteName;
+
+    const matches = await db
+      .collection("bank_reconciliation_matches")
+      .find(matchFilter)
+      .sort({ transactionDate: -1 })
+      .toArray();
+
+    return NextResponse.json(matches);
+  } catch (error: any) {
+    console.error("Reconciliation matches GET error:", error);
+    return NextResponse.json({ error: error.message || "Failed to load matches" }, { status: 500 });
+  }
+}
+
+// Manually resolve an unmatched (or mis-suggested) transaction to an institute + bill.
+// Learns a new keyword alias for the institute when it had no matched keyword before,
+// but still leaves the row in "pending" status — the user must Confirm separately
+// before anything is posted to the ledger.
+export async function POST(req: Request) {
+  try {
+    await connectMongoose();
+    const client = await clientPromise;
+    const db = client.db();
+    const body = await req.json();
+
+    // Explicit "Run Matching" trigger - the only place generateSuggestions runs from now.
+    if (body.action === "generate") {
+      const firmCode = body.firmCode || null;
+      const statementFilter: any = {};
+      if (firmCode) statementFilter.firmCode = firmCode;
+      const statements = await db.collection("account_statements").find(statementFilter).toArray();
+      await generateSuggestions(db, statements, firmCode);
+      return NextResponse.json({ success: true });
+    }
+
+    const { matchId, sellerId, billId, billIds: billIdsInput, deductionType, deductionAmount, deductionReason } = body;
+    if (!matchId || !ObjectId.isValid(matchId) || !sellerId) {
+      return NextResponse.json({ error: "matchId and sellerId are required" }, { status: 400 });
+    }
+
+    const matchesCollection = db.collection("bank_reconciliation_matches");
+    const match = await matchesCollection.findOne({ _id: new ObjectId(matchId) });
+    if (!match) return NextResponse.json({ error: "Match not found" }, { status: 404 });
+    // A rejected transaction is allowed here too - rejecting only means "don't
+    // suggest that specific wrong bill again," not "never touch this
+    // transaction again." Manually pointing it at the correct bill moves it
+    // back to pending, same as any fresh suggestion.
+    if (match.status !== "pending" && match.status !== "rejected") {
+      return NextResponse.json({ error: "Only a pending or rejected match can be reassigned" }, { status: 400 });
+    }
+
+    const seller = await Seller.findById(sellerId);
+    if (!seller) return NextResponse.json({ error: "Institute not found" }, { status: 404 });
+
+    if (!match.matchedKeyword) {
+      await learnFromManualMatch(seller, {
+        firmId: match.firmId,
+        firmCode: match.firmCode,
+        transactionDescription: match.transactionDescription,
+        creditedAmount: match.creditedAmount,
+        userName: body.userName,
+      });
+    }
+
+    let billIds: string[] = [];
+    let billNos: string[] = [];
+    let billAmount = 0;
+    let resolvedDeductionAmount = Number(deductionAmount) || 0;
+    let resolvedDeductionType = deductionType || null;
+
+    // Combo pick (several bills manually selected together, e.g. confirming
+    // a suggested combo candidate the auto-matcher found) - classify the
+    // deduction against their SUMMED remaining amount, same as a single bill.
+    if (Array.isArray(billIdsInput) && billIdsInput.length > 0) {
+      const validIds = billIdsInput.filter((id: string) => ObjectId.isValid(id));
+      const bills = await db
+        .collection("sellerorders")
+        .find({ _id: { $in: validIds.map((id: string) => new ObjectId(id)) } })
+        .toArray();
+      if (bills.length > 0) {
+        const totalRemaining = bills.reduce(
+          (s: number, b: any) => s + (Number(b.totalAmount || 0) - Number(b.paidAmount || 0)),
+          0
+        );
+        billIds = bills.map((b: any) => String(b._id));
+        billNos = bills.map((b: any) => b.orderNo);
+        billAmount = totalRemaining;
+        if (!deductionType && !deductionAmount) {
+          const classification = classifyDeduction(totalRemaining, match.creditedAmount, seller.toObject());
+          resolvedDeductionAmount = totalRemaining - match.creditedAmount > 0 ? totalRemaining - match.creditedAmount : 0;
+          resolvedDeductionType = classification.type;
+        }
+      }
+    } else if (billId && ObjectId.isValid(billId)) {
+      const bill = await db.collection("sellerorders").findOne({ _id: new ObjectId(billId) });
+      if (bill) {
+        const remaining = Number(bill.totalAmount || 0) - Number(bill.paidAmount || 0);
+        billIds = [String(bill._id)];
+        billNos = [bill.orderNo];
+        billAmount = remaining;
+        if (!deductionType && !deductionAmount) {
+          const classification = classifyDeduction(remaining, match.creditedAmount, seller.toObject());
+          resolvedDeductionAmount = remaining - match.creditedAmount > 0 ? remaining - match.creditedAmount : 0;
+          resolvedDeductionType = classification.type;
+        }
+      }
+    }
+
+    const update = {
+      status: "pending",
+      instituteName: seller.instituteName,
+      sellerId: String(seller._id),
+      billIds,
+      billNos,
+      billAmount,
+      deductionAmount: resolvedDeductionAmount,
+      deductionType: resolvedDeductionType,
+      deductionReason: deductionReason || "",
+      suggestedType: resolvedDeductionType,
+      updatedAt: new Date(),
+    };
+
+    await matchesCollection.updateOne({ _id: match._id }, { $set: update });
+    const updated = await matchesCollection.findOne({ _id: match._id });
+    return NextResponse.json(updated);
+  } catch (error: any) {
+    console.error("Reconciliation matches POST error:", error);
+    return NextResponse.json({ error: error.message || "Failed to save manual match" }, { status: 500 });
+  }
+}

@@ -1,0 +1,1754 @@
+"use client";
+
+import { useState, useEffect, useMemo, useRef } from "react";
+import { useRouter } from "next/navigation";
+import AddItemModal from "@/components/AddItemModal";
+import AddSellerModal from "@/components/AddSellerModal";
+import {
+  FiArrowLeft,
+  FiCheckCircle,
+  FiTrash2,
+  FiExternalLink,
+  FiRefreshCw,
+  FiSearch,
+  FiBriefcase,
+  FiInfo,
+  FiClock,
+  FiCheck,
+  FiAlertCircle,
+  FiChevronUp,
+  FiChevronDown,
+  FiZap,
+  FiX,
+  FiPlus
+} from "react-icons/fi";
+
+interface RawGeMOrder {
+  _id: string;
+  contractNo: string;
+  contractDate: string;
+  contractUrl: string;
+  buyerDesignation?: string;
+  department?: string;
+  location?: string;
+  instituteName: string;
+  itemName: string;
+  qty: number;
+  rate: number;
+  totalAmount: number;
+  firmCode?: string;
+  gemStatus?: string;
+  status: string;
+  createdAt: string;
+}
+
+interface BuyerOption {
+  id: string;
+  name: string;
+  gemLocationText?: string;
+}
+
+interface UploadedSheetRow {
+  originalName: string;
+  qty: number;
+  rate: number;
+  gemLink?: string;
+  mappedItemId?: string;
+}
+
+interface SheetRecord {
+  id: string;
+  fileName: string;
+  selectedBuyerId: string;
+  uploadedRows: UploadedSheetRow[];
+}
+
+interface GemListing {
+  firmCode: string;
+  itemId?: string;
+  gemLink?: string;
+}
+
+interface StockItemOption {
+  _id: string;
+  sku: string;
+  itemName: string;
+  category: string;
+  unit: string;
+  variantGroup?: string;
+  variantLabel?: string;
+}
+
+// One line item within the Verify modal - a single GeM contract can
+// legitimately bundle several different items (a merge/multi-item PO), so
+// the modal holds a list of these instead of one flat set of fields.
+interface VerifyItemRow {
+  key: string;
+  itemQuery: string;
+  selectedStockItem: StockItemOption | null;
+  showSuggestions: boolean;
+  highlightedIndex: number;
+  variantSiblings: StockItemOption[];
+  qty: number;
+  rate: number;
+  remark: string;
+}
+
+export default function FetchGeMOrdersPage() {
+  const router = useRouter();
+
+  const [rawOrders, setRawOrders] = useState<RawGeMOrder[]>([]);
+  const [companies, setCompanies] = useState<any[]>([]);
+  const [buyerOptions, setBuyerOptions] = useState<BuyerOption[]>([]);
+  const [sheets, setSheets] = useState<SheetRecord[]>([]);
+  const [gemListings, setGemListings] = useState<GemListing[]>([]);
+  const [stockItems, setStockItems] = useState<StockItemOption[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [showFetchHistory, setShowFetchHistory] = useState(false);
+  const [fetchHistory, setFetchHistory] = useState<{ firmCode: string; firmName: string; lastFetchedAt: string | null }[]>([]);
+  const [loadingFetchHistory, setLoadingFetchHistory] = useState(false);
+  const [isAddItemModalOpen, setIsAddItemModalOpen] = useState(false);
+  const [isAddSellerModalOpen, setIsAddSellerModalOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortConfig, setSortConfig] = useState<{ key: "firmCode" | "instituteName" | "itemName"; direction: "asc" | "desc" } | null>(null);
+
+  // Verification modal state
+  const [selectedOrder, setSelectedOrder] = useState<RawGeMOrder | null>(null);
+  const [selectedFirmCode, setSelectedFirmCode] = useState("");
+  const [customInstituteName, setCustomInstituteName] = useState("");
+  // One row per item on this contract - see VerifyItemRow. Each row keeps
+  // its own Item Name search/suggestions/variant state, same behavior the
+  // single-item version had, just scoped per row now.
+  const [verifyItems, setVerifyItems] = useState<VerifyItemRow[]>([]);
+  const verifyItemKeyRef = useRef(0);
+  // Keyboard nav (Up/Down/Enter) through a row's Item Name suggestion list -
+  // refs keyed by row key so scrollIntoView still works per row.
+  const itemSuggestionRefsByRow = useRef<Record<string, (HTMLButtonElement | null)[]>>({});
+  const [autoFillHint, setAutoFillHint] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  const [currentUsername, setCurrentUsername] = useState("");
+
+  // Sheet Library auto-match results, keyed by raw order id - only populated
+  // when the "Auto-Match Items" button below is clicked (never runs on its
+  // own), then reused to pre-fill the Verify modal when it's opened.
+  const [matchResults, setMatchResults] = useState<Record<string, { instituteName?: string; itemId?: string; itemName?: string; remark?: string; hint?: string }>>({});
+  const [matchingAll, setMatchingAll] = useState(false);
+
+  // GeM Order Intake tab - a lighter triage list in front of the Fetched
+  // Orders list above. The Chrome extension now posts scraped orders here
+  // first (app/api/gem-order-intake); a human bulk-transfers the real ones
+  // into raw_gem_orders (same list this page already reviews) or
+  // bulk-disables the rest so a re-scrape never re-imports them.
+  const [pageTab, setPageTab] = useState<"fetched" | "intake" | "disabled">("fetched");
+  const [intakeOrders, setIntakeOrders] = useState<RawGeMOrder[]>([]);
+  const [intakeLoading, setIntakeLoading] = useState(true);
+  const [intakeRefreshing, setIntakeRefreshing] = useState(false);
+  const [intakeSearchQuery, setIntakeSearchQuery] = useState("");
+  const [selectedIntakeIds, setSelectedIntakeIds] = useState<string[]>([]);
+  const [intakeFirmCode, setIntakeFirmCode] = useState("");
+  const [transferring, setTransferring] = useState(false);
+  const [disablingIntake, setDisablingIntake] = useState(false);
+
+  // "Disabled" tab - orders bulk-disabled from Intake (so a re-scrape never
+  // re-imports them). Read-only list + the same bulk transfer action as
+  // Intake, for undoing an accidental disable without needing a DB fix.
+  const [disabledOrders, setDisabledOrders] = useState<RawGeMOrder[]>([]);
+  const [disabledLoading, setDisabledLoading] = useState(true);
+  const [disabledRefreshing, setDisabledRefreshing] = useState(false);
+  const [disabledSearchQuery, setDisabledSearchQuery] = useState("");
+  const [selectedDisabledIds, setSelectedDisabledIds] = useState<string[]>([]);
+  const [disabledFirmCode, setDisabledFirmCode] = useState("");
+  const [transferringDisabled, setTransferringDisabled] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("oms_user");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.username) setCurrentUsername(parsed.username);
+      }
+    } catch (err) {
+      console.error("Failed to read logged-in user", err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchRawOrders();
+    fetchCompanies();
+    fetchSheetsAndBuyers();
+    fetchStockItems();
+    fetchIntakeOrders();
+    fetchDisabledOrders();
+  }, []);
+
+  // Esc closes the Item Name suggestion dropdown first (if open), otherwise
+  // closes the Verify modal itself - mirrors the Cancel button, so it's a
+  // no-op while a submit is in flight.
+  useEffect(() => {
+    if (!selectedOrder) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const anyOpen = verifyItems.some((r) => r.showSuggestions);
+      if (anyOpen) {
+        setVerifyItems((prev) => prev.map((r) => ({ ...r, showSuggestions: false })));
+      } else if (!verifying) {
+        setSelectedOrder(null);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [selectedOrder, verifyItems, verifying]);
+
+  // Ctrl+Shift+A opens "Add New Item" from anywhere on this page - global,
+  // not scoped to any modal, since the whole point is a quick shortcut that
+  // doesn't need clicking the button first.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && (e.key === "A" || e.key === "a")) {
+        e.preventDefault();
+        setIsAddItemModalOpen(true);
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  // Resolve the Sheet Library file(s) tied to a given buyer (matches by
+  // buyer id or name, same dual-check the GeM Sync Console uses since
+  // selectedBuyerId sometimes holds a name instead of an id).
+  const resolveBuyerSheets = (buyerName: string) => {
+    const buyerQ = buyerName.trim().toLowerCase();
+    if (!buyerQ) return [];
+    const matchedBuyer = buyerOptions.find(b => b.name.trim().toLowerCase() === buyerQ);
+    return sheets.filter(s => {
+      const sel = (s.selectedBuyerId || "").trim().toLowerCase();
+      return sel === buyerQ || (matchedBuyer && sel === matchedBuyer.id.trim().toLowerCase());
+    });
+  };
+
+  // A Sheet Library row only proves the buyer ordered at that rate/qty - it
+  // says nothing about which firm actually sells the item, so rate+qty alone
+  // can match a row that belongs to a completely different firm's catalogue.
+  // Master List (gem_listings) is the firm-aware source of truth (it's keyed
+  // by firmCode + gemLink/itemId), so a row only counts as a real match if
+  // this order's own firm has a live listing for that same item/link.
+  const rowBelongsToFirm = (row: UploadedSheetRow, firmCode?: string): boolean => {
+    const fc = (firmCode || "").trim().toUpperCase();
+    if (!fc) return false;
+    return gemListings.some((l) => {
+      if ((l.firmCode || "").trim().toUpperCase() !== fc) return false;
+      if (row.mappedItemId && l.itemId && String(l.itemId) === String(row.mappedItemId)) return true;
+      if (row.gemLink && l.gemLink && row.gemLink.trim() === l.gemLink.trim()) return true;
+      return false;
+    });
+  };
+
+  // Sheet Library match lookup: given a buyer and an order, find the row in
+  // that buyer's uploaded rate sheet whose Rate/Qty matches what the order
+  // actually placed on GeM at (the buyer ordered at the quoted rate/qty),
+  // restricted to rows this order's own firm actually has a Master List
+  // listing for (see rowBelongsToFirm above).
+  // /api/gem-sync's bulk response never carries uploadedRows (moved to R2,
+  // loaded lazily per-sheet - see route.ts) so each candidate sheet's rows
+  // are fetched on demand here via ?sheetContent=, through sheetRowsCache so
+  // the same sheet is never re-fetched twice in one bulk run. Only ever
+  // called from runBulkAutoMatch below (the "Auto-Match Items" button),
+  // never on its own, so Institute/Item Name/Remark never silently change
+  // under the user.
+  const findSheetMatch = async (
+    buyerName: string,
+    order: RawGeMOrder,
+    sheetRowsCache: Map<string, UploadedSheetRow[]>
+  ): Promise<{ row: UploadedSheetRow; sheet: SheetRecord } | null> => {
+    const candidateSheets = resolveBuyerSheets(buyerName);
+    const orderRate = Number(order.rate);
+    const orderQty = Number(order.qty);
+
+    let rateOnlyMatch: { row: UploadedSheetRow; sheet: SheetRecord } | null = null;
+
+    outer: for (const sheet of candidateSheets) {
+      let rows = sheetRowsCache.get(sheet.id);
+      if (!rows) {
+        try {
+          const res = await fetch(`/api/gem-sync?sheetContent=${sheet.id}`);
+          rows = res.ok ? ((await res.json()).uploadedRows || []) : [];
+        } catch {
+          rows = [];
+        }
+        sheetRowsCache.set(sheet.id, rows);
+      }
+
+      for (const row of rows) {
+        if (Number(row.rate) !== orderRate) continue;
+        if (!rowBelongsToFirm(row, order.firmCode)) continue;
+        if (Number(row.qty) === orderQty) {
+          rateOnlyMatch = { row, sheet };
+          break outer; // exact rate+qty+firm match - best case, stop here
+        }
+        if (!rateOnlyMatch) rateOnlyMatch = { row, sheet };
+      }
+    }
+
+    return rateOnlyMatch;
+  };
+
+  const fetchRawOrders = async () => {
+    try {
+      setRefreshing(true);
+      const res = await fetch(`/api/gem-orders?t=${Date.now()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setRawOrders(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error("Error fetching raw GeM orders:", err);
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  };
+
+  const fetchIntakeOrders = async () => {
+    try {
+      setIntakeRefreshing(true);
+      const res = await fetch(`/api/gem-order-intake?t=${Date.now()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setIntakeOrders(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error("Error fetching GeM order intake:", err);
+    } finally {
+      setIntakeLoading(false);
+      setIntakeRefreshing(false);
+    }
+  };
+
+  const fetchDisabledOrders = async () => {
+    try {
+      setDisabledRefreshing(true);
+      const res = await fetch(`/api/gem-order-intake/disabled?t=${Date.now()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDisabledOrders(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error("Error fetching disabled GeM order intake:", err);
+    } finally {
+      setDisabledLoading(false);
+      setDisabledRefreshing(false);
+    }
+  };
+
+  const openFetchHistory = async () => {
+    setShowFetchHistory(true);
+    setLoadingFetchHistory(true);
+    try {
+      const res = await fetch(`/api/gem-orders/fetch-history?t=${Date.now()}`);
+      const data = await res.json();
+      setFetchHistory(Array.isArray(data) ? data : []);
+    } catch (err) {
+      console.error("Error fetching GeM order fetch history:", err);
+    } finally {
+      setLoadingFetchHistory(false);
+    }
+  };
+
+  const fetchCompanies = async () => {
+    try {
+      const res = await fetch(`/api/companies?t=${Date.now()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setCompanies(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error("Error fetching companies:", err);
+    }
+  };
+
+  // Buyers/ITIs + Sheet Library, for the Buyer field suggestions and the
+  // Rate/Qty auto-fill in the verify modal (same source the GeM Sync Console uses).
+  const fetchSheetsAndBuyers = async () => {
+    try {
+      const [gemSyncRes, sellersRes] = await Promise.all([
+        fetch(`/api/gem-sync?t=${Date.now()}`),
+        fetch(`/api/sellers?t=${Date.now()}`).catch(() => null)
+      ]);
+
+      const merged = new Map<string, BuyerOption>();
+
+      if (gemSyncRes.ok) {
+        const data = await gemSyncRes.json();
+        setSheets(Array.isArray(data.sheets) ? data.sheets : []);
+        setGemListings(Array.isArray(data.listings) ? data.listings : []);
+        (data.buyers || []).forEach((b: any) => {
+          const name = (b.name || "").trim();
+          if (name) merged.set(name.toLowerCase(), { id: b.id, name });
+        });
+      }
+
+      if (sellersRes && sellersRes.ok) {
+        const sellers = await sellersRes.json();
+        (Array.isArray(sellers) ? sellers : []).forEach((s: any) => {
+          const name = (s.instituteName || s.buyerName || s.name || "").trim();
+          const gemLocationText = (s.gemLocationText || "").trim();
+          if (name) {
+            // Sellers take priority over gem_buyers for the same name, since
+            // only sellers carry gemLocationText (used to auto-match below).
+            merged.set(name.toLowerCase(), { id: s._id || name, name, gemLocationText });
+          }
+        });
+      }
+
+      setBuyerOptions(Array.from(merged.values()));
+    } catch (err) {
+      console.error("Error fetching buyers/sheets:", err);
+    }
+  };
+
+  const fetchStockItems = async () => {
+    try {
+      const res = await fetch(`/api/stock?t=${Date.now()}`);
+      if (res.ok) {
+        const data = await res.json();
+        // Hidden items must never be reachable from this page - not as a
+        // search suggestion, not as an auto-match result, not as a variant
+        // sibling. Confirmed live: a GeM order auto-matched to a hidden
+        // duplicate SKU (via an old Sheet Library mapping saved before that
+        // SKU was hidden) because this list still included it.
+        setStockItems(Array.isArray(data) ? data.filter((item: any) => !item.hidden) : []);
+      }
+    } catch (err) {
+      console.error("Error fetching stock items:", err);
+    }
+  };
+
+  // Same "does the Seller Directory already have a matching institute"
+  // guess used to pre-select the Verify modal's dropdown - also used in the
+  // list itself so a match is visible before ever opening Verify.
+  // A generic/short buyer name or location text (e.g. a junk "testing" entry
+  // someone created while trying out the Sheet Library upload) can be a
+  // substring of totally unrelated real institute names ("...soil testing
+  // laboratory...") and hijack the guess for every one of them. Real
+  // institute names/locations are always long phrases, so require a
+  // minimum length before trusting a substring match either way.
+  const MIN_MATCH_LEN = 8;
+  const guessBuyerForOrder = (order: RawGeMOrder): BuyerOption | null => {
+    const rawLoc = (order.instituteName || order.location || "").toLowerCase();
+    if (!rawLoc) return null;
+    return (
+      buyerOptions.find((b) => {
+        const gemLoc = (b.gemLocationText || "").toLowerCase();
+        return gemLoc.length >= MIN_MATCH_LEN && (rawLoc.includes(gemLoc) || gemLoc.includes(rawLoc));
+      }) ||
+      buyerOptions.find((b) => {
+        const name = (b.name || "").toLowerCase();
+        return name.length >= MIN_MATCH_LEN && (rawLoc.includes(name) || name.includes(rawLoc));
+      }) ||
+      null
+    );
+  };
+
+  // Bulk "Auto-Match Items" button (top of page) - the only trigger for the
+  // Institute + Sheet Library rate/qty matching. Runs once across every
+  // pending order and caches results in matchResults, keyed by order id;
+  // openVerifyModal reads from that cache instead of computing it itself.
+  const runBulkAutoMatch = async () => {
+    setMatchingAll(true);
+    try {
+      const sheetRowsCache = new Map<string, UploadedSheetRow[]>();
+      const results: typeof matchResults = {};
+      for (const order of rawOrders) {
+        const guessedBuyer = guessBuyerForOrder(order);
+        if (!guessedBuyer) continue;
+
+        const match = await findSheetMatch(guessedBuyer.name, order, sheetRowsCache);
+        if (!match) continue;
+
+        const { row, sheet } = match;
+        const stockItem = row.mappedItemId ? stockItems.find(s => s._id === row.mappedItemId) : null;
+
+        results[order._id] = {
+          instituteName: guessedBuyer.name,
+          itemId: stockItem?._id,
+          itemName: stockItem?.itemName,
+          remark: row.originalName || "",
+          hint: `Auto-matched from Sheet Library "${sheet.fileName}" (rate ₹${row.rate}, qty ${row.qty}, firm ${order.firmCode} confirmed in Master List)`
+        };
+      }
+      setMatchResults(results);
+      const matchedCount = Object.keys(results).length;
+      alert(`✓ ${matchedCount} of ${rawOrders.length} orders auto-matched from Sheet Library. Open Verify on a matched order to see it filled in.`);
+    } finally {
+      setMatchingAll(false);
+    }
+  };
+
+  const handleSort = (key: "firmCode" | "instituteName" | "itemName") => {
+    setSortConfig((prev) => {
+      if (prev && prev.key === key) {
+        return { key, direction: prev.direction === "asc" ? "desc" : "asc" };
+      }
+      return { key, direction: "asc" };
+    });
+  };
+
+  const handleDelete = async (id: string, contractNo: string) => {
+    if (!confirm(`Are you sure you want to delete/reject order ${contractNo}?`)) return;
+
+    try {
+      const res = await fetch(`/api/gem-orders/${id}`, { method: "DELETE" });
+      if (res.ok) {
+        setRawOrders(prev => prev.filter(o => o._id !== id));
+      } else {
+        const err = await res.json();
+        alert(err.error || "Failed to delete order");
+      }
+    } catch (err) {
+      alert("Error deleting order");
+    }
+  };
+
+  const makeEmptyVerifyItemRow = (): VerifyItemRow => ({
+    key: `item-${++verifyItemKeyRef.current}`,
+    itemQuery: "",
+    selectedStockItem: null,
+    showSuggestions: false,
+    highlightedIndex: -1,
+    variantSiblings: [],
+    qty: 1,
+    rate: 0,
+    remark: "",
+  });
+
+  const openVerifyModal = (order: RawGeMOrder) => {
+    // Refreshes in the background (not awaited) so an item added via "Add
+    // New Item" on this page, or from Stock/Inventory in another tab, shows
+    // up in the Item Name search without needing a full page reload - stock
+    // items were otherwise only fetched once, on this page's initial mount.
+    fetchStockItems();
+
+    setSelectedOrder(order);
+    const firmMatch = order.firmCode && companies.some(c => c.firmCode === order.firmCode);
+    setSelectedFirmCode(firmMatch ? order.firmCode! : (companies.length > 0 ? companies[0].firmCode : "GeM"));
+
+    // Pre-fill only from the cached "Auto-Match Items" result (if that button
+    // was run for this order) or the simple Institute name guess - never runs
+    // the Sheet Library rate/qty match itself here.
+    const match = matchResults[order._id];
+    const guessedBuyer = guessBuyerForOrder(order);
+    setCustomInstituteName(match?.instituteName || (guessedBuyer ? guessedBuyer.name : ""));
+
+    const matchedStockItem = match?.itemId ? stockItems.find(s => s._id === match.itemId) : null;
+    const firstRow = makeEmptyVerifyItemRow();
+    if (matchedStockItem) {
+      firstRow.selectedStockItem = matchedStockItem;
+      firstRow.itemQuery = matchedStockItem.itemName;
+      firstRow.variantSiblings = matchedStockItem.variantGroup
+        ? stockItems.filter((s) => s.variantGroup === matchedStockItem.variantGroup)
+        : [];
+    } else {
+      firstRow.itemQuery = order.itemName || "";
+    }
+    firstRow.qty = order.qty || 1;
+    firstRow.rate = order.rate || 0;
+    firstRow.remark = match?.remark || "";
+    setVerifyItems([firstRow]);
+    setAutoFillHint(match?.hint || null);
+  };
+
+  const addVerifyItemRow = () => {
+    setVerifyItems((prev) => [...prev, makeEmptyVerifyItemRow()]);
+  };
+
+  const removeVerifyItemRow = (index: number) => {
+    setVerifyItems((prev) => (prev.length > 1 ? prev.filter((_, i) => i !== index) : prev));
+  };
+
+  const updateVerifyItemRow = (index: number, patch: Partial<VerifyItemRow>) => {
+    setVerifyItems((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
+  };
+
+  const handleSelectStockItemForRow = (index: number, item: StockItemOption) => {
+    // If this item has color/size siblings, offer them below - matched on
+    // variantGroup (a real shared field), never on name, since a hidden
+    // duplicate can share the exact same itemName as its active replacement.
+    updateVerifyItemRow(index, {
+      selectedStockItem: item,
+      itemQuery: item.itemName,
+      showSuggestions: false,
+      variantSiblings: item.variantGroup ? stockItems.filter((s) => s.variantGroup === item.variantGroup) : [],
+    });
+  };
+
+  const getItemSuggestions = (query: string) => {
+    const q = query.toLowerCase().trim();
+    const pool = q ? stockItems.filter((s) => s.itemName.toLowerCase().includes(q)) : stockItems;
+    return pool.slice(0, 50);
+  };
+
+  const handleVerifySubmit = async () => {
+    if (!selectedOrder) return;
+
+    // Institute must come from the dropdown (Seller Directory) and every
+    // item row must come from the stock suggestions below its search box —
+    // the raw text GeM's page scraped in (order.instituteName /
+    // order.itemName) is never allowed to fall through into a saved order
+    // unconfirmed.
+    if (!customInstituteName.trim()) {
+      alert("Buyer / Institute list se select karo — GeM se aaya raw text seedha order me save nahi ho sakta.");
+      return;
+    }
+    const missingIndex = verifyItems.findIndex((row) => !row.selectedStockItem);
+    if (missingIndex !== -1) {
+      alert(`Item #${missingIndex + 1} ke suggestions me se ek real stock item select karo — GeM se aaya raw item name seedha order me save nahi ho sakta.`);
+      return;
+    }
+
+    setVerifying(true);
+
+    try {
+      const res = await fetch(`/api/gem-orders/${selectedOrder._id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          firmCode: selectedFirmCode,
+          instituteName: customInstituteName,
+          createdBy: currentUsername,
+          items: verifyItems.map((row) => ({
+            itemId: row.selectedStockItem?._id,
+            itemName: row.selectedStockItem?.itemName,
+            category: row.selectedStockItem?.category,
+            unit: row.selectedStockItem?.unit,
+            sku: row.selectedStockItem?.sku,
+            qty: row.qty,
+            rate: row.rate,
+            totalAmount: row.qty * row.rate,
+            remark: row.remark,
+          })),
+        })
+      });
+
+      if (res.ok) {
+        const result = await res.json();
+        const orderNos: string[] = result.orderNos || (result.orderNo ? [result.orderNo] : []);
+        alert(
+          orderNos.length > 1
+            ? `✅ ${orderNos.length} Orders Verified Successfully! Saved to Main Orders as ${orderNos.join(", ")}`
+            : `✅ Order Verified Successfully! Saved to Main Orders as ${orderNos[0]}`
+        );
+        setRawOrders(prev => prev.filter(o => o._id !== selectedOrder._id));
+        setSelectedOrder(null);
+      } else {
+        const err = await res.json();
+        alert(err.error || "Failed to verify order");
+      }
+    } catch (err) {
+      alert("System error verifying order");
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const filteredOrders = useMemo(() => {
+    if (!searchQuery.trim()) return rawOrders;
+    const q = searchQuery.toLowerCase().trim();
+    return rawOrders.filter(o =>
+      (o.contractNo || "").toLowerCase().includes(q) ||
+      (o.instituteName || "").toLowerCase().includes(q) ||
+      (o.itemName || "").toLowerCase().includes(q) ||
+      (o.location || "").toLowerCase().includes(q)
+    );
+  }, [rawOrders, searchQuery]);
+
+  const filteredIntakeOrders = useMemo(() => {
+    if (!intakeSearchQuery.trim()) return intakeOrders;
+    const q = intakeSearchQuery.toLowerCase().trim();
+    return intakeOrders.filter(o =>
+      (o.contractNo || "").toLowerCase().includes(q) ||
+      (o.instituteName || "").toLowerCase().includes(q) ||
+      (o.itemName || "").toLowerCase().includes(q) ||
+      (o.firmCode || "").toLowerCase().includes(q)
+    );
+  }, [intakeOrders, intakeSearchQuery]);
+
+  const toggleSelectAllIntake = (checked: boolean) => {
+    setSelectedIntakeIds(checked ? filteredIntakeOrders.map(o => o._id) : []);
+  };
+
+  const toggleSelectIntakeOne = (id: string, checked: boolean) => {
+    setSelectedIntakeIds(prev => (checked ? [...prev, id] : prev.filter(x => x !== id)));
+  };
+
+  const handleBulkTransfer = async () => {
+    if (selectedIntakeIds.length === 0) return;
+    const confirmMsg = intakeFirmCode
+      ? `${selectedIntakeIds.length} order(s) ko "${intakeFirmCode}" firm ke saath Fetched GeM Orders me transfer karein? (In sabki apni fetch-time-select-ki-hui firm override ho jayegi)`
+      : `${selectedIntakeIds.length} order(s) ko unki apni-apni (fetch ke time select ki hui) firm ke saath Fetched GeM Orders me transfer karein?`;
+    if (!confirm(confirmMsg)) return;
+
+    setTransferring(true);
+    try {
+      const res = await fetch(`/api/gem-order-intake/transfer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedIntakeIds, firmCode: intakeFirmCode }),
+      });
+      if (res.ok) {
+        const result = await res.json();
+        setSelectedIntakeIds([]);
+        fetchRawOrders(); // pull the newly transferred rows into the Fetched Orders tab
+        // Re-fetch instead of locally filtering all selectedIntakeIds out -
+        // a "no firm tagged" skip is deliberately left in gem_order_intake
+        // (not deleted) so it can be retried, unlike a duplicate skip.
+        fetchIntakeOrders();
+        if (result.skipped?.length > 0) {
+          const reasons = result.skipped.map((s: { contractNo: string; reason: string }) => `${s.contractNo}: ${s.reason}`).join("\n");
+          alert(`${result.transferred} transferred.\n${result.skipped.length} skipped:\n${reasons}`);
+        } else {
+          alert(`✓ ${result.transferred} order(s) transferred to Fetched GeM Orders.`);
+        }
+      } else {
+        const err = await res.json();
+        alert(err.error || "Transfer failed");
+      }
+    } catch (err) {
+      alert("Error transferring orders");
+    } finally {
+      setTransferring(false);
+    }
+  };
+
+  const handleBulkDisableIntake = async () => {
+    if (selectedIntakeIds.length === 0) return;
+    if (!confirm(`${selectedIntakeIds.length} order(s) ko permanently disable karein? Ye list se hat jayenge aur dobara fetch nahi honge.`)) return;
+
+    setDisablingIntake(true);
+    try {
+      const res = await fetch(`/api/gem-order-intake/disable`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedIntakeIds }),
+      });
+      if (res.ok) {
+        setIntakeOrders(prev => prev.filter(o => !selectedIntakeIds.includes(o._id)));
+        setSelectedIntakeIds([]);
+      } else {
+        const err = await res.json();
+        alert(err.error || "Disable failed");
+      }
+    } catch (err) {
+      alert("Error disabling orders");
+    } finally {
+      setDisablingIntake(false);
+    }
+  };
+
+  const filteredDisabledOrders = useMemo(() => {
+    if (!disabledSearchQuery.trim()) return disabledOrders;
+    const q = disabledSearchQuery.toLowerCase().trim();
+    return disabledOrders.filter(o =>
+      (o.contractNo || "").toLowerCase().includes(q) ||
+      (o.instituteName || "").toLowerCase().includes(q) ||
+      (o.itemName || "").toLowerCase().includes(q) ||
+      (o.firmCode || "").toLowerCase().includes(q)
+    );
+  }, [disabledOrders, disabledSearchQuery]);
+
+  const toggleSelectAllDisabled = (checked: boolean) => {
+    setSelectedDisabledIds(checked ? filteredDisabledOrders.map(o => o._id) : []);
+  };
+
+  const toggleSelectDisabledOne = (id: string, checked: boolean) => {
+    setSelectedDisabledIds(prev => (checked ? [...prev, id] : prev.filter(x => x !== id)));
+  };
+
+  // Undoes an accidental "Disable" - reuses the same transfer endpoint
+  // Intake's bulk transfer uses (it doesn't filter on the `disabled` flag),
+  // so a disabled row moves straight into Fetched GeM Orders same as any
+  // other intake row would.
+  const handleBulkTransferDisabled = async () => {
+    if (selectedDisabledIds.length === 0) return;
+    const confirmMsg = disabledFirmCode
+      ? `${selectedDisabledIds.length} order(s) ko "${disabledFirmCode}" firm ke saath Fetched GeM Orders me transfer karein? (In sabki apni fetch-time-select-ki-hui firm override ho jayegi)`
+      : `${selectedDisabledIds.length} order(s) ko unki apni-apni (fetch ke time select ki hui) firm ke saath Fetched GeM Orders me transfer karein?`;
+    if (!confirm(confirmMsg)) return;
+
+    setTransferringDisabled(true);
+    try {
+      const res = await fetch(`/api/gem-order-intake/transfer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedDisabledIds, firmCode: disabledFirmCode }),
+      });
+      if (res.ok) {
+        const result = await res.json();
+        setSelectedDisabledIds([]);
+        fetchRawOrders(); // pull the newly transferred rows into the Fetched Orders tab
+        fetchDisabledOrders();
+        if (result.skipped?.length > 0) {
+          const reasons = result.skipped.map((s: { contractNo: string; reason: string }) => `${s.contractNo}: ${s.reason}`).join("\n");
+          alert(`${result.transferred} transferred.\n${result.skipped.length} skipped:\n${reasons}`);
+        } else {
+          alert(`✓ ${result.transferred} order(s) transferred to Fetched GeM Orders.`);
+        }
+      } else {
+        const err = await res.json();
+        alert(err.error || "Transfer failed");
+      }
+    } catch (err) {
+      alert("Error transferring orders");
+    } finally {
+      setTransferringDisabled(false);
+    }
+  };
+
+  const sortedOrders = useMemo(() => {
+    if (!sortConfig) return filteredOrders;
+    const items = [...filteredOrders];
+    items.sort((a, b) => {
+      const valA = (a[sortConfig.key] || "").toString().toLowerCase();
+      const valB = (b[sortConfig.key] || "").toString().toLowerCase();
+      if (valA < valB) return sortConfig.direction === "asc" ? -1 : 1;
+      if (valA > valB) return sortConfig.direction === "asc" ? 1 : -1;
+      return 0;
+    });
+    return items;
+  }, [filteredOrders, sortConfig]);
+
+  const SortHeader = ({ label, sortKey }: { label: string; sortKey: "firmCode" | "instituteName" | "itemName" }) => (
+    <th
+      onClick={() => handleSort(sortKey)}
+      className="px-3 py-3 cursor-pointer select-none hover:text-blue-600 transition-colors"
+    >
+      <div className="flex items-center gap-1">
+        {label}
+        {sortConfig?.key === sortKey ? (
+          sortConfig.direction === "asc" ? <FiChevronUp size={12} /> : <FiChevronDown size={12} />
+        ) : (
+          <FiChevronUp size={12} className="opacity-20" />
+        )}
+      </div>
+    </th>
+  );
+
+  return (
+    <div className="p-4 md:p-10 max-w-[1600px] mx-auto font-sans">
+      {/* Top Header Navigation */}
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-8">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => router.push("/dashboard/orders")}
+            title="Back to Orders Dashboard"
+            className="flex items-center text-slate-500 hover:text-blue-600 transition-colors"
+          >
+            <FiArrowLeft size={20} />
+          </button>
+          <h1 className="text-xl font-black uppercase tracking-tight text-slate-800">Fetched GeM Order</h1>
+        </div>
+        <div className="flex items-center gap-3">
+          {pageTab === "fetched" && (
+            <>
+              <button
+                onClick={() => setIsAddItemModalOpen(true)}
+                title="Add a new stock item without leaving this page - useful when a row below shows No match (shortcut: Ctrl+Shift+A)"
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-xs uppercase tracking-wider transition-colors"
+              >
+                <FiPlus size={14} /> Add New Item
+              </button>
+              <button
+                onClick={openFetchHistory}
+                title="Har firm ke GeM orders last kab fetch hue the"
+                className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-xs uppercase tracking-wider transition-colors"
+              >
+                <FiClock size={14} /> History
+              </button>
+              <button
+                onClick={runBulkAutoMatch}
+                disabled={matchingAll || rawOrders.length === 0}
+                title="Match Institute + Item from the Sheet Library for all pending orders below"
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs uppercase tracking-wider transition-colors disabled:opacity-50"
+              >
+                <FiZap className={matchingAll ? "animate-pulse" : ""} size={14} /> {matchingAll ? "Matching..." : "Auto-Match Items"}
+              </button>
+            </>
+          )}
+          <button
+            onClick={() => (pageTab === "fetched" ? fetchRawOrders() : pageTab === "intake" ? fetchIntakeOrders() : fetchDisabledOrders())}
+            disabled={pageTab === "fetched" ? refreshing : pageTab === "intake" ? intakeRefreshing : disabledRefreshing}
+            className="flex items-center gap-2 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold text-xs uppercase tracking-wider transition-colors disabled:opacity-50"
+          >
+            <FiRefreshCw className={(pageTab === "fetched" ? refreshing : pageTab === "intake" ? intakeRefreshing : disabledRefreshing) ? "animate-spin" : ""} size={14} /> Refresh
+          </button>
+        </div>
+      </div>
+
+      {/* Tab Switcher */}
+      <div className="flex gap-2 mb-5">
+        <button
+          onClick={() => setPageTab("fetched")}
+          className={`px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${pageTab === "fetched" ? "bg-slate-900 text-white shadow-md" : "bg-white text-slate-500 border border-slate-200 hover:bg-slate-50"}`}
+        >
+          Fetched Orders ({rawOrders.length})
+        </button>
+        <button
+          onClick={() => setPageTab("intake")}
+          className={`px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${pageTab === "intake" ? "bg-slate-900 text-white shadow-md" : "bg-white text-slate-500 border border-slate-200 hover:bg-slate-50"}`}
+        >
+          Intake ({intakeOrders.length})
+        </button>
+        <button
+          onClick={() => setPageTab("disabled")}
+          className={`px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-wider transition-all ${pageTab === "disabled" ? "bg-slate-900 text-white shadow-md" : "bg-white text-slate-500 border border-slate-200 hover:bg-slate-50"}`}
+        >
+          Disabled ({disabledOrders.length})
+        </button>
+      </div>
+
+      {pageTab === "fetched" && (
+        <>
+          {/* Controls Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm mb-6">
+            <div className="relative flex-1 min-w-[260px]">
+              <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Search contract no, buyer, or item name..."
+                className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 font-medium"
+              />
+            </div>
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+              Total Pending: <span className="text-blue-600 font-black">{filteredOrders.length}</span>
+            </div>
+          </div>
+
+          {/* Orders List */}
+          {loading ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiRefreshCw className="animate-spin text-blue-600 mx-auto mb-3" size={28} />
+              <p className="text-slate-500 font-bold text-sm">Loading fetched orders...</p>
+            </div>
+          ) : filteredOrders.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiAlertCircle className="text-slate-400 mx-auto mb-3" size={36} />
+              <h3 className="text-lg font-black text-slate-700 uppercase">No Pending GeM Orders</h3>
+              <p className="text-slate-400 text-xs mt-1">
+                Transfer orders in from the Intake tab above to verify them here.
+              </p>
+            </div>
+          ) : (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse min-w-[900px]">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 font-black uppercase tracking-wider border-b border-slate-200">
+                    <SortHeader label="Firm" sortKey="firmCode" />
+                    <SortHeader label="Buyer" sortKey="instituteName" />
+                    <th className="px-3 py-3">Cat.</th>
+                    <SortHeader label="Item Details" sortKey="itemName" />
+                    <th className="px-3 py-3">Contract</th>
+                    <th className="px-3 py-3 text-center">O-Qty</th>
+                    <th className="px-3 py-3 text-right">Rate</th>
+                    <th className="px-3 py-3 text-right">Total</th>
+                    <th className="px-3 py-3 text-center">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {sortedOrders.map((order) => {
+                    const matchedBuyer = guessBuyerForOrder(order);
+                    return (
+                    <tr key={order._id} className="hover:bg-slate-50 transition-colors">
+                      <td className="px-3 py-3 font-black text-slate-700">{order.firmCode || "—"}</td>
+                      <td className="px-3 py-3 max-w-56">
+                        <div className="font-bold text-slate-800 truncate" title={order.instituteName}>{order.instituteName}</div>
+                        {matchedBuyer ? (
+                          <div className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold truncate" title={matchedBuyer.name}>
+                            <FiCheck size={11} /> {matchedBuyer.name}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-amber-600 font-semibold">No match</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-3 text-slate-400">—</td>
+                      <td className="px-3 py-3 max-w-72">
+                        <div className="font-bold text-slate-900 truncate">{order.itemName}</div>
+                        {matchResults[order._id]?.itemName && (
+                          <div className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold truncate" title={matchResults[order._id]!.itemName}>
+                            <FiCheck size={11} /> {matchResults[order._id]!.itemName}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-3 py-3">
+                        <a
+                          href={order.contractUrl || "#"}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1 text-blue-600 hover:text-blue-800 font-bold"
+                        >
+                          {order.contractNo}
+                          {order.contractUrl && <FiExternalLink size={11} />}
+                        </a>
+                        {order.contractDate && <div className="text-[10px] text-slate-400 font-semibold">{order.contractDate}</div>}
+                      </td>
+                      <td className="px-3 py-3 text-center font-bold text-slate-900">{order.qty} nos</td>
+                      <td className="px-3 py-3 text-right font-bold text-slate-900">₹{order.rate}</td>
+                      <td className="px-3 py-3 text-right font-black text-emerald-700">₹{order.totalAmount}</td>
+                      <td className="px-3 py-3">
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            onClick={() => openVerifyModal(order)}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold text-[10px] uppercase tracking-wider transition-all"
+                          >
+                            <FiCheckCircle size={13} /> Verify
+                          </button>
+                          <button
+                            onClick={() => handleDelete(order._id, order.contractNo)}
+                            className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors"
+                            title="Reject Order"
+                          >
+                            <FiTrash2 size={15} />
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      {pageTab === "intake" && (
+        <>
+          {/* Controls Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm mb-6">
+            <div className="relative flex-1 min-w-[260px]">
+              <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+              <input
+                type="text"
+                value={intakeSearchQuery}
+                onChange={(e) => setIntakeSearchQuery(e.target.value)}
+                placeholder="Search contract no, buyer, item, or firm..."
+                className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 font-medium"
+              />
+            </div>
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+              Total Pending: <span className="text-blue-600 font-black">{filteredIntakeOrders.length}</span>
+            </div>
+          </div>
+
+          {/* Bulk Action Bar */}
+          {selectedIntakeIds.length > 0 && (
+            <div className="flex flex-wrap items-center gap-3 bg-blue-50 border border-blue-200 p-4 rounded-xl mb-6">
+              <span className="text-xs font-black text-blue-800 uppercase tracking-wider">{selectedIntakeIds.length} Selected</span>
+              <select
+                value={intakeFirmCode}
+                onChange={(e) => setIntakeFirmCode(e.target.value)}
+                title="Default: har order apni fetch-time-select-ki-hui firm ke saath hi transfer hoga. Yahan se sirf tab kuch chuno jab jaan-bujhke sabko ek hi firm me force karna ho."
+                className="p-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none focus:border-blue-500"
+              >
+                <option value="">Keep Original Firm (per order)</option>
+                {companies.map(c => (
+                  <option key={c._id} value={c.firmCode}>Force: {c.firmName} ({c.firmCode})</option>
+                ))}
+              </select>
+              <button
+                onClick={handleBulkTransfer}
+                disabled={transferring}
+                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+              >
+                <FiCheckCircle size={13} /> {transferring ? "Transferring..." : `Transfer to Orders (${selectedIntakeIds.length})`}
+              </button>
+              <button
+                onClick={handleBulkDisableIntake}
+                disabled={disablingIntake}
+                className="flex items-center gap-1.5 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+              >
+                <FiTrash2 size={13} /> {disablingIntake ? "Disabling..." : `Disable (${selectedIntakeIds.length})`}
+              </button>
+            </div>
+          )}
+
+          {/* Intake List */}
+          {intakeLoading ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiRefreshCw className="animate-spin text-blue-600 mx-auto mb-3" size={28} />
+              <p className="text-slate-500 font-bold text-sm">Loading intake...</p>
+            </div>
+          ) : filteredIntakeOrders.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiAlertCircle className="text-slate-400 mx-auto mb-3" size={36} />
+              <h3 className="text-lg font-black text-slate-700 uppercase">No Pending Intake</h3>
+              <p className="text-slate-400 text-xs mt-1">
+                Fetch orders using the Chrome Extension - new ones will land here for triage first.
+              </p>
+            </div>
+          ) : (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse min-w-[900px]">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 font-black uppercase tracking-wider border-b border-slate-200">
+                    <th className="px-3 py-3 w-10 text-center">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 rounded border-slate-300 text-emerald-600 cursor-pointer"
+                        checked={filteredIntakeOrders.length > 0 && filteredIntakeOrders.every(o => selectedIntakeIds.includes(o._id))}
+                        onChange={(e) => toggleSelectAllIntake(e.target.checked)}
+                      />
+                    </th>
+                    <th className="px-3 py-3">Firm</th>
+                    <th className="px-3 py-3">Buyer</th>
+                    <th className="px-3 py-3">Item Details</th>
+                    <th className="px-3 py-3">Contract</th>
+                    <th className="px-3 py-3 text-center">O-Qty</th>
+                    <th className="px-3 py-3 text-right">Rate</th>
+                    <th className="px-3 py-3 text-right">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredIntakeOrders.map((order) => {
+                    const matchedBuyer = guessBuyerForOrder(order);
+                    return (
+                    <tr key={order._id} className={`hover:bg-slate-50 transition-colors ${selectedIntakeIds.includes(order._id) ? "bg-blue-50/50" : ""}`}>
+                      <td className="px-3 py-3 text-center">
+                        <input
+                          type="checkbox"
+                          className="w-4 h-4 rounded border-slate-300 text-emerald-600 cursor-pointer"
+                          checked={selectedIntakeIds.includes(order._id)}
+                          onChange={(e) => toggleSelectIntakeOne(order._id, e.target.checked)}
+                        />
+                      </td>
+                      <td className="px-3 py-3 font-black text-slate-700">{order.firmCode || "—"}</td>
+                      <td className="px-3 py-3 max-w-56">
+                        <div className="font-bold text-slate-800 truncate" title={order.instituteName}>{order.instituteName}</div>
+                        {matchedBuyer ? (
+                          <div className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold truncate" title={matchedBuyer.name}>
+                            <FiCheck size={11} /> {matchedBuyer.name}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-amber-600 font-semibold">No match</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-3 max-w-72">
+                        <div className="font-bold text-slate-900 truncate">{order.itemName}</div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <a
+                          href={order.contractUrl || "#"}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1 text-blue-600 hover:text-blue-800 font-bold"
+                        >
+                          {order.contractNo}
+                          {order.contractUrl && <FiExternalLink size={11} />}
+                        </a>
+                        {order.contractDate && <div className="text-[10px] text-slate-400 font-semibold">{order.contractDate}</div>}
+                      </td>
+                      <td className="px-3 py-3 text-center font-bold text-slate-900">{order.qty} nos</td>
+                      <td className="px-3 py-3 text-right font-bold text-slate-900">₹{order.rate}</td>
+                      <td className="px-3 py-3 text-right font-black text-emerald-700">₹{order.totalAmount}</td>
+                    </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      {pageTab === "disabled" && (
+        <>
+          {/* Controls Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm mb-6">
+            <div className="relative flex-1 min-w-[260px]">
+              <FiSearch className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
+              <input
+                type="text"
+                value={disabledSearchQuery}
+                onChange={(e) => setDisabledSearchQuery(e.target.value)}
+                placeholder="Search contract no, buyer, item, or firm..."
+                className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 font-medium"
+              />
+            </div>
+            <div className="text-xs font-bold text-slate-500 uppercase tracking-wider">
+              Total Disabled: <span className="text-blue-600 font-black">{filteredDisabledOrders.length}</span>
+            </div>
+          </div>
+
+          {/* Bulk Action Bar */}
+          {selectedDisabledIds.length > 0 && (
+            <div className="flex flex-wrap items-center gap-3 bg-blue-50 border border-blue-200 p-4 rounded-xl mb-6">
+              <span className="text-xs font-black text-blue-800 uppercase tracking-wider">{selectedDisabledIds.length} Selected</span>
+              <select
+                value={disabledFirmCode}
+                onChange={(e) => setDisabledFirmCode(e.target.value)}
+                title="Default: har order apni fetch-time-select-ki-hui firm ke saath hi transfer hoga. Yahan se sirf tab kuch chuno jab jaan-bujhke sabko ek hi firm me force karna ho."
+                className="p-2 bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-800 focus:outline-none focus:border-blue-500"
+              >
+                <option value="">Keep Original Firm (per order)</option>
+                {companies.map(c => (
+                  <option key={c._id} value={c.firmCode}>Force: {c.firmName} ({c.firmCode})</option>
+                ))}
+              </select>
+              <button
+                onClick={handleBulkTransferDisabled}
+                disabled={transferringDisabled}
+                className="flex items-center gap-1.5 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg font-bold text-[10px] uppercase tracking-wider transition-all disabled:opacity-50"
+              >
+                <FiCheckCircle size={13} /> {transferringDisabled ? "Transferring..." : `Transfer to Orders (${selectedDisabledIds.length})`}
+              </button>
+            </div>
+          )}
+
+          {/* Disabled List */}
+          {disabledLoading ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiRefreshCw className="animate-spin text-blue-600 mx-auto mb-3" size={28} />
+              <p className="text-slate-500 font-bold text-sm">Loading disabled orders...</p>
+            </div>
+          ) : filteredDisabledOrders.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-slate-200 shadow-sm">
+              <FiAlertCircle className="text-slate-400 mx-auto mb-3" size={36} />
+              <h3 className="text-lg font-black text-slate-700 uppercase">No Disabled Orders</h3>
+              <p className="text-slate-400 text-xs mt-1">
+                Orders disabled from the Intake tab show up here - select some and Transfer to undo.
+              </p>
+            </div>
+          ) : (
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-x-auto">
+              <table className="w-full text-left text-xs border-collapse min-w-[900px]">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-500 font-black uppercase tracking-wider border-b border-slate-200">
+                    <th className="px-3 py-3 w-10 text-center">
+                      <input
+                        type="checkbox"
+                        className="w-4 h-4 rounded border-slate-300 text-emerald-600 cursor-pointer"
+                        checked={filteredDisabledOrders.length > 0 && filteredDisabledOrders.every(o => selectedDisabledIds.includes(o._id))}
+                        onChange={(e) => toggleSelectAllDisabled(e.target.checked)}
+                      />
+                    </th>
+                    <th className="px-3 py-3">Firm</th>
+                    <th className="px-3 py-3">Buyer</th>
+                    <th className="px-3 py-3">Item Details</th>
+                    <th className="px-3 py-3">Contract</th>
+                    <th className="px-3 py-3 text-center">O-Qty</th>
+                    <th className="px-3 py-3 text-right">Rate</th>
+                    <th className="px-3 py-3 text-right">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredDisabledOrders.map((order) => {
+                    const matchedBuyer = guessBuyerForOrder(order);
+                    return (
+                    <tr key={order._id} className={`hover:bg-slate-50 transition-colors ${selectedDisabledIds.includes(order._id) ? "bg-blue-50/50" : ""}`}>
+                      <td className="px-3 py-3 text-center">
+                        <input
+                          type="checkbox"
+                          className="w-4 h-4 rounded border-slate-300 text-emerald-600 cursor-pointer"
+                          checked={selectedDisabledIds.includes(order._id)}
+                          onChange={(e) => toggleSelectDisabledOne(order._id, e.target.checked)}
+                        />
+                      </td>
+                      <td className="px-3 py-3 font-black text-slate-700">{order.firmCode || "—"}</td>
+                      <td className="px-3 py-3 max-w-56">
+                        <div className="font-bold text-slate-800 truncate" title={order.instituteName}>{order.instituteName}</div>
+                        {matchedBuyer ? (
+                          <div className="flex items-center gap-1 text-[10px] text-emerald-600 font-bold truncate" title={matchedBuyer.name}>
+                            <FiCheck size={11} /> {matchedBuyer.name}
+                          </div>
+                        ) : (
+                          <div className="text-[10px] text-amber-600 font-semibold">No match</div>
+                        )}
+                      </td>
+                      <td className="px-3 py-3 max-w-72">
+                        <div className="font-bold text-slate-900 truncate">{order.itemName}</div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <a
+                          href={order.contractUrl || "#"}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="flex items-center gap-1 text-blue-600 hover:text-blue-800 font-bold"
+                        >
+                          {order.contractNo}
+                          {order.contractUrl && <FiExternalLink size={11} />}
+                        </a>
+                        {order.contractDate && <div className="text-[10px] text-slate-400 font-semibold">{order.contractDate}</div>}
+                      </td>
+                      <td className="px-3 py-3 text-center font-bold text-slate-900">{order.qty} nos</td>
+                      <td className="px-3 py-3 text-right font-bold text-slate-900">₹{order.rate}</td>
+                      <td className="px-3 py-3 text-right font-black text-emerald-700">₹{order.totalAmount}</td>
+                    </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Verification Modal */}
+      {selectedOrder && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
+          <div className={`bg-white rounded-2xl w-full shadow-2xl overflow-hidden border border-slate-100 transition-all ${verifyItems.length > 1 ? "max-w-4xl" : "max-w-lg"}`}>
+            <div className="bg-slate-900 text-white p-6">
+              <h3 className="text-lg font-black uppercase tracking-tight">Verify GeM Order</h3>
+              <p className="text-slate-400 text-xs font-medium mt-1">
+                Contract: {selectedOrder.contractNo}
+              </p>
+            </div>
+
+            <div className="p-6 space-y-3 text-xs font-medium max-h-[78vh] overflow-y-auto">
+              <div>
+                <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                  Assign Firm (Company)
+                </label>
+                <select
+                  value={selectedFirmCode}
+                  onChange={(e) => setSelectedFirmCode(e.target.value)}
+                  className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-bold focus:outline-none focus:border-blue-500"
+                >
+                  {companies.length > 0 ? (
+                    companies.map(c => (
+                      <option key={c._id} value={c.firmCode}>{c.firmName} ({c.firmCode})</option>
+                    ))
+                  ) : (
+                    <option value="GeM">GeM Marketplace</option>
+                  )}
+                </select>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-slate-700 font-bold uppercase tracking-wider">
+                    Buyer / Institute
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setIsAddSellerModalOpen(true)}
+                    title="Naya institute Seller Directory me add karo"
+                    className="flex items-center gap-1 text-[10px] font-black text-blue-600 hover:text-blue-800 uppercase tracking-wider"
+                  >
+                    <FiPlus size={12} /> Add Seller
+                  </button>
+                </div>
+                <select
+                  value={customInstituteName}
+                  onChange={(e) => setCustomInstituteName(e.target.value)}
+                  className={`w-full p-2.5 bg-slate-50 border rounded-lg text-slate-800 font-semibold focus:outline-none ${customInstituteName ? "border-slate-200 focus:border-blue-500" : "border-red-400 focus:border-red-500"}`}
+                >
+                  <option value="">-- Select Institute --</option>
+                  {buyerOptions.map((b) => (
+                    <option key={b.id} value={b.name}>{b.name}</option>
+                  ))}
+                </select>
+                {!customInstituteName && (
+                  <p className="text-[10px] text-red-600 font-semibold mt-1">
+                    GeM se aaya raw text: "{selectedOrder?.instituteName}" - upar se sahi institute chuno (required).
+                  </p>
+                )}
+              </div>
+
+              {autoFillHint && (
+                <p className="text-[10px] text-emerald-600 font-bold">✓ {autoFillHint}</p>
+              )}
+
+              {verifyItems.length === 1 ? (
+                // Exactly one item - the common case - looks like the
+                // original single-item Verify form (full-width, labelled
+                // fields). Switches to the compact multi-row layout below
+                // the moment a second item is added.
+                (() => {
+                  const row = verifyItems[0];
+                  const itemSuggestions = getItemSuggestions(row.itemQuery);
+                  return (
+                    <>
+                      <div className="relative">
+                        <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                          Item Name {row.selectedStockItem && <span className="text-emerald-600 normal-case font-semibold">(SKU: {row.selectedStockItem.sku})</span>}
+                        </label>
+                        <input
+                          type="text"
+                          value={row.itemQuery}
+                          onChange={(e) => {
+                            updateVerifyItemRow(0, {
+                              itemQuery: e.target.value,
+                              selectedStockItem: null,
+                              showSuggestions: true,
+                              highlightedIndex: -1,
+                            });
+                          }}
+                          onFocus={() => updateVerifyItemRow(0, { showSuggestions: true })}
+                          onBlur={() => setTimeout(() => updateVerifyItemRow(0, { showSuggestions: false }), 150)}
+                          onKeyDown={(e) => {
+                            if (!row.showSuggestions || itemSuggestions.length === 0) return;
+                            if (e.key === "ArrowDown") {
+                              e.preventDefault();
+                              const next = row.highlightedIndex < itemSuggestions.length - 1 ? row.highlightedIndex + 1 : 0;
+                              updateVerifyItemRow(0, { highlightedIndex: next });
+                              itemSuggestionRefsByRow.current[row.key]?.[next]?.scrollIntoView({ block: "nearest" });
+                            } else if (e.key === "ArrowUp") {
+                              e.preventDefault();
+                              const next = row.highlightedIndex > 0 ? row.highlightedIndex - 1 : itemSuggestions.length - 1;
+                              updateVerifyItemRow(0, { highlightedIndex: next });
+                              itemSuggestionRefsByRow.current[row.key]?.[next]?.scrollIntoView({ block: "nearest" });
+                            } else if (e.key === "Enter") {
+                              if (row.highlightedIndex >= 0 && itemSuggestions[row.highlightedIndex]) {
+                                e.preventDefault();
+                                handleSelectStockItemForRow(0, itemSuggestions[row.highlightedIndex]);
+                              }
+                            }
+                          }}
+                          placeholder="Search stock item..."
+                          className={`w-full p-2.5 bg-slate-50 border rounded-lg text-slate-800 font-semibold focus:outline-none ${row.selectedStockItem ? "border-slate-200 focus:border-blue-500" : "border-red-400 focus:border-red-500"}`}
+                        />
+                        {!row.selectedStockItem && (
+                          <p className="text-[10px] text-red-600 font-semibold mt-1">
+                            Suggestions me se ek real stock item select karo (required) — GeM ka raw naam seedha save nahi hoga.
+                          </p>
+                        )}
+                        {row.showSuggestions && itemSuggestions.length > 0 && (
+                          <div className="absolute z-10 mt-1 w-full max-h-64 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+                            {itemSuggestions.map((item, idx) => (
+                              <button
+                                type="button"
+                                key={item._id}
+                                ref={(el) => {
+                                  if (!itemSuggestionRefsByRow.current[row.key]) itemSuggestionRefsByRow.current[row.key] = [];
+                                  itemSuggestionRefsByRow.current[row.key][idx] = el;
+                                }}
+                                onMouseEnter={() => updateVerifyItemRow(0, { highlightedIndex: idx })}
+                                onMouseDown={() => handleSelectStockItemForRow(0, item)}
+                                className={`w-full text-left px-3 py-2 border-b border-slate-50 last:border-0 ${
+                                  idx === row.highlightedIndex ? "bg-blue-50" : "hover:bg-blue-50"
+                                }`}
+                              >
+                                <div className="font-bold text-slate-800">{item.itemName}</div>
+                                <div className="text-[10px] text-slate-400">SKU: {item.sku} · {item.category}</div>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+
+                        {row.variantSiblings.length > 1 && (
+                          <div className="mt-2">
+                            <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">Variant</label>
+                            <select
+                              value={row.selectedStockItem?._id || ""}
+                              onChange={(e) => {
+                                const chosen = row.variantSiblings.find((v) => v._id === e.target.value);
+                                if (chosen) handleSelectStockItemForRow(0, chosen);
+                              }}
+                              className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold focus:outline-none focus:border-blue-500"
+                            >
+                              {row.variantSiblings.map((v) => (
+                                <option key={v._id} value={v._id}>{v.variantLabel || v.sku}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                            Quantity
+                          </label>
+                          <input
+                            type="number"
+                            value={row.qty}
+                            onChange={(e) => updateVerifyItemRow(0, { qty: Number(e.target.value) })}
+                            className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold focus:outline-none focus:border-blue-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                            Rate (₹)
+                          </label>
+                          <input
+                            type="number"
+                            value={row.rate}
+                            onChange={(e) => updateVerifyItemRow(0, { rate: Number(e.target.value) })}
+                            className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-800 font-semibold focus:outline-none focus:border-blue-500"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                          Remark / Note
+                        </label>
+                        <input
+                          type="text"
+                          value={row.remark}
+                          onChange={(e) => updateVerifyItemRow(0, { remark: e.target.value })}
+                          className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-black font-semibold focus:outline-none focus:border-blue-500"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                          Total Amount (₹)
+                        </label>
+                        <div className="p-2.5 bg-emerald-50 text-emerald-800 font-black rounded-lg text-sm">
+                          ₹{row.qty * row.rate}
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()
+              ) : (
+                // Two or more items - a single GeM contract can bundle
+                // several different items (merge order) - the compact
+                // per-row layout, column labels shown once above the list.
+                <>
+                  <div className="flex items-center gap-2 px-0.5">
+                    <div className="flex-1 text-slate-500 font-bold uppercase tracking-wider text-[10px]">Item Name</div>
+                    <div className="w-16 shrink-0 text-slate-500 font-bold uppercase tracking-wider text-[10px] text-center">Qty</div>
+                    <div className="w-20 shrink-0 text-slate-500 font-bold uppercase tracking-wider text-[10px] text-center">Rate ₹</div>
+                    <div className="w-24 shrink-0 text-slate-500 font-bold uppercase tracking-wider text-[10px] text-center">Total ₹</div>
+                    <div className="w-40 shrink-0 text-slate-500 font-bold uppercase tracking-wider text-[10px]">Remark</div>
+                    <div className="w-4 shrink-0" />
+                  </div>
+
+                  <div className="divide-y divide-slate-100">
+                  {verifyItems.map((row, index) => {
+                    const itemSuggestions = getItemSuggestions(row.itemQuery);
+                    return (
+                      <div key={row.key} className="py-1.5 space-y-1">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 min-w-0 relative">
+                            <input
+                              type="text"
+                              value={row.itemQuery}
+                              onChange={(e) => {
+                                updateVerifyItemRow(index, {
+                                  itemQuery: e.target.value,
+                                  selectedStockItem: null,
+                                  showSuggestions: true,
+                                  highlightedIndex: -1,
+                                });
+                              }}
+                              onFocus={() => updateVerifyItemRow(index, { showSuggestions: true })}
+                              onBlur={() => setTimeout(() => updateVerifyItemRow(index, { showSuggestions: false }), 150)}
+                              onKeyDown={(e) => {
+                                if (!row.showSuggestions || itemSuggestions.length === 0) return;
+                                if (e.key === "ArrowDown") {
+                                  e.preventDefault();
+                                  const next = row.highlightedIndex < itemSuggestions.length - 1 ? row.highlightedIndex + 1 : 0;
+                                  updateVerifyItemRow(index, { highlightedIndex: next });
+                                  itemSuggestionRefsByRow.current[row.key]?.[next]?.scrollIntoView({ block: "nearest" });
+                                } else if (e.key === "ArrowUp") {
+                                  e.preventDefault();
+                                  const next = row.highlightedIndex > 0 ? row.highlightedIndex - 1 : itemSuggestions.length - 1;
+                                  updateVerifyItemRow(index, { highlightedIndex: next });
+                                  itemSuggestionRefsByRow.current[row.key]?.[next]?.scrollIntoView({ block: "nearest" });
+                                } else if (e.key === "Enter") {
+                                  if (row.highlightedIndex >= 0 && itemSuggestions[row.highlightedIndex]) {
+                                    e.preventDefault();
+                                    handleSelectStockItemForRow(index, itemSuggestions[row.highlightedIndex]);
+                                  }
+                                }
+                              }}
+                              placeholder="Search stock item..."
+                              className={`w-full p-2 bg-white border rounded-lg text-slate-800 font-semibold focus:outline-none ${row.selectedStockItem ? "border-slate-200 focus:border-blue-500" : "border-red-400 focus:border-red-500"}`}
+                            />
+                            {row.showSuggestions && itemSuggestions.length > 0 && (
+                              <div className="absolute z-10 mt-1 w-full max-h-64 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-lg">
+                                {itemSuggestions.map((item, idx) => (
+                                  <button
+                                    type="button"
+                                    key={item._id}
+                                    ref={(el) => {
+                                      if (!itemSuggestionRefsByRow.current[row.key]) itemSuggestionRefsByRow.current[row.key] = [];
+                                      itemSuggestionRefsByRow.current[row.key][idx] = el;
+                                    }}
+                                    onMouseEnter={() => updateVerifyItemRow(index, { highlightedIndex: idx })}
+                                    onMouseDown={() => handleSelectStockItemForRow(index, item)}
+                                    className={`w-full text-left px-3 py-2 border-b border-slate-50 last:border-0 ${
+                                      idx === row.highlightedIndex ? "bg-blue-50" : "hover:bg-blue-50"
+                                    }`}
+                                  >
+                                    <div className="font-bold text-slate-800">{item.itemName}</div>
+                                    <div className="text-[10px] text-slate-400">SKU: {item.sku} · {item.category}</div>
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="w-16 shrink-0">
+                            <input
+                              type="number"
+                              value={row.qty}
+                              onChange={(e) => updateVerifyItemRow(index, { qty: Number(e.target.value) })}
+                              className="w-full p-2 bg-white border border-slate-200 rounded-lg text-slate-800 font-semibold text-center focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <div className="w-20 shrink-0">
+                            <input
+                              type="number"
+                              value={row.rate}
+                              onChange={(e) => updateVerifyItemRow(index, { rate: Number(e.target.value) })}
+                              className="w-full p-2 bg-white border border-slate-200 rounded-lg text-slate-800 font-semibold text-center focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <div className="w-24 shrink-0 p-2 bg-emerald-50 text-emerald-800 font-black rounded-lg text-sm text-center">
+                            ₹{row.qty * row.rate}
+                          </div>
+                          <div className="w-40 shrink-0">
+                            <input
+                              type="text"
+                              value={row.remark}
+                              onChange={(e) => updateVerifyItemRow(index, { remark: e.target.value })}
+                              placeholder="Remark / note..."
+                              className="w-full p-2 bg-white border border-slate-200 rounded-lg text-black font-semibold text-[11px] focus:outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => removeVerifyItemRow(index)}
+                            title="Remove this item"
+                            className="shrink-0 text-red-400 hover:text-red-600 transition-colors"
+                          >
+                            <FiTrash2 size={14} />
+                          </button>
+                        </div>
+
+                        <div className="flex items-center gap-2 flex-wrap pl-0.5">
+                          {row.selectedStockItem && (
+                            <span className="text-emerald-600 font-semibold text-[10px]">SKU: {row.selectedStockItem.sku}</span>
+                          )}
+                          {!row.selectedStockItem && (
+                            <span className="text-red-600 font-semibold text-[10px]">
+                              Suggestions me se ek real stock item select karo (required).
+                            </span>
+                          )}
+                        </div>
+
+                        {row.variantSiblings.length > 1 && (
+                          <select
+                            value={row.selectedStockItem?._id || ""}
+                            onChange={(e) => {
+                              const chosen = row.variantSiblings.find((v) => v._id === e.target.value);
+                              if (chosen) handleSelectStockItemForRow(index, chosen);
+                            }}
+                            className="w-full p-2 bg-white border border-slate-200 rounded-lg text-slate-800 font-semibold focus:outline-none focus:border-blue-500"
+                          >
+                            {row.variantSiblings.map((v) => (
+                              <option key={v._id} value={v._id}>{v.variantLabel || v.sku}</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                    );
+                  })}
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-700 font-bold uppercase tracking-wider mb-1">
+                      Grand Total (₹)
+                    </label>
+                    <div className="p-3 bg-emerald-100 text-emerald-900 font-black rounded-lg text-base">
+                      ₹{verifyItems.reduce((sum, row) => sum + row.qty * row.rate, 0)}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <button
+                type="button"
+                onClick={addVerifyItemRow}
+                className="flex items-center justify-center gap-1.5 w-full py-2.5 border-2 border-dashed border-slate-300 text-slate-500 hover:text-blue-600 hover:border-blue-400 rounded-lg font-bold uppercase text-[10px] tracking-wider transition-colors"
+              >
+                <FiPlus size={13} /> Add Another Item
+              </button>
+            </div>
+
+            <div className="p-6 bg-slate-50 border-t border-slate-100 flex items-center justify-end gap-3">
+              <button
+                onClick={() => setSelectedOrder(null)}
+                disabled={verifying}
+                className="px-4 py-2.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl font-bold uppercase text-xs tracking-wider transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleVerifySubmit}
+                disabled={verifying}
+                className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold uppercase text-xs tracking-wider transition-all shadow-md"
+              >
+                {verifying ? "Verifying..." : verifyItems.length > 1 ? `Approve & Move ${verifyItems.length} Orders` : "Approve & Move Order"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showFetchHistory && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[80vh] overflow-hidden flex flex-col">
+            <div className="p-6 bg-slate-900 text-white flex items-center justify-between">
+              <div>
+                <h2 className="font-black uppercase tracking-tight">Fetch History</h2>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Firm-wise last fetch date &amp; time</p>
+              </div>
+              <button onClick={() => setShowFetchHistory(false)} className="text-white/50 hover:text-white transition-colors">
+                <FiX size={20} />
+              </button>
+            </div>
+
+            <div className="overflow-y-auto p-4 space-y-2">
+              {loadingFetchHistory ? (
+                <p className="text-xs font-bold text-slate-400 text-center py-8">Loading...</p>
+              ) : fetchHistory.length === 0 ? (
+                <p className="text-xs font-bold text-slate-400 text-center py-8">No firms found.</p>
+              ) : (
+                fetchHistory.map((f) => (
+                  <div key={f.firmCode} className="flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-xl">
+                    <div>
+                      <p className="font-black text-slate-700 text-sm">{f.firmName}</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">{f.firmCode}</p>
+                    </div>
+                    {f.lastFetchedAt ? (
+                      <div className="text-right">
+                        <p className="text-xs font-bold text-slate-700">{new Date(f.lastFetchedAt).toLocaleDateString("en-GB")}</p>
+                        <p className="text-[10px] font-bold text-slate-400">{new Date(f.lastFetchedAt).toLocaleTimeString("en-GB")}</p>
+                      </div>
+                    ) : (
+                      <span className="text-[10px] font-black uppercase tracking-widest text-red-400">Never Fetched</span>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <AddItemModal
+        isOpen={isAddItemModalOpen}
+        onClose={() => {
+          setIsAddItemModalOpen(false);
+          fetchStockItems(); // so a newly-added item shows up for matching right away
+        }}
+      />
+
+      <AddSellerModal
+        isOpen={isAddSellerModalOpen}
+        onClose={() => setIsAddSellerModalOpen(false)}
+        prefill={{ instituteName: selectedOrder?.instituteName, gemLocationText: selectedOrder?.location }}
+        onCreated={(seller) => {
+          fetchSheetsAndBuyers(); // so the new institute shows up in the Buyer/Institute dropdown
+          setCustomInstituteName(seller.instituteName);
+        }}
+      />
+    </div>
+  );
+}

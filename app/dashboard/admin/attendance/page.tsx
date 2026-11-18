@@ -1,0 +1,1828 @@
+﻿"use client";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useRouter } from "next/navigation";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import BlockGuard from "@/components/BlockGuard";
+import PinGate from "@/components/PinGate";
+import {
+  FiArrowLeft,
+  FiUserCheck,
+  FiSave,
+  FiRefreshCw,
+  FiPlus,
+  FiDownloadCloud,
+  FiSlash,
+  FiRotateCcw,
+  FiX,
+  FiTrash2,
+  FiTrendingUp,
+  FiCreditCard,
+  FiCheckCircle,
+  FiBookOpen,
+  FiDownload,
+} from "react-icons/fi";
+
+interface Employee {
+  _id: string;
+  name: string;
+  employeeCode?: string;
+  mobile?: string;
+  designation?: string;
+  linkedUsername?: string;
+  isActive: boolean;
+  monthlySalary?: number;
+  joiningDate?: string | null;
+  salaryHistory?: SalaryChange[];
+}
+
+interface SalaryChange {
+  date: string;
+  oldSalary: number;
+  newSalary: number;
+  note?: string;
+  changedBy?: string;
+}
+
+type LedgerType = "advance" | "advance_repay" | "loan" | "loan_repay" | "salary";
+
+interface LedgerEntry {
+  _id: string;
+  employeeId: string;
+  date: string;
+  type: LedgerType;
+  amount: number;
+  note?: string;
+  createdBy?: string;
+  createdAt?: string;
+  // Salary approval rows only (see models/EmployeeLedger.ts)
+  approvalId?: string;
+  forMonth?: string;
+  calculatedAmount?: number;
+  finalSalary?: number;
+}
+
+interface Balance {
+  advanceGiven: number;
+  advanceRepaid: number;
+  advanceBalance: number;
+  loanGiven: number;
+  loanRepaid: number;
+  loanBalance: number;
+}
+
+const ZERO_BALANCE: Balance = {
+  advanceGiven: 0, advanceRepaid: 0, advanceBalance: 0,
+  loanGiven: 0, loanRepaid: 0, loanBalance: 0,
+};
+
+// Direction is carried by the type, never by the sign of the amount - see the
+// note at the top of models/EmployeeLedger.ts. Debit = firm ne diya (advance,
+// loan, salary); Credit = employee ne wapas jama kiya (advance/loan jama).
+const LEDGER_TYPES: { key: LedgerType; label: string; side: "debit" | "credit"; tone: string; pill: string }[] = [
+  { key: "advance", label: "Advance diya", side: "debit", tone: "text-amber-700", pill: "bg-amber-500 border-amber-500 text-white" },
+  { key: "advance_repay", label: "Advance jama", side: "credit", tone: "text-emerald-700", pill: "bg-emerald-600 border-emerald-600 text-white" },
+  { key: "loan", label: "Loan diya", side: "debit", tone: "text-rose-700", pill: "bg-rose-600 border-rose-600 text-white" },
+  { key: "loan_repay", label: "Loan jama", side: "credit", tone: "text-emerald-700", pill: "bg-emerald-600 border-emerald-600 text-white" },
+  { key: "salary", label: "Salary di", side: "debit", tone: "text-blue-700", pill: "bg-blue-600 border-blue-600 text-white" },
+];
+
+// Salary rows come only from the approval flow, so the quick-entry buttons
+// leave that one out.
+const QUICK_TYPES = LEDGER_TYPES.filter((t) => t.key !== "salary");
+
+const ledgerMeta = (key: string) => LEDGER_TYPES.find((t) => t.key === key);
+
+const monthLabel = (m: string) => {
+  const [y, mo] = m.split("-").map(Number);
+  return new Date(y, mo - 1, 1).toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+};
+
+const inr = (n: number) => `\u20b9${(Number(n) || 0).toLocaleString("en-IN")}`;
+
+const prettyDate = (d?: string | null) =>
+  d ? new Date(d).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "\u2014";
+
+interface AttendanceRecord {
+  employeeId: string;
+  employeeName: string;
+  date: string;
+  status: AttendanceStatus;
+  inTime?: string;
+  outTime?: string;
+  overtimeHours?: number;
+  note?: string;
+  markedBy?: string;
+}
+
+type AttendanceStatus = "present" | "absent" | "half_day" | "leave" | "holiday";
+
+// One place defining every status - the daily buttons, the monthly grid
+// letters and the totals row all read from here, so adding a status later
+// means editing this array and nothing else.
+const STATUSES: { key: AttendanceStatus; short: string; label: string; btn: string; cell: string }[] = [
+  { key: "present", short: "P", label: "Present", btn: "bg-emerald-600 border-emerald-600 text-white", cell: "bg-emerald-100 text-emerald-800" },
+  { key: "absent", short: "A", label: "Absent", btn: "bg-red-600 border-red-600 text-white", cell: "bg-red-100 text-red-800" },
+  { key: "half_day", short: "H", label: "Half Day", btn: "bg-amber-500 border-amber-500 text-white", cell: "bg-amber-100 text-amber-800" },
+  { key: "leave", short: "L", label: "Leave", btn: "bg-blue-600 border-blue-600 text-white", cell: "bg-blue-100 text-blue-800" },
+  { key: "holiday", short: "Ho", label: "Holiday", btn: "bg-slate-500 border-slate-500 text-white", cell: "bg-slate-200 text-slate-700" },
+];
+
+const statusMeta = (key: string) => STATUSES.find((s) => s.key === key);
+
+// Local calendar date, NOT toISOString(). toISOString() converts to UTC, so
+// in IST anything before 05:30 would report yesterday's date - the exact
+// off-by-one the "YYYY-MM-DD string" choice in models/Attendance.ts avoids.
+function todayLocal(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function daysInMonth(month: string): string[] {
+  const [y, m] = month.split("-").map(Number);
+  const count = new Date(y, m, 0).getDate(); // day 0 of next month = last day of this one
+  const p = (n: number) => String(n).padStart(2, "0");
+  return Array.from({ length: count }, (_, i) => `${month}-${p(i + 1)}`);
+}
+
+// What one row of the daily register holds while it is being edited.
+interface DraftRow {
+  status: AttendanceStatus;
+  inTime: string;
+  outTime: string;
+  overtimeHours: string;
+  note: string;
+}
+
+const BLANK_ROW: DraftRow = { status: "present", inTime: "", outTime: "", overtimeHours: "", note: "" };
+
+export default function AttendancePage() {
+  const router = useRouter();
+
+  const [tab, setTab] = useState<"daily" | "monthly" | "employees">("daily");
+  const [currentUsername, setCurrentUsername] = useState("");
+
+  const [employees, setEmployees] = useState<Employee[]>([]);
+  const [loadingEmployees, setLoadingEmployees] = useState(false);
+
+  // ---- Daily register ----
+  const [date, setDate] = useState(todayLocal());
+  const [draft, setDraft] = useState<Record<string, DraftRow>>({});
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  const [loadingDay, setLoadingDay] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  // ---- Monthly view ----
+  const [month, setMonth] = useState(todayLocal().slice(0, 7));
+  const [monthRecords, setMonthRecords] = useState<AttendanceRecord[]>([]);
+  const [loadingMonth, setLoadingMonth] = useState(false);
+
+  // ---- Employees tab ----
+  const [showInactive, setShowInactive] = useState(false);
+  const [newEmp, setNewEmp] = useState({
+    name: "", employeeCode: "", mobile: "", designation: "", monthlySalary: "", joiningDate: "",
+  });
+  const [savingEmp, setSavingEmp] = useState(false);
+
+  // Advance/loan balances for the whole list, summed server-side from the
+  // ledger entries (never stored on the employee).
+  const [balances, setBalances] = useState<Record<string, Balance>>({});
+
+  // ---- Employee detail (salary + ledger) ----
+  const [detailEmp, setDetailEmp] = useState<Employee | null>(null);
+  const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  const [detailBalance, setDetailBalance] = useState<Balance>(ZERO_BALANCE);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [incForm, setIncForm] = useState({ newSalary: "", effectiveDate: todayLocal(), note: "" });
+  const [ledgerForm, setLedgerForm] = useState<{ type: LedgerType; date: string; amount: string; note: string }>({
+    type: "advance", date: todayLocal(), amount: "", note: "",
+  });
+  const [savingDetail, setSavingDetail] = useState(false);
+  const [ledgerMonthFilter, setLedgerMonthFilter] = useState("");
+  const amountInputRef = useRef<HTMLInputElement>(null);
+
+  // ---- Salary approval (Monthly View) ----
+  // Approved salary row per employee for the month on screen.
+  const [approvals, setApprovals] = useState<Record<string, LedgerEntry>>({});
+  const [approvalTarget, setApprovalTarget] = useState<{
+    id: string;
+    name: string;
+    monthlySalary: number;
+    payableDays: number;
+    calculated: number;
+  } | null>(null);
+  const [approvalForm, setApprovalForm] = useState({
+    finalSalary: "", advanceDeduct: "", loanDeduct: "", date: todayLocal(), note: "",
+  });
+  const [savingApproval, setSavingApproval] = useState(false);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("oms_user");
+      if (stored) setCurrentUsername(JSON.parse(stored)?.username || "");
+    } catch {
+      // ignore - markedBy just ends up blank
+    }
+  }, []);
+
+  const loadEmployees = useCallback(() => {
+    setLoadingEmployees(true);
+    fetch(`/api/employees${showInactive ? "?all=1" : ""}`)
+      .then((res) => res.json())
+      .then((data) => setEmployees(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load employees", err))
+      .finally(() => setLoadingEmployees(false));
+  }, [showInactive]);
+
+  const loadBalances = useCallback(() => {
+    fetch("/api/employee-ledger")
+      .then((res) => res.json())
+      .then((data) => setBalances(data?.balances || {}))
+      .catch((err) => console.error("Failed to load balances", err));
+  }, []);
+
+  useEffect(() => {
+    loadEmployees();
+    loadBalances();
+  }, [loadEmployees, loadBalances]);
+
+  // Roster for the daily register - always the active people only, even when
+  // the Employees tab is showing deactivated ones.
+  const roster = useMemo(() => employees.filter((e) => e.isActive), [employees]);
+
+  // Loads whatever is already marked for this date and seeds the draft. Rows
+  // with no record yet start at Present: in a small firm that is the answer
+  // most days, so the admin only touches the exceptions. `savedIds` keeps the
+  // distinction visible - a prefilled Present is not the same as a saved one.
+  const loadDay = useCallback(() => {
+    if (!date) return;
+    setLoadingDay(true);
+    fetch(`/api/attendance?date=${date}`)
+      .then((res) => res.json())
+      .then((data: AttendanceRecord[]) => {
+        const records = Array.isArray(data) ? data : [];
+        const byId = new Map(records.map((r) => [r.employeeId, r]));
+        setSavedIds(new Set(records.map((r) => r.employeeId)));
+        setDraft(
+          Object.fromEntries(
+            roster.map((emp) => {
+              const rec = byId.get(emp._id);
+              return [
+                emp._id,
+                rec
+                  ? {
+                      status: rec.status,
+                      inTime: rec.inTime || "",
+                      outTime: rec.outTime || "",
+                      overtimeHours: rec.overtimeHours ? String(rec.overtimeHours) : "",
+                      note: rec.note || "",
+                    }
+                  : { ...BLANK_ROW },
+              ];
+            })
+          )
+        );
+      })
+      .catch((err) => console.error("Failed to load attendance", err))
+      .finally(() => setLoadingDay(false));
+  }, [date, roster]);
+
+  useEffect(() => {
+    if (tab === "daily" && roster.length > 0) loadDay();
+  }, [tab, roster, loadDay]);
+
+  const loadMonth = useCallback(() => {
+    if (!month) return;
+    setLoadingMonth(true);
+    fetch(`/api/attendance?month=${month}`)
+      .then((res) => res.json())
+      .then((data) => setMonthRecords(Array.isArray(data) ? data : []))
+      .catch((err) => console.error("Failed to load month", err))
+      .finally(() => setLoadingMonth(false));
+  }, [month]);
+
+  useEffect(() => {
+    if (tab === "monthly") loadMonth();
+  }, [tab, loadMonth]);
+
+  const loadApprovals = useCallback(() => {
+    if (!month) return;
+    fetch(`/api/employee-ledger?forMonth=${month}`)
+      .then((res) => res.json())
+      .then((data) => {
+        const rows: LedgerEntry[] = Array.isArray(data?.salaries) ? data.salaries : [];
+        setApprovals(Object.fromEntries(rows.map((r) => [r.employeeId, r])));
+      })
+      .catch((err) => console.error("Failed to load salary approvals", err));
+  }, [month]);
+
+  useEffect(() => {
+    if (tab === "monthly") loadApprovals();
+  }, [tab, loadApprovals]);
+
+  const openApproval = (p: { id: string; name: string; monthlySalary: number; payableDays: number; calculated: number }) => {
+    setApprovalTarget(p);
+    setApprovalForm({
+      finalSalary: String(Math.round(p.calculated)),
+      advanceDeduct: "",
+      loanDeduct: "",
+      date: todayLocal(),
+      note: "",
+    });
+  };
+
+  const handleApproveSalary = async () => {
+    if (!approvalTarget) return;
+    const finalSalary = Number(approvalForm.finalSalary);
+    const advanceDeduct = Number(approvalForm.advanceDeduct) || 0;
+    const loanDeduct = Number(approvalForm.loanDeduct) || 0;
+    if (!Number.isFinite(finalSalary) || finalSalary < 0) {
+      alert("Final salary ka valid number daalo.");
+      return;
+    }
+    setSavingApproval(true);
+    try {
+      const res = await fetch("/api/employee-ledger?action=approve_salary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          employeeId: approvalTarget.id,
+          employeeName: approvalTarget.name,
+          forMonth: month,
+          date: approvalForm.date,
+          calculatedAmount: approvalTarget.calculated,
+          finalSalary,
+          advanceDeduct,
+          loanDeduct,
+          note: approvalForm.note,
+          createdBy: currentUsername,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed");
+      setApprovalTarget(null);
+      loadApprovals();
+      loadBalances();
+      if (detailEmp?._id === approvalTarget.id) refreshAfterDetailChange(approvalTarget.id);
+    } catch (err: any) {
+      alert("Salary approve nahi hui: " + err.message);
+    } finally {
+      setSavingApproval(false);
+    }
+  };
+
+  const handleUndoApproval = async (entry: LedgerEntry, name: string) => {
+    if (
+      !confirm(
+        `${name} ki ${entry.forMonth ? monthLabel(entry.forMonth) : ""} ki salary approval undo karein? Salary di aur usse kati hui advance/loan ki entries, sab hat jayengi.`
+      )
+    )
+      return;
+    try {
+      const res = await fetch(`/api/employee-ledger?id=${entry._id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error((await res.json())?.error || "Failed");
+      loadApprovals();
+      loadBalances();
+      if (detailEmp?._id === entry.employeeId) refreshAfterDetailChange(entry.employeeId);
+    } catch (err: any) {
+      alert("Undo nahi hua: " + err.message);
+    }
+  };
+
+  // Salary Slip PDF - one page per employee for the month on screen. Pulls
+  // only from data already on screen (attendance counts, the calculated
+  // Net Payable, and this month's approval row if one exists) rather than a
+  // fresh fetch, so what's in the slip always matches what's visible in the
+  // table it was downloaded from.
+  const downloadSalarySlip = (p: {
+    id: string;
+    name: string;
+    emp?: Employee;
+    counts: Record<string, number>;
+    otTotal: number;
+    payableDays: number;
+    perDayRate: number;
+    netPayable: number;
+    balance: Balance;
+    records: Map<string, AttendanceRecord>;
+  }) => {
+    const approval = approvals[p.id];
+    const doc = new jsPDF();
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(10, 37, 64);
+    doc.text("SALARY SLIP", pageWidth / 2, 18, { align: "center" });
+    doc.setFontSize(9);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(120);
+    doc.text("Dev OMS Internal Management System", pageWidth / 2, 24, { align: "center" });
+
+    doc.setDrawColor(220);
+    doc.line(14, 29, pageWidth - 14, 29);
+
+    doc.setFontSize(10);
+    doc.setTextColor(30);
+    doc.setFont("helvetica", "bold");
+    doc.text(p.name.toUpperCase(), 14, 38);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    const infoLines = [
+      p.emp?.employeeCode ? `Employee Code: ${p.emp.employeeCode}` : "",
+      p.emp?.designation ? `Designation: ${p.emp.designation}` : "",
+      p.emp?.joiningDate ? `Joined: ${prettyDate(p.emp.joiningDate)}` : "",
+    ].filter(Boolean);
+    doc.text(infoLines, 14, 44);
+
+    doc.setFont("helvetica", "bold");
+    doc.text(`Month: ${monthLabel(month)}`, pageWidth - 14, 38, { align: "right" });
+    doc.setFont("helvetica", "normal");
+    doc.text(`Generated: ${prettyDate(todayLocal())}`, pageWidth - 14, 44, { align: "right" });
+
+    const attendanceStartY = 56 + (infoLines.length > 1 ? (infoLines.length - 1) * 4 : 0);
+    autoTable(doc, {
+      startY: attendanceStartY,
+      head: [["Present", "Absent", "Half Day", "Leave", "Holiday", "OT (hrs)", "Payable Days"]],
+      body: [[
+        p.counts["present"] || 0,
+        p.counts["absent"] || 0,
+        p.counts["half_day"] || 0,
+        p.counts["leave"] || 0,
+        p.counts["holiday"] || 0,
+        p.otTotal || 0,
+        p.payableDays,
+      ]],
+      theme: "grid",
+      styles: { fontSize: 9, halign: "center", cellPadding: 3 },
+      headStyles: { fillColor: [10, 37, 64], textColor: 255 },
+    });
+
+    const afterAttendanceY = (doc as any).lastAutoTable.finalY + 8;
+    const earningsRows: (string | number)[][] = [
+      ["Monthly Salary", inr(p.emp?.monthlySalary || 0)],
+      ["Per Day Rate (÷ 30)", inr(p.perDayRate)],
+      ["Payable Days", String(p.payableDays)],
+      ["Net Payable (Calculated)", inr(p.netPayable)],
+    ];
+    if (approval) {
+      earningsRows.push(["Approved Amount", inr(approval.finalSalary ?? approval.amount)]);
+      const recovered = (approval.finalSalary ?? approval.amount) - approval.amount;
+      if (recovered > 0) earningsRows.push(["Advance/Loan Deducted", `- ${inr(recovered)}`]);
+      earningsRows.push(["Amount Paid (Cash)", inr(approval.amount)]);
+    }
+    autoTable(doc, {
+      startY: afterAttendanceY,
+      body: earningsRows,
+      theme: "plain",
+      styles: { fontSize: 10, cellPadding: 2.5 },
+      columnStyles: { 0: { fontStyle: "normal", textColor: 90 }, 1: { fontStyle: "bold", halign: "right", textColor: 20 } },
+      didParseCell: (data) => {
+        const isFinalRow = data.row.index === earningsRows.length - 1;
+        if (isFinalRow && data.section === "body") {
+          data.cell.styles.fontSize = 12;
+          data.cell.styles.textColor = approval ? [16, 110, 60] : [10, 37, 64];
+        }
+      },
+    });
+
+    const afterEarningsY = (doc as any).lastAutoTable.finalY + 4;
+    doc.setFontSize(8);
+    doc.setTextColor(150);
+    if (!approval) {
+      doc.text("This month's salary has not been approved yet - figures above are the calculated estimate.", 14, afterEarningsY);
+    }
+    doc.text(
+      `Reference only (not deducted here): Advance Baki ${inr(p.balance.advanceBalance)} · Loan Baki ${inr(p.balance.loanBalance)}`,
+      14,
+      afterEarningsY + (approval ? 0 : 5)
+    );
+
+    // Page 2 - exactly which dates were Absent / Half Day, not just the
+    // counts from page 1 - the detail someone checking a short Net Payable
+    // actually wants.
+    const dayRows = (status: AttendanceStatus) =>
+      Array.from(p.records.entries())
+        .filter(([, rec]) => rec.status === status)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([date, rec]) => [prettyDate(date), rec.note || "—"]);
+
+    const absentRows = dayRows("absent");
+    const halfDayRows = dayRows("half_day");
+
+    doc.addPage();
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.setTextColor(10, 37, 64);
+    doc.text(`${p.name.toUpperCase()} — ${monthLabel(month)} — Attendance Detail`, 14, 18);
+
+    autoTable(doc, {
+      startY: 26,
+      head: [[`Absent Dates (${absentRows.length})`, "Note"]],
+      body: absentRows.length ? absentRows : [["No absent days this month", ""]],
+      theme: "grid",
+      headStyles: { fillColor: [185, 28, 28], textColor: 255 },
+      styles: { fontSize: 9, cellPadding: 3 },
+      columnStyles: { 0: { cellWidth: 60 } },
+    });
+
+    autoTable(doc, {
+      startY: (doc as any).lastAutoTable.finalY + 10,
+      head: [[`Half Day Dates (${halfDayRows.length})`, "Note"]],
+      body: halfDayRows.length ? halfDayRows : [["No half days this month", ""]],
+      theme: "grid",
+      headStyles: { fillColor: [217, 119, 6], textColor: 255 },
+      styles: { fontSize: 9, cellPadding: 3 },
+      columnStyles: { 0: { cellWidth: 60 } },
+    });
+
+    doc.save(`SalarySlip_${p.name.replace(/[^a-zA-Z0-9]/g, "_")}_${month}.pdf`);
+  };
+
+  const setRow = (empId: string, patch: Partial<DraftRow>) => {
+    setDraft((prev) => ({ ...prev, [empId]: { ...(prev[empId] || BLANK_ROW), ...patch } }));
+  };
+
+  const markAll = (status: AttendanceStatus) => {
+    setDraft((prev) => {
+      const next = { ...prev };
+      roster.forEach((emp) => {
+        next[emp._id] = { ...(next[emp._id] || BLANK_ROW), status };
+      });
+      return next;
+    });
+  };
+
+  const handleSaveDay = async () => {
+    if (roster.length === 0) {
+      alert("Roster khali hai - pehle Employees tab me se employee add karo.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await fetch("/api/attendance", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          date,
+          markedBy: currentUsername,
+          records: roster.map((emp) => {
+            const row = draft[emp._id] || BLANK_ROW;
+            return {
+              employeeId: emp._id,
+              employeeName: emp.name,
+              status: row.status,
+              inTime: row.inTime,
+              outTime: row.outTime,
+              overtimeHours: Number(row.overtimeHours) || 0,
+              note: row.note,
+            };
+          }),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Save failed");
+      setSavedIds(new Set(roster.map((e) => e._id)));
+      alert(`✓ ${date} ki attendance save ho gayi (${data.saved} log).`);
+    } catch (err: any) {
+      alert("Save nahi hui: " + err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleAddEmployee = async () => {
+    const name = newEmp.name.trim();
+    if (!name) {
+      alert("Naam zaroori hai.");
+      return;
+    }
+    setSavingEmp(true);
+    try {
+      const res = await fetch("/api/employees", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(newEmp),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed");
+      setNewEmp({ name: "", employeeCode: "", mobile: "", designation: "", monthlySalary: "", joiningDate: "" });
+      loadEmployees();
+    } catch (err: any) {
+      alert("Employee add nahi hua: " + err.message);
+    } finally {
+      setSavingEmp(false);
+    }
+  };
+
+  const handleImportUsers = async () => {
+    if (!confirm("OMS ke jitne login users hain, unka employee record bana diya jaye?")) return;
+    try {
+      const res = await fetch("/api/employees?action=import_users", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed");
+      alert(data.imported > 0 ? `✓ ${data.imported} naye employee add hue.` : "Sab users pehle se employee list me hain.");
+      loadEmployees();
+    } catch (err: any) {
+      alert("Import nahi hua: " + err.message);
+    }
+  };
+
+  const openDetail = (emp: Employee) => {
+    setDetailEmp(emp);
+    setIncForm({ newSalary: String(emp.monthlySalary || ""), effectiveDate: todayLocal(), note: "" });
+    setLedgerForm({ type: "advance", date: todayLocal(), amount: "", note: "" });
+    setLedgerMonthFilter("");
+    setLoadingDetail(true);
+    fetch(`/api/employee-ledger?employeeId=${emp._id}`)
+      .then((res) => res.json())
+      .then((data) => {
+        setLedger(Array.isArray(data?.entries) ? data.entries : []);
+        setDetailBalance(data?.balance || ZERO_BALANCE);
+      })
+      .catch((err) => console.error("Failed to load ledger", err))
+      .finally(() => setLoadingDetail(false));
+  };
+
+  // Refreshes everything a detail-panel change can affect: the open panel, the
+  // list badges, and the employee row itself (salary shows in both places).
+  const refreshAfterDetailChange = (empId: string) => {
+    loadEmployees();
+    loadBalances();
+    fetch(`/api/employee-ledger?employeeId=${empId}`)
+      .then((res) => res.json())
+      .then((data) => {
+        setLedger(Array.isArray(data?.entries) ? data.entries : []);
+        setDetailBalance(data?.balance || ZERO_BALANCE);
+      })
+      .catch(() => {});
+  };
+
+  const handleSaveIncrement = async () => {
+    if (!detailEmp) return;
+    const newSalary = Number(incForm.newSalary);
+    if (!Number.isFinite(newSalary) || newSalary < 0) {
+      alert("Salary ka valid number daalo.");
+      return;
+    }
+    if (newSalary === (detailEmp.monthlySalary || 0)) {
+      alert("Salary wahi hai jo pehle se hai - kuch badla nahi.");
+      return;
+    }
+    setSavingDetail(true);
+    try {
+      const res = await fetch("/api/employees", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          _id: detailEmp._id,
+          monthlySalary: newSalary,
+          effectiveDate: incForm.effectiveDate,
+          incrementNote: incForm.note,
+          changedBy: currentUsername,
+        }),
+      });
+      const updated = await res.json();
+      if (!res.ok) throw new Error(updated?.error || "Failed");
+      setDetailEmp(updated);
+      setIncForm({ newSalary: String(updated.monthlySalary || ""), effectiveDate: todayLocal(), note: "" });
+      loadEmployees();
+    } catch (err: any) {
+      alert("Salary update nahi hui: " + err.message);
+    } finally {
+      setSavingDetail(false);
+    }
+  };
+
+  const handleAddLedger = async () => {
+    if (!detailEmp) return;
+    const amount = Number(ledgerForm.amount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      alert("Amount 0 se zyada hona chahiye.");
+      return;
+    }
+    setSavingDetail(true);
+    try {
+      const res = await fetch("/api/employee-ledger", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          employeeId: detailEmp._id,
+          employeeName: detailEmp.name,
+          date: ledgerForm.date,
+          type: ledgerForm.type,
+          amount,
+          note: ledgerForm.note,
+          createdBy: currentUsername,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Failed");
+      setLedgerForm((p) => ({ ...p, amount: "", note: "" }));
+      refreshAfterDetailChange(detailEmp._id);
+      amountInputRef.current?.focus();
+    } catch (err: any) {
+      alert("Entry add nahi hui: " + err.message);
+    } finally {
+      setSavingDetail(false);
+    }
+  };
+
+  const handleDeleteLedger = async (entry: LedgerEntry) => {
+    if (!detailEmp) return;
+    const fromApproval = !!entry.approvalId;
+    const msg = fromApproval
+      ? `${ledgerMeta(entry.type)?.label} ${inr(entry.amount)} (${entry.date}) ek salary approval ka hissa hai. Delete karne par us approval ki salary aur usse kati hui advance/loan, sab entries hat jayengi. Aage badhein?`
+      : `${ledgerMeta(entry.type)?.label} ${inr(entry.amount)} (${entry.date}) delete karein?`;
+    if (!confirm(msg)) return;
+    try {
+      const res = await fetch(`/api/employee-ledger?id=${entry._id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error((await res.json())?.error || "Failed");
+      refreshAfterDetailChange(detailEmp._id);
+      if (fromApproval) loadApprovals();
+    } catch (err: any) {
+      alert("Delete nahi hua: " + err.message);
+    }
+  };
+
+  const handleToggleActive = async (emp: Employee) => {
+    const turningOff = emp.isActive;
+    if (turningOff && !confirm(`"${emp.name}" ko roster se hata dein? Purani attendance waise hi rahegi.`)) return;
+    try {
+      const res = await fetch("/api/employees", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ _id: emp._id, isActive: !emp.isActive }),
+      });
+      if (!res.ok) throw new Error((await res.json())?.error || "Failed");
+      loadEmployees();
+    } catch (err: any) {
+      alert("Update nahi hua: " + err.message);
+    }
+  };
+
+  // Monthly grid: { employeeId -> { date -> record } }, plus per-person totals.
+  const monthGrid = useMemo(() => {
+    const byEmp = new Map<string, Map<string, AttendanceRecord>>();
+    monthRecords.forEach((r) => {
+      if (!byEmp.has(r.employeeId)) byEmp.set(r.employeeId, new Map());
+      byEmp.get(r.employeeId)!.set(r.date, r);
+    });
+    return byEmp;
+  }, [monthRecords]);
+
+  const monthDays = useMemo(() => daysInMonth(month), [month]);
+
+  // Everyone who either is on the roster now, or has a record this month -
+  // so a person deactivated mid-month still shows in that month's register.
+  const monthPeople = useMemo(() => {
+    const seen = new Map<string, string>();
+    roster.forEach((e) => seen.set(e._id, e.name));
+    monthRecords.forEach((r) => {
+      if (!seen.has(r.employeeId)) seen.set(r.employeeId, r.employeeName);
+    });
+    return Array.from(seen.entries()).map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+  }, [roster, monthRecords]);
+
+  // Statement rows with a running advance/loan balance. The running figure is
+  // always computed over the FULL history in date order, then filtered for
+  // display - filtering first would make a month's opening balance wrong.
+  const ledgerRows = useMemo(() => {
+    const asc = [...ledger].sort(
+      (a, b) => a.date.localeCompare(b.date) || (a.createdAt || "").localeCompare(b.createdAt || "")
+    );
+    let adv = 0;
+    let loan = 0;
+    const withBal = asc.map((e) => {
+      if (e.type === "advance") adv += e.amount;
+      else if (e.type === "advance_repay") adv -= e.amount;
+      else if (e.type === "loan") loan += e.amount;
+      else if (e.type === "loan_repay") loan -= e.amount;
+      return { entry: e, advBal: adv, loanBal: loan };
+    });
+    return withBal.reverse();
+  }, [ledger]);
+
+  const visibleLedgerRows = useMemo(
+    () => (ledgerMonthFilter ? ledgerRows.filter((r) => r.entry.date.startsWith(ledgerMonthFilter)) : ledgerRows),
+    [ledgerRows, ledgerMonthFilter]
+  );
+
+  const ledgerMonths = useMemo(
+    () => Array.from(new Set(ledger.map((e) => e.date.slice(0, 7)))).sort().reverse(),
+    [ledger]
+  );
+
+  const visibleTotals = useMemo(() => {
+    let debit = 0;
+    let credit = 0;
+    visibleLedgerRows.forEach(({ entry }) => {
+      if (ledgerMeta(entry.type)?.side === "credit") credit += entry.amount;
+      else debit += entry.amount;
+    });
+    return { debit, credit };
+  }, [visibleLedgerRows]);
+
+  // Month-wise salary: what attendance produced, what was approved, what was
+  // recovered as advance/loan, and what was actually paid.
+  const salaryMonths = useMemo(
+    () =>
+      ledger
+        .filter((e) => e.type === "salary")
+        .map((e) => ({
+          month: e.forMonth || e.date.slice(0, 7),
+          calculated: e.calculatedAmount || 0,
+          approved: e.finalSalary ?? e.amount,
+          recovered: (e.finalSalary ?? e.amount) - e.amount,
+          paid: e.amount,
+          date: e.date,
+        }))
+        .sort((a, b) => b.month.localeCompare(a.month)),
+    [ledger]
+  );
+
+  const salaryPaidTotal = useMemo(() => salaryMonths.reduce((s, r) => s + r.paid, 0), [salaryMonths]);
+
+  const markedCount = useMemo(() => roster.filter((e) => savedIds.has(e._id)).length, [roster, savedIds]);
+
+  return (
+    <BlockGuard
+      permission="boss"
+      fallback={
+        <div className="flex flex-col items-center gap-2 m-4 p-4 border border-red-200 rounded-xl bg-red-50">
+          <p className="text-red-500 font-bold uppercase">You have no access for this page.</p>
+        </div>
+      }
+    >
+      <PinGate page="attendance">
+      <div className="p-4 md:p-8 bg-[#f3f6f9] min-h-screen">
+        <div className="max-w-7xl mx-auto flex flex-col gap-6">
+
+          <button
+            onClick={() => router.back()}
+            className="flex items-center gap-2 text-slate-500 font-bold text-xs uppercase tracking-widest w-fit"
+          >
+            <FiArrowLeft /> Back
+          </button>
+
+          <div className="flex items-center gap-4">
+            <div className="bg-[#0a2540] text-white p-4 rounded-2xl">
+              <FiUserCheck size={24} />
+            </div>
+            <div>
+              <h1 className="text-2xl font-black uppercase tracking-tight text-[#0a2540]">Attendance</h1>
+              <p className="text-[#ff9933] text-[10px] font-black tracking-widest uppercase">Daily Register &amp; Monthly Summary</p>
+            </div>
+          </div>
+
+          {/* Tabs */}
+          <div className="flex gap-2 flex-wrap">
+            {([
+              ["daily", "Daily Register"],
+              ["monthly", "Monthly View"],
+              ["employees", "Employees"],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                onClick={() => setTab(key)}
+                className={`text-[11px] font-black uppercase tracking-wider py-2 px-4 rounded-xl border transition-all ${
+                  tab === key
+                    ? "bg-[#0a2540] text-white border-[#0a2540]"
+                    : "bg-white text-slate-500 border-slate-200 hover:text-slate-800"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* ================= DAILY REGISTER ================= */}
+          {tab === "daily" && (
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-900">Daily Register</h3>
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    {markedCount === roster.length && roster.length > 0
+                      ? `Is din ki attendance save ho chuki hai (${roster.length} log).`
+                      : `${markedCount} / ${roster.length} save hue. Baaki rows Present par pre-filled hain — badalke Save dabao.`}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <input
+                    type="date"
+                    value={date}
+                    max={todayLocal()}
+                    onChange={(e) => setDate(e.target.value)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-[11px] font-black text-slate-700 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    onClick={loadDay}
+                    title="Is date ka saved data dobara load karo"
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl p-2 transition-colors"
+                  >
+                    <FiRefreshCw size={13} className={loadingDay ? "animate-spin" : ""} />
+                  </button>
+                  <button
+                    onClick={() => markAll("present")}
+                    className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded-xl py-2 px-3 text-[10px] font-black uppercase tracking-wider transition-colors"
+                  >
+                    Mark all Present
+                  </button>
+                  <button
+                    onClick={() => markAll("holiday")}
+                    className="bg-slate-50 hover:bg-slate-100 text-slate-600 border border-slate-200 rounded-xl py-2 px-3 text-[10px] font-black uppercase tracking-wider transition-colors"
+                  >
+                    Holiday
+                  </button>
+                  <button
+                    onClick={handleSaveDay}
+                    disabled={saving || roster.length === 0}
+                    className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2 px-4 text-[10px] font-black uppercase tracking-wider transition-colors flex items-center gap-1.5"
+                  >
+                    <FiSave size={12} /> {saving ? "Saving..." : "Save Day"}
+                  </button>
+                </div>
+              </div>
+
+              {roster.length === 0 ? (
+                <p className="text-xs text-slate-400 uppercase font-bold tracking-widest text-center py-12">
+                  Koi active employee nahi — Employees tab me jao
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs border-collapse min-w-[860px]">
+                    <thead className="bg-slate-50 text-slate-400 font-black uppercase tracking-wider text-[10px]">
+                      <tr>
+                        <th className="py-2.5 px-5">Employee</th>
+                        <th className="py-2.5 px-2.5 w-[300px]">Status</th>
+                        <th className="py-2.5 px-2.5 text-center w-24">In</th>
+                        <th className="py-2.5 px-2.5 text-center w-24">Out</th>
+                        <th className="py-2.5 px-2.5 text-center w-24">OT (hrs)</th>
+                        <th className="py-2.5 px-5">Note</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {roster.map((emp) => {
+                        const row = draft[emp._id] || BLANK_ROW;
+                        return (
+                          <tr key={emp._id} className="hover:bg-slate-50/60">
+                            <td className="py-2.5 px-5">
+                              <p className="font-black text-slate-800">{emp.name}</p>
+                              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                {emp.designation || (emp.linkedUsername ? "OMS user" : "—")}
+                                {!savedIds.has(emp._id) && <span className="text-amber-600 ml-2">unsaved</span>}
+                              </p>
+                            </td>
+
+                            <td className="py-2.5 px-2.5">
+                              <div className="flex gap-1 flex-wrap">
+                                {STATUSES.map((s) => (
+                                  <button
+                                    key={s.key}
+                                    onClick={() => setRow(emp._id, { status: s.key })}
+                                    title={s.label}
+                                    className={`w-9 h-7 rounded-lg border text-[11px] font-black transition-all ${
+                                      row.status === s.key
+                                        ? s.btn
+                                        : "bg-white border-slate-200 text-slate-400 hover:border-slate-300"
+                                    }`}
+                                  >
+                                    {s.short}
+                                  </button>
+                                ))}
+                              </div>
+                            </td>
+
+                            <td className="py-2.5 px-2.5">
+                              <input
+                                type="time"
+                                value={row.inTime}
+                                onChange={(e) => setRow(emp._id, { inTime: e.target.value })}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-[11px] font-mono focus:outline-none focus:border-blue-500"
+                              />
+                            </td>
+                            <td className="py-2.5 px-2.5">
+                              <input
+                                type="time"
+                                value={row.outTime}
+                                onChange={(e) => setRow(emp._id, { outTime: e.target.value })}
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-[11px] font-mono focus:outline-none focus:border-blue-500"
+                              />
+                            </td>
+                            <td className="py-2.5 px-2.5">
+                              <input
+                                type="number"
+                                min="0"
+                                step="0.5"
+                                value={row.overtimeHours}
+                                onChange={(e) => setRow(emp._id, { overtimeHours: e.target.value })}
+                                placeholder="0"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-[11px] font-mono text-center focus:outline-none focus:border-blue-500"
+                              />
+                            </td>
+                            <td className="py-2.5 px-5">
+                              <input
+                                type="text"
+                                value={row.note}
+                                onChange={(e) => setRow(emp._id, { note: e.target.value })}
+                                placeholder="—"
+                                className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-[11px] focus:outline-none focus:border-blue-500"
+                              />
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ================= MONTHLY VIEW ================= */}
+          {tab === "monthly" && (
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 border-b border-slate-100 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-900">Monthly Register</h3>
+                  <p className="text-[10px] text-slate-400 mt-1">
+                    Blank cell = us din attendance mark hi nahi hui. Net Payable = (Monthly Salary ÷ 30) × (Present + Holiday + Half Day×0.5) — OT ka paisa isme shamil nahi hai. Approve dabane par amount badal sakte ho aur advance/loan katauti bhi laga sakte ho; approve hote hi employee ke ledger me &quot;Salary di&quot; entry ban jati hai.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="month"
+                    value={month}
+                    onChange={(e) => setMonth(e.target.value)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-[11px] font-black text-slate-700 focus:outline-none focus:border-blue-500"
+                  />
+                  <button
+                    onClick={loadMonth}
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl p-2 transition-colors"
+                  >
+                    <FiRefreshCw size={13} className={loadingMonth ? "animate-spin" : ""} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Legend */}
+              <div className="px-5 py-2 border-b border-slate-100 flex gap-2 flex-wrap">
+                {STATUSES.map((s) => (
+                  <span key={s.key} className={`text-[9px] font-black uppercase tracking-wider rounded px-1.5 py-0.5 ${s.cell}`}>
+                    {s.short} = {s.label}
+                  </span>
+                ))}
+              </div>
+
+              {monthPeople.length === 0 ? (
+                <p className="text-xs text-slate-400 uppercase font-bold tracking-widest text-center py-12">
+                  Is mahine ka koi record nahi
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="text-left text-xs border-collapse">
+                    <thead className="bg-slate-50 text-slate-400 font-black uppercase tracking-wider text-[10px]">
+                      <tr>
+                        <th className="py-2 px-4 sticky left-0 bg-slate-50 z-10 min-w-[150px]">Employee</th>
+                        {monthDays.map((d) => (
+                          <th key={d} className="py-2 px-1 text-center w-7">{d.slice(-2)}</th>
+                        ))}
+                        {STATUSES.map((s) => (
+                          <th key={s.key} className="py-2 px-2 text-center">{s.short}</th>
+                        ))}
+                        <th className="py-2 px-3 text-center">OT</th>
+                        <th className="py-2 px-3 text-center">Net Payable</th>
+                        <th className="py-2 px-3 text-center">Adv/Loan Baki</th>
+                        <th className="py-2 px-3 text-center">Approval</th>
+                        <th className="py-2 px-3 text-center">Slip</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {monthPeople.map((person) => {
+                        const cells = monthGrid.get(person.id);
+                        const counts: Record<string, number> = {};
+                        let otTotal = 0;
+                        cells?.forEach((rec) => {
+                          counts[rec.status] = (counts[rec.status] || 0) + 1;
+                          otTotal += Number(rec.overtimeHours) || 0;
+                        });
+
+                        // Net Payable = per-day rate (Monthly Salary ÷ 30,
+                        // fixed - not the actual number of days in this
+                        // month) × payable days (Present and Holiday count
+                        // full, Half Day counts 0.5, Absent/Leave count 0).
+                        // Deliberately excludes OT pay (no ₹/hour rate is
+                        // configured anywhere) and Advance/Loan (that's a
+                        // running balance, not a fixed monthly deduction -
+                        // whether/how much to deduct this month is a manual
+                        // call, so its balance is only shown for reference).
+                        const emp = employees.find((e) => e._id === person.id);
+                        const payableDays = (counts["present"] || 0) + (counts["holiday"] || 0) + (counts["half_day"] || 0) * 0.5;
+                        const perDayRate = (emp?.monthlySalary || 0) / 30;
+                        const netPayable = perDayRate * payableDays;
+                        const bal = balances[person.id] || ZERO_BALANCE;
+                        const advLoanBaki = bal.advanceBalance + bal.loanBalance;
+
+                        return (
+                          <tr key={person.id} className="hover:bg-slate-50/60">
+                            <td className="py-2 px-4 font-black text-slate-800 sticky left-0 bg-white z-10">{person.name}</td>
+                            {monthDays.map((d) => {
+                              const rec = cells?.get(d);
+                              const meta = rec ? statusMeta(rec.status) : null;
+                              return (
+                                <td key={d} className="py-1 px-1 text-center">
+                                  <span
+                                    title={rec ? `${d} — ${meta?.label}${rec.note ? ` (${rec.note})` : ""}` : `${d} — not marked`}
+                                    className={`inline-block w-6 leading-5 rounded text-[9px] font-black ${
+                                      meta ? meta.cell : "bg-slate-50 text-slate-300"
+                                    }`}
+                                  >
+                                    {meta ? meta.short : "·"}
+                                  </span>
+                                </td>
+                              );
+                            })}
+                            {STATUSES.map((s) => (
+                              <td key={s.key} className="py-2 px-2 text-center font-mono font-bold text-slate-600">
+                                {counts[s.key] || 0}
+                              </td>
+                            ))}
+                            <td className="py-2 px-3 text-center font-mono font-black text-blue-700">{otTotal || 0}</td>
+                            <td className="py-2 px-3 text-center font-mono font-black text-emerald-700">{inr(netPayable)}</td>
+                            <td className="py-2 px-3 text-center font-mono font-bold text-amber-700">
+                              {advLoanBaki > 0 ? inr(advLoanBaki) : "—"}
+                            </td>
+                            <td className="py-2 px-3 text-center whitespace-nowrap">
+                              {approvals[person.id] ? (
+                                <span
+                                  className="inline-flex items-center gap-1.5"
+                                  title={`Approved ${approvals[person.id].date} — attendance se ${inr(approvals[person.id].calculatedAmount || 0)}, approved ${inr(approvals[person.id].finalSalary ?? approvals[person.id].amount)}`}
+                                >
+                                  <span className="inline-flex items-center gap-1 text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg py-1 px-2">
+                                    <FiCheckCircle size={11} /> Paid {inr(approvals[person.id].amount)}
+                                  </span>
+                                  <button
+                                    onClick={() => handleUndoApproval(approvals[person.id], person.name)}
+                                    title="Approval undo karo"
+                                    className="text-slate-300 hover:text-rose-600"
+                                  >
+                                    <FiRotateCcw size={12} />
+                                  </button>
+                                </span>
+                              ) : (
+                                <button
+                                  onClick={() =>
+                                    openApproval({
+                                      id: person.id,
+                                      name: person.name,
+                                      monthlySalary: emp?.monthlySalary || 0,
+                                      payableDays,
+                                      calculated: netPayable,
+                                    })
+                                  }
+                                  className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg py-1 px-3 text-[10px] font-black uppercase tracking-wider"
+                                >
+                                  Approve
+                                </button>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 text-center">
+                              <button
+                                onClick={() =>
+                                  downloadSalarySlip({
+                                    id: person.id,
+                                    name: person.name,
+                                    emp,
+                                    counts,
+                                    otTotal,
+                                    payableDays,
+                                    perDayRate,
+                                    netPayable,
+                                    balance: bal,
+                                    records: cells || new Map(),
+                                  })
+                                }
+                                title="Salary Slip PDF download karo"
+                                className="p-2 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-800 hover:text-white transition-all"
+                              >
+                                <FiDownload size={13} />
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ================= EMPLOYEES ================= */}
+          {tab === "employees" && (
+            <div className="flex flex-col gap-4">
+
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-5">
+                <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 mb-1">Add Employee</h3>
+                <p className="text-[10px] text-slate-400 mb-4">
+                  Jinke OMS login hain unhe haath se likhne ki zaroorat nahi — Import OMS Users dabao.
+                </p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+                  {([
+                    ["name", "Name *"],
+                    ["employeeCode", "Code"],
+                    ["mobile", "Mobile"],
+                    ["designation", "Designation"],
+                  ] as const).map(([field, label]) => (
+                    <input
+                      key={field}
+                      type="text"
+                      value={newEmp[field]}
+                      onChange={(e) => setNewEmp((p) => ({ ...p, [field]: e.target.value }))}
+                      placeholder={label}
+                      className="bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-xs focus:outline-none focus:border-blue-500"
+                    />
+                  ))}
+                  <input
+                    type="number"
+                    min="0"
+                    value={newEmp.monthlySalary}
+                    onChange={(e) => setNewEmp((p) => ({ ...p, monthlySalary: e.target.value }))}
+                    placeholder="Monthly Salary"
+                    className="bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-xs font-mono focus:outline-none focus:border-blue-500"
+                  />
+                  <input
+                    type="date"
+                    value={newEmp.joiningDate}
+                    onChange={(e) => setNewEmp((p) => ({ ...p, joiningDate: e.target.value }))}
+                    title="Joining date"
+                    className="bg-slate-50 border border-slate-200 rounded-xl py-2.5 px-3 text-xs focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div className="flex gap-2 mt-3 flex-wrap">
+                  <button
+                    onClick={handleAddEmployee}
+                    disabled={savingEmp}
+                    className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2 px-4 text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5"
+                  >
+                    <FiPlus size={12} /> {savingEmp ? "Adding..." : "Add"}
+                  </button>
+                  <button
+                    onClick={handleImportUsers}
+                    className="bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl py-2 px-4 text-[10px] font-black uppercase tracking-wider flex items-center gap-1.5"
+                  >
+                    <FiDownloadCloud size={12} /> Import OMS Users
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+                <div className="p-5 border-b border-slate-100 flex items-center justify-between gap-3">
+                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-900">
+                    Employee List ({employees.length})
+                  </h3>
+                  <label className="flex items-center gap-2 text-[10px] font-black uppercase tracking-wider text-slate-500 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={showInactive}
+                      onChange={(e) => setShowInactive(e.target.checked)}
+                      className="w-3.5 h-3.5 rounded border-slate-300"
+                    />
+                    Show removed
+                  </label>
+                </div>
+
+                {loadingEmployees ? (
+                  <div className="flex justify-center py-10">
+                    <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-blue-500" />
+                  </div>
+                ) : employees.length === 0 ? (
+                  <p className="text-xs text-slate-400 uppercase font-bold tracking-widest text-center py-10">
+                    Abhi koi employee nahi
+                  </p>
+                ) : (
+                  <div className="divide-y divide-slate-100">
+                    {employees.map((emp) => {
+                      const bal = balances[emp._id] || ZERO_BALANCE;
+                      return (
+                        <div key={emp._id} className="px-5 py-3 flex items-center justify-between gap-3">
+                          {/* Whole name block opens the detail panel - salary,
+                              increments and the advance/loan ledger all live there. */}
+                          <button
+                            onClick={() => openDetail(emp)}
+                            className="min-w-0 text-left flex-1 group"
+                            title="Salary, increment aur advance/loan kholo"
+                          >
+                            <p className={`text-xs font-black truncate group-hover:text-blue-700 ${emp.isActive ? "text-slate-800" : "text-slate-400 line-through"}`}>
+                              {emp.name}
+                            </p>
+                            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                              {[emp.employeeCode, emp.designation, emp.mobile].filter(Boolean).join(" · ") || "—"}
+                              {emp.linkedUsername && <span className="text-blue-600 ml-2">login: {emp.linkedUsername}</span>}
+                            </p>
+                            <p className="text-[10px] font-bold text-slate-400 mt-0.5">
+                              Joined {prettyDate(emp.joiningDate)}
+                            </p>
+                          </button>
+
+                          <div className="hidden md:flex items-center gap-2 shrink-0">
+                            <span className="text-[10px] font-black uppercase tracking-wider bg-slate-100 text-slate-700 border border-slate-200 rounded-lg py-1 px-2">
+                              Salary {inr(emp.monthlySalary || 0)}
+                            </span>
+                            {/* Only shown when something is actually outstanding -
+                                a row of zeros is noise on a clean employee. */}
+                            {bal.advanceBalance > 0 && (
+                              <span className="text-[10px] font-black uppercase tracking-wider bg-amber-50 text-amber-800 border border-amber-200 rounded-lg py-1 px-2">
+                                Advance {inr(bal.advanceBalance)}
+                              </span>
+                            )}
+                            {bal.loanBalance > 0 && (
+                              <span className="text-[10px] font-black uppercase tracking-wider bg-rose-50 text-rose-700 border border-rose-200 rounded-lg py-1 px-2">
+                                Loan {inr(bal.loanBalance)}
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            onClick={() => handleToggleActive(emp)}
+                            title={emp.isActive ? "Roster se hatao" : "Wapas roster me daalo"}
+                            className={`shrink-0 rounded-lg py-1.5 px-3 text-[10px] font-black uppercase tracking-wider border transition-colors flex items-center gap-1.5 ${
+                              emp.isActive
+                                ? "bg-white hover:bg-rose-50 text-rose-600 border-rose-200"
+                                : "bg-white hover:bg-emerald-50 text-emerald-700 border-emerald-200"
+                            }`}
+                          >
+                            {emp.isActive ? <><FiSlash size={11} /> Remove</> : <><FiRotateCcw size={11} /> Restore</>}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+
+          {/* ============ SALARY APPROVAL ============ */}
+          {approvalTarget && (() => {
+            const bal = balances[approvalTarget.id] || ZERO_BALANCE;
+            const finalSalary = Number(approvalForm.finalSalary) || 0;
+            const advDeduct = Number(approvalForm.advanceDeduct) || 0;
+            const loanDeduct = Number(approvalForm.loanDeduct) || 0;
+            const cash = finalSalary - advDeduct - loanDeduct;
+            const invalid =
+              finalSalary < 0 ||
+              advDeduct < 0 ||
+              loanDeduct < 0 ||
+              advDeduct > bal.advanceBalance ||
+              loanDeduct > bal.loanBalance ||
+              cash < 0;
+            const inputCls =
+              "w-full bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs font-mono focus:outline-none focus:border-blue-500";
+            return (
+              <div
+                className="fixed inset-0 z-[60] flex items-center justify-center p-3 bg-black/60 backdrop-blur-sm"
+                onClick={() => !savingApproval && setApprovalTarget(null)}
+              >
+                <div
+                  className="bg-white rounded-2xl w-full max-w-md shadow-2xl overflow-hidden"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <div className="p-5 border-b border-slate-200 flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-black uppercase tracking-wider text-[#0a2540]">
+                        Approve Salary &mdash; {approvalTarget.name}
+                      </h3>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-1">
+                        {monthLabel(month)} &middot; {inr(approvalTarget.monthlySalary)} / month &middot; {approvalTarget.payableDays} payable din
+                      </p>
+                    </div>
+                    <button onClick={() => setApprovalTarget(null)} className="text-slate-400 hover:text-slate-700">
+                      <FiX size={18} />
+                    </button>
+                  </div>
+
+                  <div className="p-5 flex flex-col gap-3">
+                    <div className="flex justify-between text-[11px] font-bold text-slate-500">
+                      <span>Attendance se Net Payable</span>
+                      <span className="font-mono">{inr(approvalTarget.calculated)}</span>
+                    </div>
+
+                    <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                      Final Salary (badal sakte ho)
+                      <input
+                        type="number"
+                        min="0"
+                        autoFocus
+                        value={approvalForm.finalSalary}
+                        onChange={(e) => setApprovalForm((p) => ({ ...p, finalSalary: e.target.value }))}
+                        className={`${inputCls} mt-1 text-sm font-black`}
+                      />
+                    </label>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                        Advance kato <span className="text-amber-700">(baki {inr(bal.advanceBalance)})</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max={bal.advanceBalance}
+                          value={approvalForm.advanceDeduct}
+                          onChange={(e) => setApprovalForm((p) => ({ ...p, advanceDeduct: e.target.value }))}
+                          placeholder="0"
+                          className={`${inputCls} mt-1`}
+                        />
+                      </label>
+                      <label className="text-[10px] font-black uppercase tracking-wider text-slate-500">
+                        Loan kato <span className="text-rose-700">(baki {inr(bal.loanBalance)})</span>
+                        <input
+                          type="number"
+                          min="0"
+                          max={bal.loanBalance}
+                          value={approvalForm.loanDeduct}
+                          onChange={(e) => setApprovalForm((p) => ({ ...p, loanDeduct: e.target.value }))}
+                          placeholder="0"
+                          className={`${inputCls} mt-1`}
+                        />
+                      </label>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <input
+                        type="date"
+                        value={approvalForm.date}
+                        onChange={(e) => setApprovalForm((p) => ({ ...p, date: e.target.value }))}
+                        title="Payment date"
+                        className={inputCls}
+                      />
+                      <input
+                        type="text"
+                        value={approvalForm.note}
+                        onChange={(e) => setApprovalForm((p) => ({ ...p, note: e.target.value }))}
+                        placeholder="Note (optional)"
+                        className={`${inputCls} font-sans`}
+                      />
+                    </div>
+
+                    <div
+                      className={`flex justify-between items-center rounded-xl px-3 py-2.5 border ${
+                        invalid ? "bg-rose-50 border-rose-200 text-rose-700" : "bg-emerald-50 border-emerald-200 text-emerald-800"
+                      }`}
+                    >
+                      <span className="text-[10px] font-black uppercase tracking-wider">
+                        {invalid ? "Amount check karo" : "Employee ko cash dena hai"}
+                      </span>
+                      <span className="font-mono font-black text-sm">{inr(cash)}</span>
+                    </div>
+
+                    <button
+                      onClick={handleApproveSalary}
+                      disabled={savingApproval || invalid}
+                      className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2.5 px-4 text-[11px] font-black uppercase tracking-wider flex items-center justify-center gap-1.5"
+                    >
+                      <FiCheckCircle size={13} /> {savingApproval ? "Saving..." : "Approve & ledger me add karo"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* ============ EMPLOYEE DETAIL: salary, increments, advance & loan ============ */}
+          {detailEmp && (
+            <div
+              className="fixed inset-0 z-50 flex items-start sm:items-center justify-center p-3 sm:p-6 bg-black/60 backdrop-blur-sm overflow-y-auto"
+              onClick={() => setDetailEmp(null)}
+            >
+              <div
+                className="bg-[#f3f6f9] rounded-2xl w-full max-w-4xl shadow-2xl overflow-hidden my-auto"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="p-5 bg-white border-b border-slate-200 flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-black uppercase tracking-wider text-[#0a2540] truncate">{detailEmp.name}</h3>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mt-1">
+                      Joined {prettyDate(detailEmp.joiningDate)}
+                      {detailEmp.designation ? ` \u00b7 ${detailEmp.designation}` : ""}
+                      {detailEmp.mobile ? ` \u00b7 ${detailEmp.mobile}` : ""}
+                      {detailEmp.linkedUsername ? ` \u00b7 login: ${detailEmp.linkedUsername}` : ""}
+                    </p>
+                  </div>
+                  <button onClick={() => setDetailEmp(null)} className="text-slate-400 hover:text-slate-700 shrink-0">
+                    <FiX size={18} />
+                  </button>
+                </div>
+
+                <div className="p-5 flex flex-col gap-4 max-h-[70vh] overflow-y-auto">
+
+                  {/* ---- Salary & increments ---- */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4">
+                    <div className="flex items-center justify-between gap-3 mb-3">
+                      <h4 className="text-[11px] font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                        <FiTrendingUp className="text-blue-600" size={13} /> Salary
+                      </h4>
+                      <span className="text-sm font-black text-slate-900 font-mono">
+                        {inr(detailEmp.monthlySalary || 0)}<span className="text-[10px] text-slate-400 font-bold"> / month</span>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <input
+                        type="number"
+                        min="0"
+                        value={incForm.newSalary}
+                        onChange={(e) => setIncForm((p) => ({ ...p, newSalary: e.target.value }))}
+                        placeholder="New salary"
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs font-mono focus:outline-none focus:border-blue-500"
+                      />
+                      <input
+                        type="date"
+                        value={incForm.effectiveDate}
+                        onChange={(e) => setIncForm((p) => ({ ...p, effectiveDate: e.target.value }))}
+                        title="Kis date se lagu"
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <input
+                        type="text"
+                        value={incForm.note}
+                        onChange={(e) => setIncForm((p) => ({ ...p, note: e.target.value }))}
+                        placeholder="Reason"
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <button
+                        onClick={handleSaveIncrement}
+                        disabled={savingDetail}
+                        className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2 px-3 text-[10px] font-black uppercase tracking-wider"
+                      >
+                        Update Salary
+                      </button>
+                    </div>
+
+                    {(detailEmp.salaryHistory?.length || 0) > 0 && (
+                      <div className="mt-3 pt-3 border-t border-slate-100 space-y-1">
+                        {[...(detailEmp.salaryHistory || [])].reverse().map((h, i) => (
+                          <div key={`${h.date}-${i}`} className="flex items-center justify-between gap-3 text-[11px]">
+                            <span className="font-bold text-slate-400 font-mono w-24 shrink-0">{h.date}</span>
+                            <span className="font-mono text-slate-700 flex-1">
+                              {inr(h.oldSalary)} <span className="text-slate-300">&rarr;</span>{" "}
+                              <span className="font-black">{inr(h.newSalary)}</span>
+                            </span>
+                            <span className="text-slate-400 truncate max-w-[45%] text-right">{h.note || ""}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* ---- Advance & loan ledger ---- */}
+                  <div className="bg-white border border-slate-200 rounded-2xl p-4">
+                    <div className="flex items-center justify-between gap-3 flex-wrap mb-3">
+                      <h4 className="text-[11px] font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
+                        <FiBookOpen className="text-blue-600" size={13} /> Ledger &mdash; Advance, Loan &amp; Salary
+                      </h4>
+                    </div>
+
+                    {/* Summary: diya / jama / baki for advance and loan, plus salary paid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mb-4">
+                      {([
+                        ["Advance", detailBalance.advanceGiven, detailBalance.advanceRepaid, detailBalance.advanceBalance, "bg-amber-50 border-amber-200 text-amber-800"],
+                        ["Loan", detailBalance.loanGiven, detailBalance.loanRepaid, detailBalance.loanBalance, "bg-rose-50 border-rose-200 text-rose-700"],
+                      ] as const).map(([label, given, repaid, baki, tone]) => (
+                        <div key={label} className={`border rounded-xl p-3 ${tone}`}>
+                          <p className="text-[10px] font-black uppercase tracking-wider mb-1.5">{label}</p>
+                          <div className="flex justify-between text-[11px] font-bold">
+                            <span>Diya</span><span className="font-mono">{inr(given)}</span>
+                          </div>
+                          <div className="flex justify-between text-[11px] font-bold">
+                            <span>Jama</span><span className="font-mono">{inr(repaid)}</span>
+                          </div>
+                          <div className="flex justify-between text-xs font-black border-t border-slate-300/60 mt-1 pt-1">
+                            <span>Baki</span><span className="font-mono">{inr(baki)}</span>
+                          </div>
+                        </div>
+                      ))}
+                      <div className="border rounded-xl p-3 bg-blue-50 border-blue-200 text-blue-800">
+                        <p className="text-[10px] font-black uppercase tracking-wider mb-1.5">Salary</p>
+                        <div className="flex justify-between text-[11px] font-bold">
+                          <span>Months paid</span><span className="font-mono">{salaryMonths.length}</span>
+                        </div>
+                        <div className="flex justify-between text-xs font-black border-t border-slate-300/60 mt-1 pt-1">
+                          <span>Total di</span><span className="font-mono">{inr(salaryPaidTotal)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Quick entry: pick the type with one tap, type the amount, press Enter */}
+                    <div className="flex gap-1.5 flex-wrap mb-2">
+                      {QUICK_TYPES.map((t) => (
+                        <button
+                          key={t.key}
+                          onClick={() => {
+                            setLedgerForm((p) => ({ ...p, type: t.key }));
+                            amountInputRef.current?.focus();
+                          }}
+                          className={`text-[10px] font-black uppercase tracking-wider py-1.5 px-3 rounded-lg border transition-all ${
+                            ledgerForm.type === t.key ? t.pill : "bg-white border-slate-200 text-slate-500 hover:border-slate-300"
+                          }`}
+                        >
+                          {t.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      <input
+                        type="date"
+                        value={ledgerForm.date}
+                        onChange={(e) => setLedgerForm((p) => ({ ...p, date: e.target.value }))}
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-2 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <input
+                        ref={amountInputRef}
+                        type="number"
+                        min="0"
+                        value={ledgerForm.amount}
+                        onChange={(e) => setLedgerForm((p) => ({ ...p, amount: e.target.value }))}
+                        onKeyDown={(e) => e.key === "Enter" && handleAddLedger()}
+                        placeholder="Amount"
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs font-mono focus:outline-none focus:border-blue-500"
+                      />
+                      <input
+                        type="text"
+                        value={ledgerForm.note}
+                        onChange={(e) => setLedgerForm((p) => ({ ...p, note: e.target.value }))}
+                        onKeyDown={(e) => e.key === "Enter" && handleAddLedger()}
+                        placeholder="Note (Enter = save)"
+                        className="bg-slate-50 border border-slate-200 rounded-xl py-2 px-3 text-xs focus:outline-none focus:border-blue-500"
+                      />
+                      <button
+                        onClick={handleAddLedger}
+                        disabled={savingDetail}
+                        className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-xl py-2 px-3 text-[10px] font-black uppercase tracking-wider flex items-center justify-center gap-1.5"
+                      >
+                        <FiPlus size={12} /> Add
+                      </button>
+                    </div>
+                    {/* One-tap "poora baki jama" when a repayment type is selected */}
+                    {(ledgerForm.type === "advance_repay" && detailBalance.advanceBalance > 0) && (
+                      <button
+                        onClick={() => setLedgerForm((p) => ({ ...p, amount: String(detailBalance.advanceBalance) }))}
+                        className="mt-2 text-[10px] font-black uppercase tracking-wider text-emerald-700 hover:underline"
+                      >
+                        Poora advance baki jama: {inr(detailBalance.advanceBalance)}
+                      </button>
+                    )}
+                    {(ledgerForm.type === "loan_repay" && detailBalance.loanBalance > 0) && (
+                      <button
+                        onClick={() => setLedgerForm((p) => ({ ...p, amount: String(detailBalance.loanBalance) }))}
+                        className="mt-2 text-[10px] font-black uppercase tracking-wider text-emerald-700 hover:underline"
+                      >
+                        Poora loan baki jama: {inr(detailBalance.loanBalance)}
+                      </button>
+                    )}
+
+                    <div className="mt-3 pt-3 border-t border-slate-100">
+                      {loadingDetail ? (
+                        <div className="flex justify-center py-6">
+                          <div className="animate-spin rounded-full h-5 w-5 border-t-2 border-blue-500" />
+                        </div>
+                      ) : ledger.length === 0 ? (
+                        <p className="text-[10px] text-slate-400 uppercase font-black tracking-widest text-center py-6">
+                          Koi ledger entry nahi
+                        </p>
+                      ) : (
+                        <>
+                          <div className="flex items-center justify-between gap-3 flex-wrap mb-2">
+                            <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+                              Statement (Debit = firm ne diya, Credit = jama)
+                            </span>
+                            <select
+                              value={ledgerMonthFilter}
+                              onChange={(e) => setLedgerMonthFilter(e.target.value)}
+                              className="bg-slate-50 border border-slate-200 rounded-lg py-1 px-2 text-[11px] font-bold focus:outline-none focus:border-blue-500"
+                            >
+                              <option value="">All months</option>
+                              {ledgerMonths.map((m) => (
+                                <option key={m} value={m}>{monthLabel(m)}</option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="overflow-x-auto max-h-72 overflow-y-auto border border-slate-100 rounded-xl">
+                            <table className="w-full text-left text-[11px] border-collapse min-w-[640px]">
+                              <thead className="bg-slate-50 text-slate-400 font-black uppercase tracking-wider text-[9px] sticky top-0">
+                                <tr>
+                                  <th className="py-2 px-2">Date</th>
+                                  <th className="py-2 px-2">Details</th>
+                                  <th className="py-2 px-2 text-right">Debit</th>
+                                  <th className="py-2 px-2 text-right">Credit</th>
+                                  <th className="py-2 px-2 text-right">Adv Baki</th>
+                                  <th className="py-2 px-2 text-right">Loan Baki</th>
+                                  <th className="py-2 px-2 w-6" />
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100">
+                                {visibleLedgerRows.map(({ entry, advBal, loanBal }) => {
+                                  const meta = ledgerMeta(entry.type);
+                                  const isCredit = meta?.side === "credit";
+                                  return (
+                                    <tr key={entry._id} className="hover:bg-slate-50/60">
+                                      <td className="py-1.5 px-2 font-bold text-slate-400 font-mono whitespace-nowrap">{entry.date}</td>
+                                      <td className="py-1.5 px-2">
+                                        <span className={`font-black uppercase tracking-wider ${meta?.tone}`}>{meta?.label}</span>
+                                        {entry.type === "salary" && entry.forMonth && (
+                                          <span className="text-slate-500 font-bold"> &middot; {monthLabel(entry.forMonth)}</span>
+                                        )}
+                                        {entry.note && <span className="text-slate-400"> &mdash; {entry.note}</span>}
+                                      </td>
+                                      <td className="py-1.5 px-2 text-right font-mono font-black text-slate-800">
+                                        {isCredit ? "" : inr(entry.amount)}
+                                      </td>
+                                      <td className="py-1.5 px-2 text-right font-mono font-black text-emerald-700">
+                                        {isCredit ? inr(entry.amount) : ""}
+                                      </td>
+                                      <td className="py-1.5 px-2 text-right font-mono font-bold text-amber-700">{inr(advBal)}</td>
+                                      <td className="py-1.5 px-2 text-right font-mono font-bold text-rose-700">{inr(loanBal)}</td>
+                                      <td className="py-1.5 px-2">
+                                        <button
+                                          onClick={() => handleDeleteLedger(entry)}
+                                          title="Ye entry delete karo"
+                                          className="text-slate-300 hover:text-rose-600"
+                                        >
+                                          <FiTrash2 size={12} />
+                                        </button>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                              <tfoot className="bg-slate-50 font-black text-slate-800 sticky bottom-0">
+                                <tr>
+                                  <td className="py-2 px-2" colSpan={2}>
+                                    Total {ledgerMonthFilter ? monthLabel(ledgerMonthFilter) : "(all)"}
+                                  </td>
+                                  <td className="py-2 px-2 text-right font-mono">{inr(visibleTotals.debit)}</td>
+                                  <td className="py-2 px-2 text-right font-mono text-emerald-700">{inr(visibleTotals.credit)}</td>
+                                  <td className="py-2 px-2 text-right font-mono text-amber-700">{inr(detailBalance.advanceBalance)}</td>
+                                  <td className="py-2 px-2 text-right font-mono text-rose-700">{inr(detailBalance.loanBalance)}</td>
+                                  <td />
+                                </tr>
+                              </tfoot>
+                            </table>
+                          </div>
+                        </>
+                      )}
+
+                      {/* Month-wise salary */}
+                      {salaryMonths.length > 0 && (
+                        <div className="mt-4 pt-3 border-t border-slate-100">
+                          <span className="text-[10px] font-black uppercase tracking-wider text-slate-400 block mb-2">
+                            Salary &mdash; month-wise
+                          </span>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left text-[11px] border-collapse min-w-[480px]">
+                              <thead className="bg-slate-50 text-slate-400 font-black uppercase tracking-wider text-[9px]">
+                                <tr>
+                                  <th className="py-2 px-2">Month</th>
+                                  <th className="py-2 px-2 text-right">Attendance se</th>
+                                  <th className="py-2 px-2 text-right">Approved</th>
+                                  <th className="py-2 px-2 text-right">Adv/Loan kata</th>
+                                  <th className="py-2 px-2 text-right">Di (cash)</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y divide-slate-100">
+                                {salaryMonths.map((r) => (
+                                  <tr key={r.month}>
+                                    <td className="py-1.5 px-2 font-black text-slate-700">{monthLabel(r.month)}</td>
+                                    <td className="py-1.5 px-2 text-right font-mono text-slate-500">{inr(r.calculated)}</td>
+                                    <td className="py-1.5 px-2 text-right font-mono font-bold text-slate-800">
+                                      {inr(r.approved)}
+                                      {Math.round(r.approved) !== Math.round(r.calculated) && (
+                                        <span className="text-amber-600" title="Haath se badli gayi"> *</span>
+                                      )}
+                                    </td>
+                                    <td className="py-1.5 px-2 text-right font-mono text-amber-700">{r.recovered > 0 ? inr(r.recovered) : "—"}</td>
+                                    <td className="py-1.5 px-2 text-right font-mono font-black text-blue-700">{inr(r.paid)}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+      </PinGate>
+    </BlockGuard>
+  );
+}

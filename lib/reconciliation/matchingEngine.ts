@@ -1,0 +1,836 @@
+import type { Db } from "mongodb";
+
+// Stable signature for a set of bill ids, order-independent - used to
+// remember exactly which COMBO was rejected for a transaction (as opposed
+// to blacklisting its individual member bills forever, which would make a
+// later, genuinely different combo that happens to share a member
+// unfindable too; see the reject handler in
+// app/api/reconciliation/matches/[id]/route.ts and its use in
+// generateSuggestions in app/api/reconciliation/matches/route.ts).
+export function comboSignature(ids: (string | { toString(): string })[]): string {
+  return [...ids].map((id) => String(id)).sort().join(",");
+}
+
+// ============================================================
+// TYPES
+// ============================================================
+
+export interface AliasMeta {
+  keyword: string;
+  confidence: number;
+  lastUsed?: Date;
+  source?: "manual_seed" | "learned";
+}
+
+export interface NegativeKeyword {
+  keyword: string;
+  rejectedCount: number;
+}
+
+export interface DeductionProfile {
+  tdsOnlyCount: number;
+  tdsGstCount: number;
+  kasarCount: number;
+  kasarRange: { min: number | null; max: number | null };
+  lastConfirmedType: string | null;
+}
+
+export interface ClusterProfile {
+  typicalGapDays: number | null;
+  gapSamples: number[];
+  lastUpdated?: Date | null;
+}
+
+// Minimal shape the matching engine needs from a Seller ("Institute") doc —
+// deliberately loose (matches this codebase's convention of `any` for Mongoose docs).
+export interface SellerForMatching {
+  _id?: any;
+  instituteName: string;
+  statementDescriptionName?: string[];
+  aliasMeta?: AliasMeta[];
+  negativeKeywords?: NegativeKeyword[];
+  deductionProfile?: DeductionProfile;
+  clusterProfile?: ClusterProfile;
+  autoApproveTrusted?: boolean;
+}
+
+export type ConfidenceLabel = "high" | "low" | "new";
+
+export interface InstituteMatchResult {
+  instituteName: string;
+  sellerId: any;
+  matchedKeyword: string;
+  confidence: number;
+  confidenceLabel: ConfidenceLabel;
+}
+
+export type DeductionType = "TDS" | "TDS+GST" | "Kasar";
+
+export interface BillMatchResult {
+  // Almost always one real SellerOrder - more than one when the matched
+  // amount actually belongs to a split-order group, e.g. an order and its
+  // "-P1" partial-ship sibling (see groupSplitOrders above).
+  bills: any[];
+  remainingAmount: number;
+  deductionAmount: number;
+  matchType: "exact" | "deduction";
+}
+
+export interface CombinationMatchResult {
+  bills: any[];
+  totalAmount: number;
+  matchType: "combination";
+}
+
+export const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+// A payment is never credited for MORE than the bill - only equal or short
+// (short meaning a deduction was cut). This tiny buffer only absorbs float/
+// paisa rounding noise, not a real overpayment allowance.
+export const OVERPAY_ROUNDING_BUFFER = 1;
+
+// TDS is always exactly 2% of the bill, cut alone; TDS+GST is always 2% TDS
+// + 2% GST cut together (GST is never deducted on its own) - real confirmed
+// data confirms this precisely (samples land within 1.98%-2.01%, not a loose
+// "roughly 2%"). ±0.25% only absorbs paisa-level rounding, not real variance.
+export const TDS_PERCENT = 2;
+export const TDS_GST_PERCENT = 4;
+export const DEDUCTION_PERCENT_TOLERANCE = 0.25;
+
+// Real deduction history shows a payment is short-paid on only a small
+// minority of bills, and even then never by more than TDS+GST's own ceiling
+// - so the search window for "this might be a deduction" is capped just
+// above that rather than the old blanket 20%, which routinely misclassified
+// unrelated shortfalls as a deduction against the wrong bill.
+export const MAX_DEDUCTION_FRACTION = (TDS_GST_PERCENT + DEDUCTION_PERCENT_TOLERANCE) / 100;
+
+// ============================================================
+// KEYWORD EXTRACTION (ported from the provided learning-engine.js)
+// ============================================================
+
+const STOPWORDS = new Set([
+  "neft", "imps", "rtgs", "upi", "utr", "transfer", "credit", "cr",
+  "dr", "txn", "trn", "ref", "to", "from", "by", "the", "and", "of",
+  "in", "at", "for", "a", "an", "on", "via", "payment", "pymt", "pmt",
+]);
+
+// Generic banking/transaction jargon that is never a real institute
+// identifier, no matter who it got registered against - it would false-
+// match almost any transaction of that type, from any payer. Unlike
+// STOPWORDS (filters individual tokens out of a longer auto-learned
+// keyword), this blocks a registered statementDescriptionName entry
+// outright when it's ONLY one of these phrases (exact match, not
+// substring) - confirmed live: "CHQ DEP" / "CHQ DEP CTS" registered
+// against BHESAN ITI matched a ₹10,00,000 cheque deposit from the firm
+// owner himself, nothing to do with BHESAN ITI.
+export const GENERIC_REGISTERED_KEYWORDS = new Set([
+  "chq dep", "chq dep cts", "cheque deposit", "cash dep", "cash deposit",
+  "neft", "rtgs", "imps", "upi", "clg", "clg chq", "cts clg1", "transfer", "credit",
+  "payment", "cr.for", "by transfer", "to transfer", "deposit", "withdrawal",
+  "cash withdrawal", "atm", "pos", "txn", "bank charges", "sms charges",
+]);
+
+export function normalizeText(text?: string): string {
+  return (text || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Extracts candidate keyword(s) from a bank-statement description for learning a new alias. */
+export function extractKeywords(description?: string): string[] {
+  if (!description) return [];
+  const normalized = normalizeText(description);
+
+  const tokens = normalized.split(" ").filter((token) => {
+    if (token.length < 3) return false;
+    if (STOPWORDS.has(token.toLowerCase())) return false;
+    if (/^\d+$/.test(token)) return false;
+    return true;
+  });
+  if (tokens.length === 0) return [];
+
+  const candidates = new Set<string>();
+  const longest = [...tokens].sort((a, b) => b.length - a.length)[0];
+  candidates.add(longest);
+  if (tokens.length >= 2) candidates.add(tokens.slice(0, 2).join(" "));
+  if (tokens.length >= 3) candidates.add(tokens.slice(0, 3).join(" "));
+
+  return [...candidates];
+}
+
+// ============================================================
+// STEP 1 — INSTITUTE MATCH
+// ============================================================
+
+// Bank narration fields have a fixed total length, so a long institute name
+// often gets cut off mid-word rather than ever failing to appear at all -
+// "DISTRICT TREASURY,MEHSANA" shows up as "...DISTRICT TREASURY,MEHS" in one
+// statement and the full name in another, purely because the field ran out
+// of room that time, not because they're different places. Confirmed by the
+// user: these are the same institute and should always be treated as such.
+//
+// Requiring the surviving prefix to land EXACTLY at the end of the
+// description is what keeps this safe and distinct from the fuzzy/inferred
+// matching deliberately removed elsewhere in this engine (see the long
+// comment in collectInstituteCandidates): a coincidental partial word
+// appearing anywhere else in the text doesn't qualify, only "the
+// description stops here, right where this keyword would have continued."
+const MIN_TRUNCATED_MATCH_LENGTH = 4;
+
+// Length of the literal (or truncated-literal) match: the full keyword
+// length for a normal substring match, the length of the surviving prefix
+// for a truncated one, or 0 if neither applies.
+export function matchedKeywordLength(desc: string, candidate: string): number {
+  if (desc.includes(candidate)) return candidate.length;
+  const minPrefix = Math.max(MIN_TRUNCATED_MATCH_LENGTH, Math.ceil(candidate.length / 2));
+  for (let k = candidate.length - 1; k >= minPrefix; k--) {
+    if (desc.endsWith(candidate.slice(0, k))) return k;
+  }
+  return 0;
+}
+
+export interface InstituteCandidate extends InstituteMatchResult {
+  // Length of the matched keyword text — used only to break ties between
+  // candidates that score equally on amount/date fit (see scoreInstituteCandidates).
+  matchLength: number;
+}
+
+/**
+ * Collects every institute whose registered keyword matches the description —
+ * a payer name like "Dist Treasury Mehsana" can legitimately belong to several
+ * institutes' statementDescriptionName lists, so this deliberately does NOT pick
+ * a single winner by keyword length alone (that used to silently hide ties).
+ * One candidate per seller (its best-matching keyword), sorted longest-match-first.
+ */
+function collectInstituteCandidates(
+  description: string,
+  sellers: SellerForMatching[]
+): InstituteCandidate[] {
+  const desc = (description || "").toLowerCase();
+  const bySeller = new Map<string, InstituteCandidate>();
+
+  const consider = (seller: SellerForMatching, raw: string, candidateLower: string, matchLength: number) => {
+    const key = String(seller._id ?? seller.instituteName);
+    const existing = bySeller.get(key);
+    if (existing && existing.matchLength >= matchLength) return;
+
+    const meta = (seller.aliasMeta || []).find(
+      (a) => (a.keyword || "").trim().toLowerCase() === candidateLower
+    );
+    const confidence = meta ? meta.confidence : 1;
+    bySeller.set(key, {
+      instituteName: seller.instituteName,
+      sellerId: seller._id,
+      matchedKeyword: raw,
+      confidence,
+      confidenceLabel: confidence >= 3 ? "high" : meta ? "low" : "new",
+      matchLength,
+    });
+  };
+
+  // negativeKeywords is deliberately NOT consulted here (see learnFromRejection
+  // in learningEngine.ts for why) - a keyword registered on a seller's own
+  // statementDescriptionName always makes that seller a candidate, past
+  // rejections or not. Confirmed live: "SUB TREASURY,VADNAGAR" is shared by
+  // VADANAGAR/SATLASANA/VIJAPUR ITI; rejecting it once for VADANAGAR ITI (in
+  // favor of a different transaction's correct answer) silently excluded
+  // VADANAGAR ITI from EVERY later transaction with that keyword too - even
+  // ones that genuinely were VADANAGAR ITI's (proved by an exact ₹9,800 bill
+  // match once manually selected). A shared/generic treasury code is reused
+  // by different real institutes across different transactions; one past
+  // rejection is evidence about that ONE transaction, never a permanent ban.
+  // Only a literal match (full, or truncated right at the end of the
+  // description - see matchedKeywordLength): the registered word/phrase
+  // must actually appear in the transaction description, not be guessed at.
+  // No fuzzy fallback beyond that (there used to be a second pass here that
+  // prefix-matched a heuristically-extracted payer fragment against
+  // registered keywords even when the registered text never literally
+  // appeared anywhere) - that was the system guessing beyond what was
+  // explicitly registered, and every false-match case found in this engine
+  // (DIET MEHSANA, VADANAGAR ITI, BHESAN ITI) traced back to some form of
+  // the system inferring a match instead of requiring the literal
+  // registered text to actually be present. If nothing literally (or
+  // truncated-literally) matches, the transaction is surfaced as unmatched
+  // for a manual pick - never guessed.
+  if (desc) {
+    for (const seller of sellers) {
+      for (const raw of seller.statementDescriptionName || []) {
+        const candidate = (raw || "").trim().toLowerCase();
+        if (candidate.length < 3) continue;
+        if (GENERIC_REGISTERED_KEYWORDS.has(candidate)) continue;
+        const matchLen = matchedKeywordLength(desc, candidate);
+        if (!matchLen) continue;
+        consider(seller, raw, candidate, matchLen);
+      }
+    }
+  }
+
+  return [...bySeller.values()].sort((a, b) => b.matchLength - a.matchLength);
+}
+
+/**
+ * Richer sibling of lib/institutMatcher.ts's matchInstituteFromDescription:
+ * returns confidence info instead of just the institute name, so the caller
+ * can persist a scored suggestion. Returns only the single best candidate -
+ * use findInstituteMatches when a keyword might legitimately belong to more
+ * than one institute and the caller wants to disambiguate rather than
+ * silently pick one.
+ */
+export function findInstituteMatch(
+  description: string,
+  sellers: SellerForMatching[]
+): InstituteMatchResult | null {
+  return collectInstituteCandidates(description, sellers)[0] ?? null;
+}
+
+/** All institutes whose registered keyword matches the description, best match first. */
+export function findInstituteMatches(
+  description: string,
+  sellers: SellerForMatching[]
+): InstituteCandidate[] {
+  return collectInstituteCandidates(description, sellers);
+}
+
+export interface ScoredInstituteCandidate extends InstituteCandidate {
+  amountFit: boolean;
+  dateFit: boolean;
+  score: number;
+  // Concrete evidence for amountFit - which bill(s) actually add up to the
+  // credited amount for this candidate, shown to the user instead of just a
+  // "fits/unclear" label so they can see WHY before picking between institutes
+  // sharing the same keyword.
+  matchedBillNos?: string[];
+}
+
+// Converts a date string into a YYYYMMDD number for reliable chronological
+// comparison, regardless of which format the source bank statement used
+// (ISO YYYY-MM-DD, or DD-MM-YYYY / DD-MM-YY as printed by banks like HDFC) -
+// same parsing as account-statements' sortTransactions. Plain `new Date(s)`
+// is NOT safe here: V8 parses an ambiguous "05/10/26" as the US M/D/Y
+// convention (May 10) instead of the Indian D/M/Y one (Oct 5) banks actually
+// use, which would silently corrupt every date comparison below.
+export function parseDateToSortable(dateStr?: string): number {
+  if (!dateStr) return 0;
+  const s = dateStr.trim();
+  let m = s.match(/^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$/); // YYYY-MM-DD
+  if (m) return Number(m[1]) * 10000 + Number(m[2]) * 100 + Number(m[3]);
+  m = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$/); // DD-MM-YYYY
+  if (m) return Number(m[3]) * 10000 + Number(m[2]) * 100 + Number(m[1]);
+  m = s.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2})$/); // DD-MM-YY
+  if (m) return (2000 + Number(m[3])) * 10000 + Number(m[2]) * 100 + Number(m[1]);
+  return 0;
+}
+
+// Turns a sortable YYYYMMDD int back into a real Date (local midnight) for
+// day-difference math - built from parseDateToSortable's already-correct
+// D/M/Y interpretation rather than re-parsing the original string.
+function sortableToDate(n: number): Date | null {
+  if (!n) return null;
+  const year = Math.floor(n / 10000);
+  const month = Math.floor((n % 10000) / 100);
+  const day = n % 100;
+  const d = new Date(year, month - 1, day);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// How close (in days) a payment date needs to be to one of the institute's open
+// bill dates to count as a "date fit" — a rough proxy until Phase 3's cluster
+// engine gives a real per-institute burst window.
+const DATE_FIT_WINDOW_DAYS = 60;
+
+// A candidate is a "clear winner" over the runner-up once its score is ahead by
+// more than this margin — below it, the two are close enough to ask the user.
+export const AMBIGUITY_SCORE_MARGIN = 60;
+
+// Same-date, any-firm evidence: a government institute commonly releases
+// payment to several different supplier firms on the same real-world day,
+// so an institute that already has a CONFIRMED match on this exact credit
+// date (in any firm, not just this transaction's) was demonstrably paying
+// out that day - real evidence worth preferring it as a tie-breaker when
+// another candidate's score is otherwise equal or close. Deliberately a
+// boost, not a hard override: big enough to clear AMBIGUITY_SCORE_MARGIN
+// against an equally-scored rival with no such evidence, but a rival with
+// its OWN same-date evidence (or an otherwise much stronger score) still
+// leaves the transaction correctly ambiguous. User-specified design,
+// confirmed live on PRANTIJ ITI vs IDAR MAHILA ITI repeatedly tying on
+// exact combo matches for unrelated same-amount transactions.
+const SAME_DATE_CONFIRMED_BOOST = 70;
+
+// Builds the sellerId -> {confirmed credit dates, as sortable ints} index
+// scoreInstituteCandidates' same-date tie-breaker reads from. Called ONCE
+// per Run Matching pass (not once per candidate per ambiguous transaction -
+// see scoreInstituteCandidates' confirmedDatesBySeller param for why that
+// mattered).
+export function buildConfirmedDatesBySeller(confirmed: { sellerId: any; transactionDate?: string }[]): Map<string, Set<number>> {
+  const map = new Map<string, Set<number>>();
+  for (const cm of confirmed) {
+    const sortable = parseDateToSortable(cm.transactionDate);
+    if (!sortable) continue;
+    const key = String(cm.sellerId);
+    if (!map.has(key)) map.set(key, new Set());
+    map.get(key)!.add(sortable);
+  }
+  return map;
+}
+
+// Reverse of buildConfirmedDatesBySeller - date -> every seller that already
+// has a CONFIRMED match that same day (any firm). A government treasury
+// commonly pays one institute's bills out across several different supplier
+// firms on the same real-world day under a narration that may not be
+// registered as that institute's own keyword yet (e.g. "DISTRICT TREASURY,
+// PAL" confirmed for VADGAM ITI under one firm's statement doesn't make it a
+// candidate for an identical-day transaction under a different firm until
+// that keyword is learned) - this index is what lets generateSuggestions
+// fall back to "who else got paid this exact day" when literal keyword
+// matching finds nothing at all. User-specified design, 2026-11-05.
+export function buildSameDateConfirmedSellers(confirmed: { sellerId: any; transactionDate?: string }[]): Map<number, Set<string>> {
+  const map = new Map<number, Set<string>>();
+  for (const cm of confirmed) {
+    const sortable = parseDateToSortable(cm.transactionDate);
+    if (!sortable) continue;
+    if (!map.has(sortable)) map.set(sortable, new Set());
+    map.get(sortable)!.add(String(cm.sellerId));
+  }
+  return map;
+}
+
+/**
+ * Scores each candidate institute by (a) whether the credited amount fits one of
+ * its open bills/combinations and (b) whether the payment date falls near its
+ * open-bill activity — used to resolve a keyword shared by multiple institutes
+ * (Addition 2) without guessing. Amount fit is the dominant signal since two
+ * institutes rarely have the same institute-specific pending amount at once.
+ */
+export async function scoreInstituteCandidates(
+  db: Db,
+  candidates: InstituteCandidate[],
+  {
+    creditedAmount,
+    transactionDate,
+    firmCode,
+    confirmedDatesBySeller,
+  }: {
+    creditedAmount: number;
+    transactionDate?: string;
+    firmCode?: string;
+    // Precomputed once per Run Matching pass (see buildConfirmedDatesBySeller)
+    // instead of queried per candidate here - that per-candidate query was
+    // slow enough in production to blow through Vercel's 60s function
+    // timeout on the all-firms Run Matching request, silently discarding
+    // the entire run's work since nothing gets written until the very end.
+    confirmedDatesBySeller?: Map<string, Set<number>>;
+  }
+): Promise<ScoredInstituteCandidate[]> {
+  const txnDateSortable = parseDateToSortable(transactionDate);
+  const txnDate = sortableToDate(txnDateSortable);
+  const txnDateValid = !!txnDate;
+
+  const scored = await Promise.all(
+    candidates.map(async (c) => {
+      const allOpenBills = await findOpenBills(db, { instituteName: c.instituteName, firmCode });
+      // A bill dated after the money was actually credited can never be what
+      // that payment was for - exclude it from the amount/combo search so a
+      // future-dated order never gets suggested as the match for an earlier
+      // payment (applied per Contract No group, not per line item - see
+      // filterBillsByCutoffDate). A bill with no date at all is kept (can't
+      // prove it's future-dated, so no evidence to exclude it on).
+      const openBills = txnDateValid ? filterBillsByCutoffDate(allOpenBills, transactionDate) : allOpenBills;
+      const singleMatch = findAmountMatch(openBills, creditedAmount);
+      const comboMatch = singleMatch ? null : findCombinationMatch(openBills, creditedAmount);
+      const amountFit = !!(singleMatch || comboMatch);
+      // A TRUE exact match (the matched bill/combo total equals the credited
+      // amount to within a rupee of rounding - OVERPAY_ROUNDING_BUFFER, not
+      // the full search tolerance) is strong evidence - two institutes can
+      // coincidentally share a keyword, but essentially never also
+      // coincidentally owe the exact same precise amount. Anything else -
+      // a "deduction" single match, OR a combo that only landed within the
+      // broader ±tolerance search window without actually summing to the
+      // credited amount - is much weaker: a combo payment can never
+      // legitimately total MORE than what was actually received unless a
+      // deduction explains the gap, so a few-rupee-off "near match" is only
+      // as trustworthy as a guessed deduction, not a real exact fit.
+      // Confirmed live twice: a true exact ₹480 single match lost the clear-
+      // winner margin to a same-pool ~3%-short ₹495 "deduction" match, and a
+      // true exact ₹12,400 combo tied against a different institute's
+      // ₹12,404 combo that only fit because of search tolerance slack - both
+      // because flat amountFit scoring treated every "fits" case the same.
+      const matchedTotal = singleMatch ? singleMatch.remainingAmount : comboMatch ? comboMatch.totalAmount : null;
+      const isExactFit = matchedTotal !== null && Math.abs(matchedTotal - creditedAmount) <= OVERPAY_ROUNDING_BUFFER;
+      const matchedBillNos = singleMatch
+        ? singleMatch.bills.map((b) => b.orderNo)
+        : comboMatch
+        ? comboMatch.bills.map((b) => b.orderNo)
+        : undefined;
+
+      let dateFit = false;
+      if (txnDateValid) {
+        for (const b of openBills) {
+          if (!b.contractDate) continue;
+          const billDate = sortableToDate(parseDateToSortable(b.contractDate));
+          if (!billDate) continue;
+          if (Math.abs(txnDate!.getTime() - billDate.getTime()) / 86400000 <= DATE_FIT_WINDOW_DAYS) {
+            dateFit = true;
+            break;
+          }
+        }
+      }
+
+      const sameDateConfirmedElsewhere =
+        txnDateValid && !!confirmedDatesBySeller?.get(String(c.sellerId))?.has(txnDateSortable);
+
+      const amountScore = isExactFit ? 100 : amountFit ? 15 : 0;
+      const score =
+        amountScore + (dateFit ? 20 : 0) + Math.min(c.matchLength, 15) + (sameDateConfirmedElsewhere ? SAME_DATE_CONFIRMED_BOOST : 0);
+      return { ...c, amountFit, dateFit, score, matchedBillNos };
+    })
+  );
+
+  return scored.sort((a, b) => b.score - a.score);
+}
+
+// ============================================================
+// STEP 2 — OPEN BILLS + AMOUNT MATCH
+// ============================================================
+
+// Every SellerOrder status is eligible for payment matching except the return
+// family — a returned/cancelled order is never something an institute still owes on.
+export const ELIGIBLE_BILL_STATUSES = [
+  "TO CHECK",
+  "READY TO SHIP",
+  "DELIVERY",
+  "FULFILLED",
+  "HISAB",
+];
+
+export async function findOpenBills(
+  db: Db,
+  { instituteName, firmCode }: { instituteName: string; firmCode?: string }
+): Promise<any[]> {
+  const query: any = {
+    instituteName,
+    isPaid: { $ne: true },
+    status: { $in: ELIGIBLE_BILL_STATUSES },
+  };
+  if (firmCode) query.firmCode = firmCode;
+  return db.collection("sellerorders").find(query).sort({ contractDate: 1 }).toArray();
+}
+
+export const withRemainingAmounts = (bills: any[]) =>
+  bills.map((b) => ({
+    ...b,
+    remainingAmount: round2(Number(b.totalAmount || 0) - Number(b.paidAmount || 0)),
+  }));
+
+// A Partial Ship or Return split (see app/api/seller-orders/[id]/route.ts,
+// which creates an order's "-P{n}"/"-Re{n}"/"-RE-N{n}" sibling) breaks one
+// real order into several SellerOrder docs that are still, in practice, one
+// delivery paid together - so the amount/combo search below must never be
+// able to match only part of such a split. Siblings sharing a base order
+// number are merged into one synthetic candidate (summed totalAmount/
+// paidAmount) for the search; expandBills unpacks a matched synthetic
+// candidate back into its real underlying SellerOrder docs before the
+// result is handed back, so callers never see the synthetic merge.
+//
+// Deliberately NOT grouped by raw Contract No: confirmed live, one GeM
+// Contract No can cover 90 genuinely separate line items for an institute (a
+// whole rate-contract), paid individually over time rather than as one giant
+// lump sum - grouping by contractNo alone merged all 90 into a single
+// candidate whose total basically never matches anything, silently breaking
+// auto-matching for that institute entirely.
+function baseOrderNo(orderNo: string): string {
+  return (orderNo || "").replace(/-(P\d+|Re\d+|RE-N\d+)$/i, "");
+}
+
+export function groupSplitOrders(bills: any[]): any[] {
+  // Every bill's key is its own base order number - an un-suffixed order's
+  // key is just itself, so it naturally merges with any "-P"/"-Re" sibling
+  // that's also present (and stays standalone when none is).
+  const byBase = new Map<string, any[]>();
+  for (const b of bills) {
+    const base = baseOrderNo(b.orderNo) || b.orderNo;
+    if (!byBase.has(base)) byBase.set(base, []);
+    byBase.get(base)!.push(b);
+  }
+  const grouped: any[] = [];
+  for (const members of byBase.values()) {
+    if (members.length === 1) {
+      grouped.push(members[0]);
+      continue;
+    }
+    // The group's effective date is its LATEST member's date - the full
+    // contract (and so the combined payment for it) can only be "done"
+    // once every line item in it exists, not as soon as the first one does.
+    const latestDate = members.reduce(
+      (latest, m) => (parseDateToSortable(m.contractDate) > parseDateToSortable(latest) ? m.contractDate : latest),
+      members[0].contractDate
+    );
+    grouped.push({
+      _id: members[0]._id,
+      orderNo: members.map((m) => m.orderNo).join(" + "),
+      contractDate: latestDate,
+      totalAmount: members.reduce((s, m) => s + Number(m.totalAmount || 0), 0),
+      paidAmount: members.reduce((s, m) => s + Number(m.paidAmount || 0), 0),
+      _groupMembers: members,
+    });
+  }
+  return grouped;
+}
+
+export function expandBills(bills: any[]): any[] {
+  const out: any[] = [];
+  for (const b of bills) {
+    if (b._groupMembers) out.push(...b._groupMembers);
+    else out.push(b);
+  }
+  return out;
+}
+
+// Applies the "never match a bill dated after the credit date" rule at the
+// split-order-group level (see groupSplitOrders) instead of per individual
+// order, so an order's "-P"/"-Re" siblings are excluded as a whole if any one
+// of them postdates the payment, rather than silently letting the search
+// match only the earlier-dated members. Returns real (ungrouped) SellerOrder
+// docs either way.
+export function filterBillsByCutoffDate(bills: any[], cutoffDateStr?: string): any[] {
+  const cutoffSortable = parseDateToSortable(cutoffDateStr);
+  if (!cutoffSortable) return bills;
+  const grouped = groupSplitOrders(bills);
+  const kept = grouped.filter((b) => {
+    const sortable = parseDateToSortable(b.contractDate);
+    return !sortable || sortable <= cutoffSortable;
+  });
+  return expandBills(kept);
+}
+
+/**
+ * Step 2: match a credited amount to a single open bill, within tolerance for a full
+ * settlement (never more than the bill, only equal or short), or — if the credited
+ * amount is short by up to MAX_DEDUCTION_FRACTION — the closest bill by deduction
+ * size, so Step 3 can classify what was deducted.
+ */
+export function findAmountMatch(
+  bills: any[],
+  creditedAmount: number,
+  tolerance = 5
+): BillMatchResult | null {
+  const candidates = withRemainingAmounts(groupSplitOrders(bills));
+
+  // Credited can be up to `tolerance` short and still count as fully settled
+  // (rounding-level), but never more than the bill by more than a paisa-level buffer.
+  const exact = candidates.find(
+    (b) => creditedAmount <= b.remainingAmount + OVERPAY_ROUNDING_BUFFER && creditedAmount >= b.remainingAmount - tolerance
+  );
+  if (exact) {
+    return { bills: expandBills([exact]), remainingAmount: exact.remainingAmount, deductionAmount: 0, matchType: "exact" };
+  }
+
+  // A bill whose shortfall lands cleanly on TDS's fixed 2% or TDS+GST's fixed
+  // 4% is almost certainly the right one - those are precise, known business
+  // rules, unlike Kasar's wide 0.1%-3% catch-all band. Sorting by smallest
+  // absolute deduction alone picked e.g. a ₹15,500 bill (1.21% "Kasar") over
+  // the real ₹15,624 bill (1.997% ≈ TDS) just because ₹188 < ₹312 - the
+  // wrong bill, with a vaguer deduction type, purely because it was
+  // numerically closer. Clean TDS/TDS+GST matches now sort first; ties
+  // within the same group still break on smallest deduction.
+  const isCleanDeduction = (remainingAmount: number, deductionAmount: number) => {
+    const percent = (deductionAmount / remainingAmount) * 100;
+    return (
+      Math.abs(percent - TDS_PERCENT) <= DEDUCTION_PERCENT_TOLERANCE ||
+      Math.abs(percent - TDS_GST_PERCENT) <= DEDUCTION_PERCENT_TOLERANCE
+    );
+  };
+
+  const shortPaid = candidates
+    .filter(
+      (b) =>
+        creditedAmount < b.remainingAmount - tolerance &&
+        creditedAmount >= b.remainingAmount * (1 - MAX_DEDUCTION_FRACTION)
+    )
+    .map((b) => ({ ...b, deductionAmount: round2(b.remainingAmount - creditedAmount) }))
+    .sort((a, b) => {
+      const aClean = isCleanDeduction(a.remainingAmount, a.deductionAmount);
+      const bClean = isCleanDeduction(b.remainingAmount, b.deductionAmount);
+      if (aClean !== bClean) return aClean ? -1 : 1;
+      return a.deductionAmount - b.deductionAmount;
+    });
+
+  if (shortPaid.length > 0) {
+    const best = shortPaid[0];
+    return {
+      bills: expandBills([best]),
+      remainingAmount: best.remainingAmount,
+      deductionAmount: best.deductionAmount,
+      matchType: "deduction",
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Fallback when no single bill fits: a bounded subset-sum search across the institute's
+ * open bills for a combination whose total lands within ±tolerance of the credited amount
+ * (e.g. one payment settling several small bills at once, no deduction).
+ */
+export function findCombinationMatch(
+  bills: any[],
+  creditedAmount: number,
+  tolerance = 5
+): CombinationMatchResult | null {
+  const candidates = withRemainingAmounts(groupSplitOrders(bills))
+    .filter((b) => b.remainingAmount > 0)
+    .slice(0, 25); // bound the search space
+
+  const n = candidates.length;
+  if (n < 2) return null;
+
+  let found: any[] | null = null;
+
+  const search = (startIdx: number, chosen: any[], sum: number) => {
+    if (found) return;
+    // Same never-more-than-the-bill rule as the single-bill matcher: the
+    // combined bill total (sum) can be up to `tolerance` more than what was
+    // credited (short-paid, rounding-level), but credited can only exceed
+    // the total by the tiny paisa-rounding buffer, not the full tolerance.
+    if (chosen.length > 0 && sum >= creditedAmount - OVERPAY_ROUNDING_BUFFER && sum <= creditedAmount + tolerance) {
+      found = [...chosen];
+      return;
+    }
+    // No cap on how many bills can combine - only the sum-based pruning
+    // above bounds the search (confirmed live: a real 5-bill combo wasn't
+    // found under an earlier maxCombo=4 cap even though its sum matched
+    // the credited amount exactly).
+    if (sum > creditedAmount + tolerance) return;
+    for (let i = startIdx; i < n; i++) {
+      chosen.push(candidates[i]);
+      search(i + 1, chosen, round2(sum + candidates[i].remainingAmount));
+      chosen.pop();
+      if (found) return;
+    }
+  };
+
+  search(0, [], 0);
+  if (!found) return null;
+
+  const expanded = expandBills(found as any[]);
+  const total = round2(expanded.reduce((s, b) => s + (Number(b.totalAmount || 0) - Number(b.paidAmount || 0)), 0));
+  return { bills: expanded, totalAmount: total, matchType: "combination" };
+}
+
+// ============================================================
+// STEP 3 — DEDUCTION CLASSIFICATION
+// ============================================================
+
+/**
+ * Institute's learned deduction history takes priority; falls back to null when
+ * there isn't enough history yet so the caller uses the default percentage rule.
+ */
+export function suggestDeductionTypeFromHistory(
+  seller: SellerForMatching | null | undefined,
+  deductionPercent: number
+): DeductionType | null {
+  const profile = seller?.deductionProfile;
+  if (!profile) return null;
+
+  const { tdsOnlyCount = 0, tdsGstCount = 0, kasarCount = 0, kasarRange } = profile;
+
+  if (
+    kasarCount >= 2 &&
+    kasarRange?.min !== null &&
+    kasarRange?.min !== undefined &&
+    deductionPercent >= kasarRange.min - 0.5 &&
+    deductionPercent <= (kasarRange.max ?? kasarRange.min) + 0.5 &&
+    // Even an institute's own learned history can't push Kasar outside the
+    // hard 0.1%-3% business rule - a stray bad historical entry shouldn't be
+    // able to teach the system to suggest an implausible deduction.
+    deductionPercent >= 0.1 &&
+    deductionPercent <= 3
+  ) {
+    return "Kasar";
+  }
+
+  // Same guard as Kasar above: history only overrides when the current
+  // deduction is actually near TDS's fixed 2% (or TDS+GST's fixed 4%) - an
+  // institute having 3+ past TDS deductions doesn't mean every future
+  // deduction is TDS regardless of its size.
+  if (
+    tdsGstCount >= 3 &&
+    tdsGstCount > tdsOnlyCount &&
+    deductionPercent >= TDS_GST_PERCENT - DEDUCTION_PERCENT_TOLERANCE &&
+    deductionPercent <= TDS_GST_PERCENT + DEDUCTION_PERCENT_TOLERANCE
+  )
+    return "TDS+GST";
+  if (
+    tdsOnlyCount >= 3 &&
+    tdsOnlyCount >= tdsGstCount &&
+    deductionPercent >= TDS_PERCENT - DEDUCTION_PERCENT_TOLERANCE &&
+    deductionPercent <= TDS_PERCENT + DEDUCTION_PERCENT_TOLERANCE
+  )
+    return "TDS";
+
+  return null;
+}
+
+export interface DeductionClassification {
+  type: DeductionType | null;
+  percent: number;
+  // True when `type` came from the institute's own learned deductionProfile
+  // rather than the generic percentage-range fallback — used to decide
+  // whether a suggestion is confident enough to fast-track (see Phase 4).
+  usedHistory: boolean;
+}
+
+/**
+ * Step 3: classify a deduction as TDS (~2%), TDS+GST (~4%), or Kasar (0.1%-3%,
+ * outside the TDS/TDS+GST bands). Real Kasar deductions never run wider than
+ * 3% of the bill - anything larger (or a sub-0.1% sliver too small to be a
+ * real deduction) isn't a plausible deduction at all and is left unclassified
+ * (null) rather than guessed, so it surfaces for manual review instead of a
+ * bad auto-suggestion.
+ */
+export function classifyDeduction(
+  billAmount: number,
+  creditedAmount: number,
+  seller?: SellerForMatching | null
+): DeductionClassification {
+  if (!billAmount) return { type: null, percent: 0, usedHistory: false };
+  const deduction = billAmount - creditedAmount;
+  const percent = round2((deduction / billAmount) * 100);
+  if (percent <= 0) return { type: null, percent: 0, usedHistory: false };
+
+  const historySuggestion = suggestDeductionTypeFromHistory(seller, percent);
+  if (historySuggestion) return { type: historySuggestion, percent, usedHistory: true };
+
+  if (percent >= TDS_PERCENT - DEDUCTION_PERCENT_TOLERANCE && percent <= TDS_PERCENT + DEDUCTION_PERCENT_TOLERANCE) {
+    return { type: "TDS", percent, usedHistory: false };
+  }
+  if (percent >= TDS_GST_PERCENT - DEDUCTION_PERCENT_TOLERANCE && percent <= TDS_GST_PERCENT + DEDUCTION_PERCENT_TOLERANCE) {
+    return { type: "TDS+GST", percent, usedHistory: false };
+  }
+  if (percent >= 0.1 && percent <= 3) return { type: "Kasar", percent, usedHistory: false };
+  return { type: null, percent, usedHistory: false };
+}
+
+// ============================================================
+// STEP 4 — HIGH-CONFIDENCE FAST-TRACK (Addition 3, non-automatic)
+// ============================================================
+
+/**
+ * A suggestion is "high confidence" only when the keyword match itself is
+ * already trusted (learned aliasMeta confidence >= 3) AND the amount either
+ * settled exactly or its deduction matched the institute's own learned
+ * deduction history (not just the generic % fallback). This never skips the
+ * Confirm click — it only decides whether the UI pre-fills/fast-tracks a row.
+ */
+export function isHighConfidenceMatch(params: {
+  confidenceLabel: ConfidenceLabel;
+  matchType: "exact" | "deduction" | "combination" | "combination-deduction" | null;
+  deductionUsedHistory: boolean;
+}): boolean {
+  const { confidenceLabel, matchType, deductionUsedHistory } = params;
+  if (confidenceLabel !== "high" || !matchType) return false;
+  if (matchType === "exact" || matchType === "combination") return true;
+  return deductionUsedHistory;
+}

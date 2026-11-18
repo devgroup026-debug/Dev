@@ -1,0 +1,231 @@
+﻿import { NextResponse } from "next/server";
+import dbConnect from "@/lib/dbConnect";
+import mongoose from "mongoose";
+
+export async function GET() {
+  try {
+    await dbConnect();
+    const db = mongoose.connection.db;
+    if (!db) {
+      return NextResponse.json({ error: "Database connection not initialized" }, { status: 500 });
+    }
+
+    const indexResults: Record<string, string[]> = {};
+
+    // 1. sellerorders collection
+    const sellerorders = db.collection("sellerorders");
+    await sellerorders.createIndex({ firmCode: 1, createdAt: -1 });
+    await sellerorders.createIndex({ sellerId: 1, createdAt: -1 });
+    await sellerorders.createIndex({ sku: 1, status: 1 });
+    await sellerorders.createIndex({ paymentStatus: 1, firmCode: 1 });
+    await sellerorders.createIndex({ createdAt: -1 });
+    await sellerorders.createIndex({ contractNo: 1, firmCode: 1 });
+    await sellerorders.createIndex({ billId: 1 });
+    indexResults["sellerorders"] = [
+      "{ firmCode: 1, createdAt: -1 }",
+      "{ sellerId: 1, createdAt: -1 }",
+      "{ sku: 1, status: 1 }",
+      "{ paymentStatus: 1, firmCode: 1 }",
+      "{ createdAt: -1 }",
+      "{ contractNo: 1, firmCode: 1 }",
+      "{ billId: 1 }"
+    ];
+
+    // 2. Received purchase collection
+    const receivedPurchase = db.collection("Received purchase");
+    await receivedPurchase.createIndex({ sku: 1 });
+    await receivedPurchase.createIndex({ receivedAt: -1 });
+    indexResults["Received purchase"] = ["{ sku: 1 }", "{ receivedAt: -1 }"];
+
+    // 3. Order place Purchase collection
+    const orderPlacePurchase = db.collection("Order place Purchase");
+    await orderPlacePurchase.createIndex({ sku: 1 });
+    await orderPlacePurchase.createIndex({ orderNo: 1 });
+    await orderPlacePurchase.createIndex({ createdAt: -1 });
+    indexResults["Order place Purchase"] = ["{ sku: 1 }", "{ orderNo: 1 }", "{ createdAt: -1 }"];
+
+    // 4. account_statements collection
+    const accountStatements = db.collection("account_statements");
+    await accountStatements.createIndex({ firmCode: 1, date: -1 });
+    await accountStatements.createIndex({ processed: 1 });
+    indexResults["account_statements"] = ["{ firmCode: 1, date: -1 }", "{ processed: 1 }"];
+
+    // 5. bank_reconciliation_matches collection - the documents' actual field
+    // is "status" (matchStatus doesn't exist on them), so an index on
+    // matchStatus was dead weight; every query filtering by status/firmCode
+    // was falling back to a collection scan.
+    const matches = db.collection("bank_reconciliation_matches");
+    await matches.createIndex({ firmCode: 1, status: 1 });
+    await matches.createIndex({ sellerId: 1 });
+    indexResults["bank_reconciliation_matches"] = ["{ firmCode: 1, status: 1 }", "{ sellerId: 1 }"];
+
+    // 6. gem_catalogue_links collection
+    const gemLinks = db.collection("gem_catalogue_links");
+    await gemLinks.createIndex({ firmCode: 1 });
+    await gemLinks.createIndex({ masterItemId: 1 });
+    indexResults["gem_catalogue_links"] = ["{ firmCode: 1 }", "{ masterItemId: 1 }"];
+
+    // 7. sellers collection
+    const sellers = db.collection("sellers");
+    await sellers.createIndex({ instituteName: 1 });
+    await sellers.createIndex({ createdAt: -1 });
+    indexResults["sellers"] = ["{ instituteName: 1 }", "{ createdAt: -1 }"];
+
+    // 8. items collection
+    const items = db.collection("items");
+    await items.createIndex({ sku: 1 }, { unique: true, sparse: true });
+    await items.createIndex({ category: 1 });
+    // Case-insensitive uniqueness on itemName, scoped to non-hidden items -
+    // 16 duplicate-name groups (33 items) were found across the live
+    // inventory before this existed, created via manual "Add New Item"
+    // entries with no dedup check at all. A hidden item is a retired
+    // duplicate on purpose, so it's excluded (partialFilterExpression) -
+    // otherwise merging two duplicates into one visible + one hidden would
+    // itself violate the constraint. $in:[false,null] matches hidden=false,
+    // hidden=null, and a missing field alike ($ne isn't a supported partial-
+    // index operator).
+    await items.createIndex(
+      { itemName: 1 },
+      {
+        unique: true,
+        collation: { locale: "en", strength: 2 },
+        partialFilterExpression: { hidden: { $in: [false, null] } },
+        name: "itemName_unique_visible_ci",
+      }
+    );
+    // Multikey index on the per-item audit-log array - the Summary dashboard's
+    // "today's activity" query now $elemMatch-filters on history.date before
+    // unwinding, which needs this to avoid scanning every item's full history.
+    await items.createIndex({ "history.date": 1 });
+    indexResults["items"] = ["{ sku: 1 } (unique)", "{ category: 1 }", "{ itemName: 1 } (unique, case-insensitive, non-hidden only)", "{ history.date: 1 }"];
+
+    // 9. stock collection - no Mongoose model, queried/updated by sku on
+    // nearly every order/purchase/return write across the app, but never had
+    // an index (this was the single biggest missing index found in the audit)
+    const stock = db.collection("stock");
+    await stock.createIndex({ sku: 1 });
+    // Uniqueness on sku, scoped to non-hidden rows - same shape and same
+    // reasoning as itemName_unique_visible_ci above. Without this, an edit
+    // could stamp one sku onto several stock rows and nothing stopped it:
+    // 7 rows had been silently corrupted this way (S2661 x5, S2635 x4) while
+    // `items` - which DOES have a unique sku index - stayed correct, so the
+    // two collections drifted apart unnoticed (repaired Sep-2026, see the
+    // note in components/ItemForm.tsx for the bug that caused it). Hidden
+    // rows are excluded because a hidden row is a retired duplicate on
+    // purpose, exactly as with items.
+    await stock.createIndex(
+      { sku: 1 },
+      { unique: true, partialFilterExpression: { hidden: { $in: [false, null] } }, name: "sku_unique_visible" }
+    );
+    indexResults["stock"] = ["{ sku: 1 }", "{ sku: 1 } (unique, non-hidden only)"];
+
+    // 10. purchase_requests collection
+    const purchaseRequests = db.collection("purchase_requests");
+    await purchaseRequests.createIndex({ sku: 1 });
+    await purchaseRequests.createIndex({ status: 1 });
+    await purchaseRequests.createIndex({ itemName: 1 });
+    indexResults["purchase_requests"] = ["{ sku: 1 }", "{ status: 1 }", "{ itemName: 1 }"];
+
+    // 11. companies collection
+    const companies = db.collection("companies");
+    await companies.createIndex({ createdAt: -1 });
+    await companies.createIndex({ firmCode: 1 });
+    indexResults["companies"] = ["{ createdAt: -1 }", "{ firmCode: 1 }"];
+
+    // 12. transporters collection
+    const transporters = db.collection("transporters");
+    await transporters.createIndex({ createdAt: -1 });
+    indexResults["transporters"] = ["{ createdAt: -1 }"];
+
+    // 13. todo_tasks collection - Header polls this (now filtered to
+    // status=Pending) on every navigation across the whole app.
+    const todoTasks = db.collection("todo_tasks");
+    await todoTasks.createIndex({ status: 1, createdAt: -1 });
+    indexResults["todo_tasks"] = ["{ status: 1, createdAt: -1 }"];
+
+    // 14/15. chat_messages / direct_messages - also fetched by Header on
+    // every navigation across the whole app.
+    const chatMessages = db.collection("chat_messages");
+    await chatMessages.createIndex({ createdAt: -1 });
+    indexResults["chat_messages"] = ["{ createdAt: -1 }"];
+
+    const directMessages = db.collection("direct_messages");
+    await directMessages.createIndex({ sender: 1 });
+    await directMessages.createIndex({ recipient: 1 });
+    indexResults["direct_messages"] = ["{ sender: 1 }", "{ recipient: 1 }"];
+
+    // 16. gem_bids collection - sorted by updatedAt on every GeM Bids board load.
+    const gemBids = db.collection("gem_bids");
+    await gemBids.createIndex({ updatedAt: -1 });
+    indexResults["gem_bids"] = ["{ updatedAt: -1 }"];
+
+    // 17. gem_sheets - multikey index backing the Summary dashboard's
+    // $elemMatch pre-filter on uploadedRows.completedAt (see dashboard-summary route).
+    const gemSheets = db.collection("gem_sheets");
+    await gemSheets.createIndex({ "uploadedRows.completedAt": 1 });
+    indexResults["gem_sheets"] = ["{ uploadedRows.completedAt: 1 }"];
+
+    // 18. bills collection - one invoice number per firm can never repeat;
+    // firmCode+invoiceDate backs the history table, contractNo backs lookups
+    // from a SellerOrder back to the bill that covered it.
+    const bills = db.collection("bills");
+    await bills.createIndex({ firmCode: 1, invoiceNumber: 1 }, { unique: true });
+    await bills.createIndex({ firmCode: 1, invoiceDate: -1 });
+    await bills.createIndex({ contractNo: 1 });
+    indexResults["bills"] = [
+      "{ firmCode: 1, invoiceNumber: 1 } (unique)",
+      "{ firmCode: 1, invoiceDate: -1 }",
+      "{ contractNo: 1 }"
+    ];
+
+    // 19. raw_gem_orders - the GeM Chrome extension's staging collection.
+    // POST /api/gem-orders already checks for an existing contractNo before
+    // inserting, but that's a findOne-then-insert race, not atomic; this
+    // unique index is the actual backstop against a duplicate order landing
+    // twice (e.g. two overlapping extension runs for the same firm).
+    const rawGemOrders = db.collection("raw_gem_orders");
+    await rawGemOrders.createIndex({ contractNo: 1 }, { unique: true });
+    indexResults["raw_gem_orders"] = ["{ contractNo: 1 } (unique)"];
+
+    // 20. gem_order_intake - triage collection in front of raw_gem_orders
+    // (app/dashboard/orders/gem-order-intake). Same unique-contractNo
+    // backstop, plus a "disabled" index since the page's default list view
+    // filters those out on every load.
+    const gemOrderIntake = db.collection("gem_order_intake");
+    await gemOrderIntake.createIndex({ contractNo: 1 }, { unique: true });
+    await gemOrderIntake.createIndex({ disabled: 1, createdAt: -1 });
+    indexResults["gem_order_intake"] = ["{ contractNo: 1 } (unique)", "{ disabled: 1, createdAt: -1 }"];
+
+    // Task module (tasks / task_activities / task_followups)
+    const tasks = db.collection("tasks");
+    await tasks.createIndex({ taskNo: 1 }, { unique: true });
+    await tasks.createIndex({ assignee: 1, status: 1, dueAt: 1 });
+    await tasks.createIndex({ assignedBy: 1, status: 1 });
+    await tasks.createIndex({ status: 1, nextFollowUpAt: 1 });
+    await tasks.createIndex({ isDeleted: 1, dueAt: 1 });
+    await tasks.createIndex({ "links.sellerOrderId": 1 });
+    await tasks.createIndex({ "links.bidId": 1 });
+    await tasks.createIndex({ "links.billId": 1 });
+    await tasks.createIndex(
+      { title: "text", description: "text", "links.buyerName": "text", "links.gemOrderNo": "text" },
+      { name: "tasks_text" }
+    );
+    await db.collection("task_activities").createIndex({ taskId: 1, createdAt: -1 });
+    await db.collection("task_followups").createIndex({ taskId: 1 });
+    indexResults["tasks"] = [
+      "{ taskNo: 1 } (unique)", "{ assignee: 1, status: 1, dueAt: 1 }", "{ assignedBy: 1, status: 1 }",
+      "{ status: 1, nextFollowUpAt: 1 }", "{ isDeleted: 1, dueAt: 1 }", "links.* ids", "text index",
+    ];
+    indexResults["task_activities"] = ["{ taskId: 1, createdAt: -1 }"];
+    indexResults["task_followups"] = ["{ taskId: 1 }"];
+
+    return NextResponse.json({
+      success: true,
+      message: "Successfully ensured performance indexes across all MongoDB collections",
+      indexesCreated: indexResults,
+    });
+  } catch (error: any) {
+    console.error("Index creation error:", error);
+    return NextResponse.json({ success: false, error: error.message }, { status: 500 });
+  }
+}

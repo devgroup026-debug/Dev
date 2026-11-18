@@ -1,0 +1,302 @@
+import MatchFeedbackLog from "@/models/MatchFeedbackLog";
+import { extractKeywords, round2, DeductionType } from "./matchingEngine";
+
+const MAX_GAP_SAMPLES = 20;
+
+// These hooks operate on a live (non-lean) Mongoose Seller document so callers
+// can `.save()` it once after learning has been applied.
+
+// A confirmed/rejected match often shares an institute with other matches in
+// the same bulk action, and the UI fires those concurrently - each one loads
+// the same Seller doc, mutates it in memory, and saves, so whichever save()
+// lands second sees a stale version and fails outright (Mongoose
+// VersionError: "No matching document found for id ... version ..."). The
+// payment/match write itself is unaffected either way - this only protects
+// the Seller learning side-effect. Confirmed live on a 45-match bulk confirm
+// where several shared an institute (9 of them failed this way). Retries by
+// re-fetching the CURRENT doc and re-applying the mutation on top of IT
+// (rather than the stale, already-mutated in-memory copy), so a retried save
+// reflects both the other request's change and this one, instead of either
+// silently losing one of them or failing the whole confirm outright.
+// `mutate` returning `false` means nothing changed - skip the save entirely
+// rather than writing a no-op (or retrying one).
+async function saveSellerWithRetry(
+  seller: any,
+  mutate: (seller: any) => boolean | void,
+  maxAttempts = 5
+): Promise<void> {
+  let current = seller;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const changed = mutate(current);
+    if (changed === false) return;
+    try {
+      await current.save();
+      return;
+    } catch (err: any) {
+      if (err?.name !== "VersionError" || attempt === maxAttempts - 1) throw err;
+      current = await current.constructor.findById(current._id);
+      if (!current) return;
+    }
+  }
+}
+
+interface FeedbackContext {
+  firmId?: string;
+  firmCode?: string;
+  transactionDescription: string;
+  billAmount?: number;
+  creditedAmount?: number;
+  deductionAmount?: number;
+  userId?: string;
+  userName?: string;
+}
+
+// Every matchedKeyword is, by construction, already a member of the seller's
+// OWN statementDescriptionName list (collectInstituteCandidates in
+// matchingEngine.ts only ever sets it from there) - so blacklisting it can
+// only ever be correct when the SAME keyword is also registered by at least
+// one other institute (a genuinely shared/ambiguous tag, e.g. several
+// schools all filing "District Treasury, Mehsana"), and the user rejected
+// this one in favor of a different candidate. `isAmbiguous` is exactly that
+// signal, computed live per-transaction by collectInstituteCandidates.
+
+/**
+ * Updates an institute's learned cluster (order-burst) shape: the gaps, in days,
+ * between the contractDates of orders that a confirmed combo payment settled
+ * together. Bounded ring buffer of the most recent samples, median re-derived
+ * on every update — mirrors updateDeductionProfile's "no fixed threshold, learn
+ * from every confirmation" approach (Addition 3).
+ */
+export function updateClusterProfile(seller: any, orderDates: string[]): void {
+  if (!orderDates || orderDates.length < 2) return;
+  const dates = orderDates
+    .map((d) => new Date(d))
+    .filter((d) => !isNaN(d.getTime()))
+    .sort((a, b) => a.getTime() - b.getTime());
+  if (dates.length < 2) return;
+
+  if (!seller.clusterProfile) {
+    seller.clusterProfile = { typicalGapDays: null, gapSamples: [], lastUpdated: null };
+  }
+  const profile = seller.clusterProfile;
+  profile.gapSamples = profile.gapSamples || [];
+
+  for (let i = 1; i < dates.length; i++) {
+    profile.gapSamples.push(round2((dates[i].getTime() - dates[i - 1].getTime()) / 86400000));
+  }
+  if (profile.gapSamples.length > MAX_GAP_SAMPLES) {
+    profile.gapSamples = profile.gapSamples.slice(profile.gapSamples.length - MAX_GAP_SAMPLES);
+  }
+
+  const sorted = [...profile.gapSamples].sort((a: number, b: number) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  profile.typicalGapDays =
+    sorted.length % 2 ? sorted[mid] : round2((sorted[mid - 1] + sorted[mid]) / 2);
+  profile.lastUpdated = new Date();
+}
+
+/** HOOK 1 — an unmatched transaction was manually linked to an institute. */
+export async function learnFromManualMatch(
+  seller: any,
+  ctx: FeedbackContext
+): Promise<string[]> {
+  const candidates = extractKeywords(ctx.transactionDescription);
+
+  await saveSellerWithRetry(seller, (s) => {
+    const existingKeywords = new Set(
+      (s.statementDescriptionName || []).map((k: string) => k.trim().toLowerCase())
+    );
+    let added = false;
+    for (const keyword of candidates) {
+      if (existingKeywords.has(keyword.toLowerCase())) continue;
+      s.statementDescriptionName = s.statementDescriptionName || [];
+      s.statementDescriptionName.push(keyword);
+      s.aliasMeta = s.aliasMeta || [];
+      s.aliasMeta.push({ keyword, confidence: 1, lastUsed: new Date(), source: "learned" });
+      added = true;
+    }
+    return added;
+  });
+
+  await MatchFeedbackLog.create({
+    firmId: ctx.firmId,
+    firmCode: ctx.firmCode,
+    instituteName: seller.instituteName,
+    sellerId: seller._id,
+    transactionDescription: ctx.transactionDescription,
+    billAmount: ctx.billAmount,
+    creditedAmount: ctx.creditedAmount,
+    action: "manual_match",
+    userId: ctx.userId,
+    userName: ctx.userName,
+  });
+
+  return candidates;
+}
+
+/** HOOK 2 — engine's suggestion was confirmed as-is; reinforces the keyword + deduction/cluster history. */
+export async function reinforceOnConfirm(
+  seller: any,
+  ctx: FeedbackContext & {
+    matchedKeyword?: string;
+    deductionType?: DeductionType | null;
+    // Contract dates of the orders a combo match settled — present only for a
+    // multi-bill confirm, used to learn this institute's typical burst gap.
+    clusterOrderDates?: string[];
+  }
+): Promise<void> {
+  await saveSellerWithRetry(seller, (s) => {
+    if (ctx.matchedKeyword) {
+      s.aliasMeta = s.aliasMeta || [];
+      const alias = s.aliasMeta.find(
+        (a: any) => (a.keyword || "").trim().toLowerCase() === ctx.matchedKeyword!.trim().toLowerCase()
+      );
+      if (alias) {
+        alias.confidence += 1;
+        alias.lastUsed = new Date();
+      } else {
+        // First time this manual-seed keyword led to a real confirmed match
+        s.aliasMeta.push({
+          keyword: ctx.matchedKeyword,
+          confidence: 2,
+          lastUsed: new Date(),
+          source: "manual_seed",
+        });
+      }
+    }
+
+    if (ctx.deductionType) {
+      updateDeductionProfile(s, ctx.deductionType, ctx.deductionAmount || 0, ctx.billAmount || 0);
+    }
+
+    if (ctx.clusterOrderDates && ctx.clusterOrderDates.length >= 2) {
+      updateClusterProfile(s, ctx.clusterOrderDates);
+    }
+  });
+
+  await MatchFeedbackLog.create({
+    firmId: ctx.firmId,
+    firmCode: ctx.firmCode,
+    instituteName: seller.instituteName,
+    sellerId: seller._id,
+    transactionDescription: ctx.transactionDescription,
+    billAmount: ctx.billAmount,
+    creditedAmount: ctx.creditedAmount,
+    deductionAmount: ctx.deductionAmount,
+    suggestedType: ctx.deductionType,
+    correctedType: ctx.deductionType,
+    action: "confirm",
+    userId: ctx.userId,
+    userName: ctx.userName,
+  });
+}
+
+/** HOOK 3 — engine's suggested deduction type was wrong; user corrected it on Confirm. */
+export async function learnFromDeductionCorrection(
+  seller: any,
+  ctx: FeedbackContext & { suggestedType?: string | null; correctedType: DeductionType }
+): Promise<void> {
+  await saveSellerWithRetry(seller, (s) => {
+    updateDeductionProfile(s, ctx.correctedType, ctx.deductionAmount || 0, ctx.billAmount || 0);
+  });
+
+  await MatchFeedbackLog.create({
+    firmId: ctx.firmId,
+    firmCode: ctx.firmCode,
+    instituteName: seller.instituteName,
+    sellerId: seller._id,
+    transactionDescription: ctx.transactionDescription,
+    billAmount: ctx.billAmount,
+    creditedAmount: ctx.creditedAmount,
+    deductionAmount: ctx.deductionAmount,
+    suggestedType: ctx.suggestedType,
+    correctedType: ctx.correctedType,
+    action: "edit",
+    userId: ctx.userId,
+    userName: ctx.userName,
+  });
+}
+
+/** HOOK 4 — engine suggested the wrong institute/bill; user rejected it. */
+export async function learnFromRejection(
+  seller: any,
+  ctx: FeedbackContext & { matchedKeyword?: string; isAmbiguous?: boolean }
+): Promise<void> {
+  // negativeKeywords is deliberately never written here any more (and
+  // matchingEngine.ts's collectInstituteCandidates no longer reads it either)
+  // - confirmed live it causes real harm either way: for a UNIQUE keyword,
+  // rejecting one bill-mismatch wrongly killed every future match for the
+  // institute's own name (e.g. "DIET MEHSANA"). For a SHARED/ambiguous one
+  // (several real institutes genuinely reuse the same generic treasury
+  // code), rejecting it once in favor of a different candidate wrongly
+  // excluded that institute from every LATER transaction too - even ones
+  // that genuinely were theirs (confirmed: "SUB TREASURY,VADNAGAR" excluding
+  // VADANAGAR ITI from its own exact ₹9,800 bill match). A past rejection is
+  // evidence about that ONE transaction only, never a permanent ban.
+  //
+  // A genuinely ambiguous rejection still mildly penalizes confidence (never
+  // excludes - just deprioritizes slightly in future scoring), since
+  // confidence only affects ranking among candidates, not whether one
+  // appears at all.
+  await saveSellerWithRetry(seller, (s) => {
+    if (!ctx.matchedKeyword || !ctx.isAmbiguous) return false;
+    const keyword = ctx.matchedKeyword.trim();
+    s.aliasMeta = s.aliasMeta || [];
+    const alias = s.aliasMeta.find(
+      (a: any) => (a.keyword || "").trim().toLowerCase() === keyword.toLowerCase()
+    );
+    if (alias) alias.confidence = Math.max(0, alias.confidence - 2);
+  });
+
+  await MatchFeedbackLog.create({
+    firmId: ctx.firmId,
+    firmCode: ctx.firmCode,
+    instituteName: seller.instituteName,
+    sellerId: seller._id,
+    transactionDescription: ctx.transactionDescription,
+    action: "reject",
+    userId: ctx.userId,
+    userName: ctx.userName,
+  });
+}
+
+/** Updates TDS/TDS+GST/Kasar counters and the Kasar min-max range for an institute. */
+export function updateDeductionProfile(
+  seller: any,
+  type: string,
+  deductionAmount: number,
+  billAmount: number
+): void {
+  if (!seller.deductionProfile) {
+    seller.deductionProfile = {
+      tdsOnlyCount: 0,
+      tdsGstCount: 0,
+      kasarCount: 0,
+      kasarRange: { min: null, max: null },
+      lastConfirmedType: null,
+    };
+  }
+  const profile = seller.deductionProfile;
+
+  if (type === "TDS") {
+    profile.tdsOnlyCount = (profile.tdsOnlyCount || 0) + 1;
+  } else if (type === "TDS+GST") {
+    profile.tdsGstCount = (profile.tdsGstCount || 0) + 1;
+  } else if (type === "Kasar") {
+    profile.kasarCount = (profile.kasarCount || 0) + 1;
+    const pct = billAmount ? (deductionAmount / billAmount) * 100 : null;
+    if (pct !== null) {
+      profile.kasarRange = profile.kasarRange || { min: null, max: null };
+      profile.kasarRange.min =
+        profile.kasarRange.min === null || profile.kasarRange.min === undefined
+          ? pct
+          : Math.min(profile.kasarRange.min, pct);
+      profile.kasarRange.max =
+        profile.kasarRange.max === null || profile.kasarRange.max === undefined
+          ? pct
+          : Math.max(profile.kasarRange.max, pct);
+    }
+  }
+
+  profile.lastConfirmedType = type;
+}

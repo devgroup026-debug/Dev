@@ -1,0 +1,793 @@
+"use client";
+import { useState, useMemo, useRef, useEffect } from "react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
+import {
+  FiDownload,
+  FiPackage,
+  FiX,
+  FiCheck,
+  FiCheckCircle,
+  FiXCircle,
+  FiEdit3,
+  FiCopy,
+  FiChevronUp,
+  FiChevronDown
+} from "react-icons/fi";
+
+interface PurchaseOrder {
+  _id: string;
+  itemId?: string;
+  orderNumber?: string;
+  itemName: string;
+  sku?: string;
+  category?: string;
+  orderedAt?: string;
+  createdAt: string;
+  prQty: number;
+  orderQty: number;
+  unit: string;
+  rate: number;
+  vendor: string;
+  remark?: string;
+  // Manual, user-typed note - separate from `remark` (which is auto-filled
+  // from the source Purchase Request and must stay untouched). Shows up in
+  // the exported PDF under the item name.
+  manualRemark?: string;
+}
+
+interface OrderPlaceTableProps {
+  data: PurchaseOrder[];
+  vendors: any[];
+  onRefresh: () => void;
+  onCancel: (req: PurchaseOrder) => void;
+}
+
+export default function OrderPlaceTable({ data, vendors, onRefresh, onCancel }: OrderPlaceTableProps) {
+  const [selectedRequest, setSelectedRequest] = useState<PurchaseOrder | null>(null);
+  const [receivedQty, setReceivedQty] = useState<number>(0);
+  const [isSaving, setIsSaving] = useState(false);
+  const [damageQty, setDamageQty] = useState(0);
+  const [moveRemainingTo, setMoveRemainingTo] = useState("Order Place");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [editRate, setEditRate] = useState<number>(0);
+
+  // Per-row manual note popover (Option 2: an icon that opens a small editor,
+  // rather than a permanently-visible column)
+  const [openNoteId, setOpenNoteId] = useState<string | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [savingNoteId, setSavingNoteId] = useState<string | null>(null);
+  const [copiedNoteId, setCopiedNoteId] = useState<string | null>(null);
+  const notePopoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Per-row vendor edit popover - lets a wrong vendor picked at order-creation
+  // time get fixed while the order still sits in Order Place.
+  const [editVendorId, setEditVendorId] = useState<string | null>(null);
+  const [vendorDraft, setVendorDraft] = useState("");
+  const [savingVendorId, setSavingVendorId] = useState<string | null>(null);
+  const vendorPopoverRef = useRef<HTMLDivElement | null>(null);
+
+  // Filter States
+  const [filterDate, setFilterDate] = useState("");
+  const [filterItem, setFilterItem] = useState("");
+  const [filterVendor, setFilterVendor] = useState("");
+
+  const filteredData = useMemo(() => {
+    if (!Array.isArray(data)) return [];
+    return data.filter((item) => {
+      const dateStr = new Date(item.orderedAt || item.createdAt).toLocaleDateString('en-CA');
+      const dateMatch = filterDate ? dateStr.includes(filterDate) : true;
+      const itemMatch = item.itemName.toLowerCase().includes(filterItem.toLowerCase()) ||
+        (item.sku && item.sku.toLowerCase().includes(filterItem.toLowerCase()));
+      const vendorMatch = (item.vendor || "").toLowerCase().includes(filterVendor.toLowerCase());
+      return dateMatch && itemMatch && vendorMatch;
+    });
+  }, [data, filterDate, filterItem, filterVendor]);
+
+  // Column sort - click a header to sort ascending, click again for
+  // descending. "date" is a virtual key (orderedAt falling back to
+  // createdAt, same as what's actually displayed in that column) since
+  // orders aren't guaranteed to have orderedAt set.
+  const [sortConfig, setSortConfig] = useState<{ key: string; direction: "asc" | "desc" } | null>(null);
+  const NUMERIC_SORT_KEYS = new Set(["prQty", "orderQty", "rate"]);
+
+  const requestSort = (key: string) => {
+    setSortConfig((prev) => {
+      if (prev?.key === key && prev.direction === "asc") return { key, direction: "desc" };
+      return { key, direction: "asc" };
+    });
+  };
+
+  const renderSortIcon = (key: string) => {
+    if (sortConfig?.key !== key) return <FiChevronDown className="text-slate-300" size={12} />;
+    return sortConfig.direction === "asc" ? (
+      <FiChevronUp className="text-blue-600" size={12} />
+    ) : (
+      <FiChevronDown className="text-blue-600" size={12} />
+    );
+  };
+
+  const sortedData = useMemo(() => {
+    if (!sortConfig) return filteredData;
+    const { key, direction } = sortConfig;
+    const dir = direction === "asc" ? 1 : -1;
+    return [...filteredData].sort((a, b) => {
+      if (key === "date") {
+        const aT = new Date(a.orderedAt || a.createdAt).getTime();
+        const bT = new Date(b.orderedAt || b.createdAt).getTime();
+        return (aT - bT) * dir;
+      }
+      if (NUMERIC_SORT_KEYS.has(key)) {
+        return (((a as any)[key] || 0) - ((b as any)[key] || 0)) * dir;
+      }
+      const aVal = ((a as any)[key] || "").toString().toLowerCase();
+      const bVal = ((b as any)[key] || "").toString().toLowerCase();
+      if (aVal < bVal) return -1 * dir;
+      if (aVal > bVal) return 1 * dir;
+      return 0;
+    });
+  }, [filteredData, sortConfig]);
+
+
+  // Toggle single selection
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev =>
+      prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]
+    );
+  };
+
+  // Toggle "Select All" for current filtered view
+  const toggleSelectAll = () => {
+    if (selectedIds.length === filteredData.length) {
+      setSelectedIds([]);
+    } else {
+      setSelectedIds(filteredData.map(item => item._id));
+    }
+  };
+
+  // Closes the note popover on an outside click, since it has its own inputs
+  // inside it (a blur-based close would fire while moving focus between the
+  // textarea and its Save/Copy/Cancel buttons).
+  useEffect(() => {
+    if (!openNoteId) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (notePopoverRef.current && !notePopoverRef.current.contains(e.target as Node)) {
+        setOpenNoteId(null);
+      }
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [openNoteId]);
+
+  // Same outside-click-to-close pattern as the note popover above.
+  useEffect(() => {
+    if (!editVendorId) return;
+    const onMouseDown = (e: MouseEvent) => {
+      if (vendorPopoverRef.current && !vendorPopoverRef.current.contains(e.target as Node)) {
+        setEditVendorId(null);
+      }
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [editVendorId]);
+
+  const openVendorEdit = (req: PurchaseOrder) => {
+    setEditVendorId(req._id);
+    setVendorDraft(req.vendor || "");
+  };
+
+  const saveVendor = async (req: PurchaseOrder) => {
+    const vendor = vendorDraft.trim();
+    if (!vendor) {
+      alert("Vendor khali nahi ho sakta.");
+      return;
+    }
+    setSavingVendorId(req._id);
+    try {
+      const res = await fetch(`/api/orders/${req._id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ vendor }),
+      });
+      if (res.ok) {
+        setEditVendorId(null);
+        onRefresh();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || "Vendor update nahi hua, dubara try karo.");
+      }
+    } catch {
+      alert("Network error - vendor update nahi hua.");
+    } finally {
+      setSavingVendorId(null);
+    }
+  };
+
+  const openNote = (req: PurchaseOrder) => {
+    setOpenNoteId(req._id);
+    setNoteDraft(req.manualRemark || "");
+  };
+
+  const saveNote = async (req: PurchaseOrder) => {
+    setSavingNoteId(req._id);
+    try {
+      const res = await fetch(`/api/orders/${req._id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ manualRemark: noteDraft }),
+      });
+      if (res.ok) {
+        setOpenNoteId(null);
+        onRefresh();
+      } else {
+        alert("Note save nahi hua, dubara try karo.");
+      }
+    } catch {
+      alert("Network error - note save nahi hua.");
+    } finally {
+      setSavingNoteId(null);
+    }
+  };
+
+  const copyNote = async (text: string, id: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedNoteId(id);
+      setTimeout(() => setCopiedNoteId(null), 1500);
+    } catch {
+      alert("Copy nahi ho paya.");
+    }
+  };
+
+  // jsPDF's standard fonts only support WinAnsi (roughly Latin-1) encoding.
+  // "Smart" Unicode punctuation - curly quotes, em/en dashes, ellipsis - is
+  // exactly what a Word/Excel paste into the manual Note tends to carry, and
+  // falls outside that table. That corrupts autoTable's per-character width
+  // measurement once the line has to wrap, which is what produced the
+  // garbled, letter-spaced rendering ("N o t e : T R A N S F O R M E R...")
+  // instead of an overflow - confirmed live, it self-corrected again as soon
+  // as the text ran back into plain ASCII.
+  const sanitizeForPdf = (text: string) =>
+    text
+      .replace(/[‘’‚‛]/g, "'")
+      .replace(/[“”„‟]/g, '"')
+      .replace(/[–—]/g, "-")
+      .replace(/…/g, "...")
+      .replace(/[^\x00-\xFF]/g, "");
+
+  const downloadPDF = () => {
+    const doc = new jsPDF('landscape');
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    // Get Full Vendor Name
+    const firstItem = sortedData[0];
+    const fullVendorName = filterVendor && firstItem ? firstItem.vendor : "All Vendors";
+    const reportTitle = sanitizeForPdf(`${fullVendorName.toUpperCase()} - PURCHASE ORDER`);
+    const fileNameDate = new Date().toLocaleDateString('en-GB').replace(/\//g, '-');
+
+    // 1. Center Align Top Title & Generated Date (Prose remains centered)
+    doc.setFontSize(22);
+    doc.setFont("helvetica", "bold");
+    doc.text(reportTitle, pageWidth / 2, 20, { align: 'center' });
+
+    doc.setFontSize(12);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(100);
+    doc.text(`Generated on: ${new Date().toLocaleDateString('en-GB')}`, pageWidth / 2, 28, { align: 'center' });
+
+    // 2. Table Data
+    const tableColumn = ["Order ID", "Date", "Item Name", "Order Qty"];
+
+    const dataToExport = selectedIds.length > 0
+      ? sortedData.filter(item => selectedIds.includes(item._id))
+      : sortedData;
+
+    const tableRows = dataToExport.map(item => [
+      sanitizeForPdf(item.orderNumber || "N/A"),
+      new Date(item.orderedAt || item.createdAt).toLocaleDateString('en-GB'),
+      sanitizeForPdf(item.manualRemark ? `${item.itemName}\nNote: ${item.manualRemark}` : item.itemName),
+      sanitizeForPdf(`${item.orderQty} ${item.unit}`)
+    ]);
+
+    // 3. Render Table - All Left Aligned
+    autoTable(doc, {
+      head: [tableColumn],
+      body: tableRows,
+      startY: 35,
+      theme: 'grid',
+      headStyles: {
+        fillColor: [30, 41, 59],
+        fontSize: 11,
+        halign: 'left' // Change from 'center' to 'left' for Headers
+      },
+      styles: {
+        fontSize: 10,
+        cellPadding: 4,
+        halign: 'left', // Body data already left-aligned
+        overflow: 'linebreak' // wrap long text instead of spilling past the page edge
+      },
+      // Order ID/Date/Order Qty get fixed widths so Item Name (the one
+      // column that can carry a long manual Note) is forced to wrap within
+      // whatever's left, rather than autoTable sizing it to its longest
+      // unbroken content and running off the page - confirmed live: a long
+      // Note text was printing past the table border into the page margin.
+      columnStyles: {
+        0: { halign: 'left', cellWidth: 25 },
+        1: { halign: 'left', cellWidth: 28 },
+        2: { halign: 'left', cellWidth: 'auto' },
+        3: { halign: 'left', cellWidth: 28 }
+      },
+      // Item Name and its appended "Note: ..." line share one cell (see
+      // tableRows above), and autoTable only supports one textColor per
+      // cell - so the Note prints in the same dark color as the item name
+      // by default. This runs AFTER the default draw (which already
+      // painted everything dark), covers just the Note's line(s) in white,
+      // and redraws them in light green so only the note looks lighter.
+      // Baseline math mirrors jspdf-autotable's own autoTableText/getTextPos
+      // (default valign is 'top', not 'middle') - cell.contentHeight/lines
+      // overestimates line height because it includes cell padding, which
+      // is what threw the first attempt at this off (redrawn text landed
+      // below, not on top of, the original).
+      didDrawCell: (data) => {
+        if (data.section !== 'body' || data.column.index !== 2) return;
+        const item = dataToExport[data.row.index];
+        if (!item?.manualRemark) return;
+
+        const { cell, doc: pdfDoc } = data;
+        pdfDoc.setFont(cell.styles.font, cell.styles.fontStyle);
+        pdfDoc.setFontSize(cell.styles.fontSize);
+        const contentWidth = cell.width - cell.padding('left') - cell.padding('right');
+        const itemNameLines = pdfDoc.splitTextToSize(sanitizeForPdf(item.itemName), contentWidth);
+        const noteStartLine = itemNameLines.length;
+        const totalLines = cell.text.length;
+        if (noteStartLine >= totalLines) return;
+
+        const scaleFactor = pdfDoc.internal.scaleFactor;
+        const fontSize = pdfDoc.internal.getFontSize() / scaleFactor;
+        const lineHeightFactor = pdfDoc.getLineHeightFactor ? pdfDoc.getLineHeightFactor() : 1.15;
+        const lineHeight = fontSize * lineHeightFactor;
+        const firstLineBaselineY = cell.y + cell.padding('top') + fontSize * (2 - 1.15);
+
+        const noteLines = cell.text.slice(noteStartLine);
+        const noteBaselineY = firstLineBaselineY + noteStartLine * lineHeight;
+        const boxX = cell.x + cell.padding('left');
+        const boxY = noteBaselineY - fontSize * 0.85;
+        const boxHeight = noteLines.length * lineHeight + fontSize * 0.3;
+
+        pdfDoc.setFillColor(255, 255, 255);
+        pdfDoc.rect(boxX, boxY, contentWidth, boxHeight, 'F');
+        pdfDoc.setTextColor(76, 175, 80);
+        pdfDoc.text(noteLines, boxX, noteBaselineY);
+      }
+    });
+
+    const cleanFileName = fullVendorName.replace(/[<>:"/\\|?*]/g, '');
+    doc.save(`${cleanFileName}_${fileNameDate}.pdf`);
+  };
+
+  const handleSaveToStock = async () => {
+    if (!selectedRequest) return;
+    if (damageQty < 0) return alert("Damage quantity cannot be negative");
+
+    setIsSaving(true);
+
+    const session = localStorage.getItem("oms_user");
+    const userData = session ? JSON.parse(session) : null;
+    const Login_user = userData?.username || "Unknown User";
+    
+    try {
+      const res = await fetch("/api/received-purchase", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          originalOrderId: selectedRequest._id,
+          itemId: selectedRequest.itemId || null,
+          orderNumber: selectedRequest.orderNumber,
+          itemName: selectedRequest.itemName,
+          sku: selectedRequest.sku,
+          category: selectedRequest.category,
+          orderQty: selectedRequest.orderQty,
+          receivedQty: Number(receivedQty),
+          damageQty: Number(damageQty), // This triggers the Return logic in backend
+          unit: selectedRequest.unit,
+          vendor: selectedRequest.vendor,
+          rate: Number(editRate), // Using the updated rate
+          moveRemainingTo: moveRemainingTo,
+          userName: Login_user
+        }),
+      });
+
+      if (res.ok) {
+        alert("✅ Success: Stock updated and Damage recorded in Returns.");
+        setSelectedRequest(null);
+        setDamageQty(0);
+        onRefresh();
+      }
+    } catch (err) {
+      console.error(err);
+      alert("❌ Error processing receipt");
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+
+  const handleCancelClick = async (req: any) => {
+    if (!confirm(`Move ${req.itemName} back to Purchase Request?`)) return;
+
+    try {
+      const res = await fetch(`/api/purchase-requests/${req._id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "pending" }),
+      });
+
+      if (res.ok) {
+        alert("✅ Success: Moved back to Purchase Requests.");
+        onRefresh(); // This triggers fetchTabData() in your Page.tsx
+      } else {
+        const err = await res.json();
+        alert(`❌ Error: ${err.error}`);
+      }
+    } catch (err) {
+      alert("❌ Network error occurred.");
+    }
+  };
+
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* Filter Bar */}
+      <div className="bg-white p-6 rounded-3xl border border-slate-200 shadow-sm flex flex-wrap gap-4 items-end">
+        <div className="flex-1 min-w-[140px]">
+          <label className="text-[10px] font-black uppercase text-slate-400 mb-1.5 block">Date</label>
+          <input type="date" className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold" onChange={(e) => setFilterDate(e.target.value)} />
+        </div>
+        <div className="flex-2 min-w-[220px]">
+          <label className="text-[10px] font-black uppercase text-slate-400 mb-1.5 block">Search Item / SKU</label>
+          <input type="text" placeholder="Search..." className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold" onChange={(e) => setFilterItem(e.target.value)} />
+        </div>
+        <div className="flex-1 min-w-[180px]">
+          <label className="text-[10px] font-black uppercase text-slate-400 mb-1.5 block">Vendor</label>
+          <input type="text" placeholder="Vendor..." className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold" onChange={(e) => setFilterVendor(e.target.value)} />
+        </div>
+        <button
+          onClick={downloadPDF}
+          disabled={filteredData.length === 0}
+          className="bg-blue-600 text-white px-6 py-3 rounded-xl text-[10px] font-black uppercase flex items-center gap-2 hover:bg-blue-700 disabled:bg-slate-300 transition-all"
+        >
+          <FiDownload size={16} />
+          {selectedIds.length > 0 ? `Export Selected (${selectedIds.length})` : "Export PDF"}
+        </button>
+      </div>
+
+      {/* Table */}
+      <div className="bg-white rounded-3xl border border-slate-200 shadow-2xl overflow-hidden">
+        <div className="overflow-x-auto no-scrollbar">
+          <table className="w-full text-left border-collapse">
+            <thead className="bg-slate-50/80 border-b border-slate-100">
+              <tr>
+                <th className="py-3 px-4 w-10">
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 rounded accent-blue-600 cursor-pointer"
+                    checked={selectedIds.length === filteredData.length && filteredData.length > 0}
+                    onChange={toggleSelectAll}
+                  />
+                </th>
+                <th
+                  onClick={() => requestSort("orderNumber")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Order ID {renderSortIcon("orderNumber")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("date")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Date {renderSortIcon("date")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("itemName")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Item Details {renderSortIcon("itemName")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("category")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Category {renderSortIcon("category")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("prQty")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 text-center cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center justify-center gap-1">PR Qty {renderSortIcon("prQty")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("orderQty")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 text-center cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center justify-center gap-1">Order Qty {renderSortIcon("orderQty")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("rate")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Rate {renderSortIcon("rate")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("vendor")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Vendor {renderSortIcon("vendor")}</div>
+                </th>
+                <th
+                  onClick={() => requestSort("remark")}
+                  className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 cursor-pointer select-none hover:bg-slate-100 transition-colors"
+                >
+                  <div className="flex items-center gap-1">Remarks {renderSortIcon("remark")}</div>
+                </th>
+                <th className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 text-center">Note</th>
+                <th className="py-3 px-4 text-[10px] font-black uppercase text-slate-400 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {sortedData.map((req) => (
+                <tr key={req._id} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors">
+                  <td className="py-3 px-4">
+                    <input
+                      type="checkbox"
+                      className="w-4 h-4 rounded accent-blue-600 cursor-pointer"
+                      checked={selectedIds.includes(req._id)}
+                      onChange={() => toggleSelect(req._id)}
+                    />
+                  </td>
+                  <td className="py-3 px-4 font-black text-blue-600 text-xs">{req.orderNumber || "---"}</td>
+                  <td className="py-3 px-4 text-[11px] font-bold text-slate-500">
+                    {new Date(req.orderedAt || req.createdAt).toLocaleDateString('en-GB')}
+                  </td>
+                  <td className="py-3 px-4">
+                    <div className="flex flex-col">
+                      <span className="text-[9px] font-bold text-blue-500 mb-1">{req.sku || "N/A"}</span>
+                      <span className="font-black text-slate-800 text-xs uppercase">{req.itemName}</span>
+                    </div>
+                  </td>
+                  <td className="py-3 px-4 text-[10px] font-bold text-slate-500 uppercase">{req.category || "General"}</td>
+                  <td className="py-3 px-4 text-center text-xs font-bold text-slate-500">{req.prQty}</td>
+                  <td className="py-3 px-4 text-center font-black text-slate-800 text-xs">{req.orderQty}</td>
+                  <td className="py-3 px-4 font-bold text-blue-600 text-xs">₹{req.rate}</td>
+                  <td className="py-3 px-4 relative">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-black text-slate-600 uppercase">{req.vendor}</span>
+                      <button
+                        type="button"
+                        onClick={() => (editVendorId === req._id ? setEditVendorId(null) : openVendorEdit(req))}
+                        title="Vendor change karo"
+                        className="p-1 rounded-md text-slate-300 hover:text-blue-600 hover:bg-blue-50 transition-all"
+                      >
+                        <FiEdit3 size={12} />
+                      </button>
+                    </div>
+
+                    {editVendorId === req._id && (
+                      <div
+                        ref={vendorPopoverRef}
+                        className="absolute z-20 left-4 mt-2 w-60 bg-white border border-slate-200 rounded-xl shadow-2xl p-3 text-left"
+                      >
+                        <p className="text-[9px] font-black text-slate-400 uppercase mb-1.5">Change Vendor</p>
+                        <input
+                          type="text"
+                          list={`order-vendor-options-${req._id}`}
+                          value={vendorDraft}
+                          onChange={(e) => setVendorDraft(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && saveVendor(req)}
+                          autoFocus
+                          placeholder="Search vendor..."
+                          className="w-full p-2 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 uppercase font-bold"
+                        />
+                        <datalist id={`order-vendor-options-${req._id}`}>
+                          {vendors.map((v: any) => (
+                            <option key={v._id} value={v.name} />
+                          ))}
+                        </datalist>
+                        <div className="flex items-center justify-end gap-2 mt-2">
+                          <button
+                            type="button"
+                            onClick={() => setEditVendorId(null)}
+                            className="text-[10px] font-bold text-slate-400 hover:text-slate-600"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => saveVendor(req)}
+                            disabled={savingVendorId === req._id}
+                            className="text-[10px] font-black text-white bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded-lg disabled:bg-slate-300"
+                          >
+                            {savingVendorId === req._id ? "Saving..." : "Save"}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </td>
+                  <td className="py-3 px-4 text-[10px] text-slate-600">{req.remark}</td>
+                  <td className="py-3 px-4 text-center relative">
+                    <button
+                      type="button"
+                      onClick={() => (openNoteId === req._id ? setOpenNoteId(null) : openNote(req))}
+                      title={req.manualRemark ? "Note edit karo" : "Note add karo"}
+                      className={`p-2 rounded-lg transition-all ${
+                        req.manualRemark
+                          ? "bg-amber-100 text-amber-700 hover:bg-amber-200"
+                          : "bg-slate-50 text-slate-400 hover:bg-slate-100"
+                      }`}
+                    >
+                      <FiEdit3 size={14} />
+                    </button>
+
+                    {openNoteId === req._id && (
+                      <div
+                        ref={notePopoverRef}
+                        className="absolute z-20 right-4 mt-2 w-64 bg-white border border-slate-200 rounded-xl shadow-2xl p-3 text-left"
+                      >
+                        <p className="text-[9px] font-black text-slate-400 uppercase mb-1.5">Manual Note</p>
+                        <textarea
+                          value={noteDraft}
+                          onChange={(e) => setNoteDraft(e.target.value)}
+                          rows={3}
+                          autoFocus
+                          placeholder="Yaha manual note likho..."
+                          className="w-full p-2 text-xs border border-slate-200 rounded-lg focus:outline-none focus:border-blue-500 resize-none"
+                        />
+                        <div className="flex items-center justify-between mt-2">
+                          <button
+                            type="button"
+                            onClick={() => copyNote(noteDraft, req._id)}
+                            disabled={!noteDraft}
+                            className="text-[10px] font-bold text-slate-500 hover:text-slate-800 disabled:opacity-40 flex items-center gap-1"
+                          >
+                            <FiCopy size={12} /> {copiedNoteId === req._id ? "Copied!" : "Copy"}
+                          </button>
+                          <div className="flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => setOpenNoteId(null)}
+                              className="text-[10px] font-bold text-slate-400 hover:text-slate-600"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => saveNote(req)}
+                              disabled={savingNoteId === req._id}
+                              className="text-[10px] font-black text-white bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded-lg disabled:bg-slate-300"
+                            >
+                              {savingNoteId === req._id ? "Saving..." : "Save"}
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </td>
+                  <td className="py-3 px-4">
+                    <div className="flex justify-end gap-2">
+                      <button
+                        onClick={() => {
+                          setSelectedRequest(req);
+                          setReceivedQty(req.orderQty);
+                          // This line ensures the rate shows up in the textbox immediately
+                          setEditRate(req.rate || 0);
+                        }}
+                        className="p-2 bg-green-50 text-green-600 rounded-lg hover:bg-green-600 hover:text-white transition-all"
+                      >
+                        <FiCheckCircle size={14} />
+                      </button>
+                      <button
+                        onClick={() => handleCancelClick(req)}
+                        disabled={isSaving}
+                        className="p-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-600 hover:text-white transition-all"
+                      >
+                        {isSaving ? "..." : <FiXCircle size={14} />}
+                        
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Received Modal */}
+      {selectedRequest && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden">
+            {/* Header */}
+            <div className="bg-slate-900 p-5 text-white flex justify-between items-center">
+              <h3 className="font-black uppercase text-[10px] tracking-widest">Receive Stock (Order: {selectedRequest.orderNumber})</h3>
+              <button onClick={() => setSelectedRequest(null)}><FiX size={18} /></button>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {/* Item Info & Edit Rate */}
+              <div className="flex justify-between items-start bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <div>
+                  <span className="text-[10px] font-black text-slate-400 uppercase tracking-tighter">Item: {selectedRequest.sku}</span>
+                  <h4 className="font-black text-slate-800 uppercase text-sm">{selectedRequest.itemName}</h4>
+                  <p className="text-[10px] text-blue-600 font-bold">Ordered Qty: {selectedRequest.orderQty}</p>
+                </div>
+
+                <div className="text-right">
+                  <label className="text-[9px] font-black text-blue-500 uppercase block mb-1">Edit Rate (₹)</label>
+                  <input
+                    type="number"
+                    // This will now show the rate you set in the onClick above
+                    value={editRate}
+                    onChange={(e) => setEditRate(Number(e.target.value))}
+                    className="w-24 p-2 bg-white border border-blue-200 rounded-lg font-black text-right text-blue-600 outline-none focus:ring-2 focus:ring-blue-400 transition-all"
+                    placeholder="0.00"
+                  />
+                </div>
+              </div>
+
+              {/* Quantities Grid */}
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <label className="text-[9px] font-black text-slate-400 uppercase">Rec. Qty</label>
+                  <input
+                    type="number"
+                    value={receivedQty}
+                    onChange={(e) => setReceivedQty(Number(e.target.value))}
+                    className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl font-black text-center focus:border-blue-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="text-[9px] font-black text-red-500 uppercase">Damage (Return)</label>
+                  <input
+                    type="number"
+                    value={damageQty}
+                    onChange={(e) => setDamageQty(Number(e.target.value))}
+                    className="w-full p-3 bg-red-50 border border-red-100 text-red-600 rounded-xl font-black text-center focus:border-red-500 outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="text-[9px] font-black text-slate-400 uppercase">Remaining</label>
+                  <div className="w-full p-3 bg-slate-100 border border-slate-200 rounded-xl font-black text-center text-slate-500">
+                    {Math.max(0, selectedRequest.orderQty - receivedQty - damageQty)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Remaining Management */}
+              <div className="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <p className="text-[9px] font-black text-slate-500 mb-2 uppercase">Where to move remaining Qty?</p>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" name="moveRemaining" value="Purchase Request" checked={moveRemainingTo === "Purchase Request"} onChange={(e) => setMoveRemainingTo(e.target.value)} className="w-4 h-4 accent-slate-900" />
+                    <span className="text-[10px] font-black uppercase">Purchase Req</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" name="moveRemaining" value="Order Place" checked={moveRemainingTo === "Order Place"} onChange={(e) => setMoveRemainingTo(e.target.value)} className="w-4 h-4 accent-slate-900" />
+                    <span className="text-[10px] font-black uppercase">Order Place</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Action Button */}
+              <button
+                onClick={handleSaveToStock}
+                disabled={isSaving}
+                className="w-full bg-blue-600 text-white font-black uppercase py-4 rounded-xl text-[10px] hover:bg-blue-700 transition-all shadow-lg shadow-blue-100 disabled:bg-slate-300"
+              >
+                {isSaving ? "Processing..." : "Confirm & Update Stock"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

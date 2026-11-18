@@ -1,0 +1,317 @@
+import { NextResponse } from "next/server";
+import clientPromise from "@/lib/mongodb";
+import SellerOrder from "@/models/SellerOrder";
+import mongoose from "mongoose";
+
+export async function PATCH(req: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    const client = await clientPromise;
+    const db = client.db("dev_oms_db");
+
+    if (mongoose.connection.readyState !== 1) {
+      await mongoose.connect(process.env.MONGODB_URI as string);
+    }
+
+    const updateData = await req.json();
+
+    // 1. Find Original Order
+    const originalOrder = await SellerOrder.findById(id);
+    if (!originalOrder) return NextResponse.json({ error: "Order not found" }, { status: 404 });
+
+    // ================================================================
+    // LOGIC A: RETURN ORDER (WITH MOVE TO TO-CHECK FEATURE)
+    // ================================================================
+    if (updateData.status === "RETURN ORDER") {
+      const returnQty = Number(updateData.reQty);
+      const itemName = originalOrder.itemName?.trim();
+      const stockFilter = itemName ? { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } } : null;
+
+      // Get the base order number (removes any existing -1, -2, etc.)
+      const baseOrderNo = originalOrder.orderNo.split('-')[0];
+      const returnRecordCount = await SellerOrder.countDocuments({
+        orderNo: { $regex: new RegExp(`^${baseOrderNo}-Re`) }
+      });
+      const nextReNumber = returnRecordCount + 1;
+      const returnOrderNo = `${baseOrderNo}-Re${nextReNumber}`;
+
+      // 1. Create the Return Record Order
+      const returnOrderObj = originalOrder.toObject();
+      delete returnOrderObj._id;
+      if (returnOrderObj.createdAt) delete returnOrderObj.createdAt;
+      if (returnOrderObj.updatedAt) delete returnOrderObj.updatedAt;
+
+      const returnOrderData = {
+        ...returnOrderObj,
+        reQty: returnQty,
+        totalAmount: returnQty * (originalOrder.rate || 0),
+        status: "RETURN ORDER",
+        orderNo: returnOrderNo,
+        isPaid: false
+      };
+      await SellerOrder.create(returnOrderData);
+
+      // 2. NEW: Create a duplicate "TO CHECK" order if requested
+      if (updateData.moveToCheck) {
+        const resubOrderNo = `${baseOrderNo}-RE-N${nextReNumber}`;
+        const toCheckOrderData = {
+          ...returnOrderObj,
+          reQty: returnQty,
+          totalAmount: returnQty * (originalOrder.rate || 0),
+          status: "TO CHECK",
+          orderNo: resubOrderNo,
+          isPaid: false
+        };
+        await SellerOrder.create(toCheckOrderData);
+
+        // Increase reQty (Pending Stock) for the new TO CHECK order
+        if (stockFilter) {
+          await db.collection("stock").updateOne(stockFilter, { $inc: { reQty: returnQty } });
+        }
+      }
+
+      // 3. Update or Delete the Original Order
+      let updatedOriginal = null;
+      if (updateData.isPartial) {
+        const remainingQty = originalOrder.reQty - returnQty;
+        updatedOriginal = await SellerOrder.findByIdAndUpdate(
+          id,
+          {
+            reQty: remainingQty,
+            totalAmount: remainingQty * (originalOrder.rate || 0),
+          },
+          { new: true }
+        );
+      } else {
+        // If full return, delete or move original out of Delivery
+        updatedOriginal = await SellerOrder.findByIdAndDelete(id);
+      }
+
+      return NextResponse.json(updatedOriginal || { success: true }, { status: 200 });
+    }
+
+    // ================================================================
+    // LOGIC C: PARTIAL READY TO SHIP (SPLIT ORDER)
+    // ================================================================
+    const shipQty = Number(updateData.shipQty);
+
+    // Only enter this block if shipQty is LESS than total order qty
+    if (
+      updateData.status === "READY TO SHIP" &&
+      updateData.isPartialFulfillment &&
+      shipQty < originalOrder.reQty
+    ) {
+      const remainingQty = originalOrder.reQty - shipQty;
+
+      // 1. GENERATE SEQUENTIAL ORDER NUMBER (P1, P2, etc.)
+      const baseOrderNo = originalOrder.orderNo.split('-P')[0];
+      const partialCount = await SellerOrder.countDocuments({
+        orderNo: { $regex: new RegExp(`^${baseOrderNo}-P`) }
+      });
+
+      const nextPNumber = partialCount + 1;
+      const newOrderNo = `${baseOrderNo}-P${nextPNumber}`;
+
+      // 2. Create the Shipped Child Order
+      const shippedOrderObj = originalOrder.toObject();
+      delete shippedOrderObj._id;
+
+      if (shippedOrderObj.createdAt) delete shippedOrderObj.createdAt;
+      if (shippedOrderObj.updatedAt) delete shippedOrderObj.updatedAt;
+
+      const shippedOrderData = {
+        ...shippedOrderObj,
+        reQty: shipQty,
+        totalAmount: shipQty * (originalOrder.rate || 0),
+        status: "READY TO SHIP",
+        orderNo: newOrderNo,
+      };
+      await SellerOrder.create(shippedOrderData);
+
+      // 2. Update Original Order (Keep in TO CHECK with leftover qty)
+      const updatedOriginal = await SellerOrder.findByIdAndUpdate(
+        id,
+        {
+          reQty: remainingQty,
+          totalAmount: remainingQty * (originalOrder.rate || 0),
+        },
+        { new: true }
+      );
+
+      // 3. Deduct ONLY the shipped amount from stock
+      const itemName = originalOrder.itemName?.trim();
+      if (itemName) {
+        const stockFilter = { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } };
+        
+        await db.collection("stock").updateOne(stockFilter, {
+          $inc: { quantity: -shipQty, reQty: -shipQty }
+        });
+
+        await db.collection("items").updateOne(
+          { sku: originalOrder.sku },
+          {
+            $inc: { currentStock: -shipQty },
+            $push: {
+              history: {
+                type: `PARTIAL SHIP by ${updateData.userName || "Admin"}`,
+                qty: -shipQty,
+                date: new Date(),
+                orderNo: newOrderNo,
+                sellerName: originalOrder.sellerName || originalOrder.instituteName || "N/A",
+                otherDetails: `Split Order from To check to Ready to Ship. Order No: ${newOrderNo}`
+              }
+            } as any
+          }
+        );
+      }
+
+      return NextResponse.json(updatedOriginal, { status: 200 });
+    }
+
+    // ================================================================
+    // LOGIC B: STANDARD UPDATE (FULL STATUS CHANGE)
+    // ================================================================
+
+    // 1. STOCK CHECK: Only for full transitions to Ready to Ship
+    if (updateData.activeTab === "TO CHECK" && updateData.status === "READY TO SHIP") {
+      const itemName = originalOrder.itemName?.trim();
+      const orderQty = Number(updateData.shipQty || updateData.reQty || originalOrder.reQty || 0);
+
+      if (itemName) {
+        const stockFilter = { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } };
+        const stockItem = await db.collection("stock").findOne(stockFilter);
+        const available = stockItem?.quantity || 0;
+
+        if (available < orderQty) {
+          if (!updateData.shipQty) {
+            return NextResponse.json(
+              { error: `Insufficient Stock! Available: ${available}, Required: ${orderQty}.` },
+              { status: 400 }
+            );
+          }
+        }
+      }
+    }
+
+    if (updateData.status === "RETURN RECEIVED" && updateData.activeTab === "RETURN ORDER") {
+      const itemName = updateData.itemName?.trim();
+      const returnQty = Number(updateData.reQty || originalOrder.reQty || 0);
+
+      if (itemName) {
+        const stockFilter = { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } };
+
+        await db.collection("stock").updateOne(stockFilter, {
+          $inc: { quantity: returnQty }
+        });
+
+        const historyFilter = {
+          $or: [
+            { sku: originalOrder.sku },
+            { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } }
+          ]
+        };
+
+        await db.collection("items").updateOne(
+          historyFilter,
+          {
+            $inc: { currentStock: returnQty },
+            $push: {
+              history: {
+                type: `RETURN RECEIVED by ${updateData.userName || "Admin"}`,
+                qty: returnQty,
+                date: new Date(),
+                orderNo: originalOrder.orderNo,
+                sellerName: updateData.sellerName || originalOrder.instituteName || "N/A",
+                otherDetails: `Item returned from ${originalOrder.orderNo}. Stock restored.`
+              }
+            } as any
+          }
+        );
+      }
+    }
+
+    // Perform the update once safely
+    const updated = await SellerOrder.findByIdAndUpdate(id, { ...updateData }, { new: true });
+
+    // Correctly reference original quantity configuration so full orders are calculated safely
+    const adjustQty = Number(originalOrder.reQty || updated.reQty || 0);
+    const itemName = updated.itemName?.trim();
+
+    if (itemName && adjustQty > 0) {
+      const stockFilter = { itemName: { $regex: new RegExp(`^${itemName}$`, "i") } };
+
+      if (updateData.activeTab === "TO CHECK") {
+        if (updateData.status === "READY TO SHIP") {
+          await db.collection("stock").updateOne(stockFilter, {
+            $inc: { reQty: -adjustQty, quantity: -adjustQty }
+          });
+
+          await db.collection("items").updateOne(
+            { sku: updated.sku || originalOrder.sku },
+            {
+              $inc: { currentStock: -adjustQty },
+              $push: {
+                history: {
+                  type: `${updateData.status} by ${updateData.userName || "Admin"}`,
+                  qty: -adjustQty,
+                  date: new Date(),
+                  orderNo: updated.orderNo,
+                  sellerName: originalOrder.sellerName || originalOrder.instituteName || "N/A",
+                  otherDetails: `Order confirmed so Stock deducted. It's from To Check to ${updateData.status}. `
+                }
+              } as any
+            }
+          );
+        } else if (updateData.status === "HISAB" || updateData.status === "CANCELL ORDER" || updateData.status === "FULFILLED") {
+          await db.collection("stock").updateOne(stockFilter, {
+            $inc: { reQty: -adjustQty }
+          });
+        }
+      }
+      else if (updateData.activeTab === "READY TO SHIP") {
+        if (["HISAB", "CANCELL ORDER", "RETURN ORDER", "FULFILLED"].includes(updateData.status)) {
+          await db.collection("stock").updateOne(stockFilter, {
+            $inc: { quantity: adjustQty }
+          });
+
+          await db.collection("items").updateOne(
+            { sku: updated.sku || originalOrder.sku },
+            {
+              $inc: { currentStock: adjustQty },
+              $push: {
+                history: {
+                  type: `${updateData.status} by ${updateData.userName || "Admin"}`,
+                  qty: adjustQty,
+                  date: new Date(),
+                  orderNo: updated.orderNo,
+                  sellerName: updateData.sellerName || "N/A",
+                  otherDetails: `Order moved from Ready to Ship to ${updateData.status}. Stock restored.`
+                }
+              } as any
+            }
+          );
+        }
+      }
+      else if (updateData.activeTab === "CANCELL ORDER") {
+        if (updateData.status === "TO CHECK") {
+          await db.collection("stock").updateOne(stockFilter, {
+            $inc: { reQty: adjustQty }
+          });
+        }
+      }
+      else if (updateData.activeTab === "HISAB") {
+        if (updateData.status === "TO CHECK") {
+          await db.collection("stock").updateOne(stockFilter, {
+            $inc: { reQty: adjustQty }
+          });
+        }
+      }
+    }
+
+    return NextResponse.json(updated, { status: 200 });
+
+  } catch (error: any) {
+    console.error("PATCH Error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}

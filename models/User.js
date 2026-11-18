@@ -1,0 +1,38 @@
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true },
+    permissions: {
+        addSeller: { type: Boolean, default: false },
+        purchaseReq: { type: Boolean, default: false },
+        addOrder: { type: Boolean, default: false },
+        addTransporter: { type: Boolean, default: false },
+        addMyCompanies: { type: Boolean, default: false },
+        stock: { type: Boolean, default: false },
+        addNewItem: { type: Boolean, default: false },
+        addVendor: { type: Boolean, default: false },
+        purchase: { type: Boolean, default: false },
+        boss: { type: Boolean, default: false },
+        users: { type: Boolean, default: false },
+        backup: { type: Boolean, default: false },
+        manageStock: { type: Boolean, default: false },
+        receivePurchaseRate: { type: Boolean, default: false },
+        stockLastRate: { type: Boolean, default: false },
+        printLabels: { type: Boolean, default: false },
+        accountStatements: { type: Boolean, default: false },
+        bankReconciliation: { type: Boolean, default: false },
+        dashboardSummary: { type: Boolean, default: false },
+        gemBids: { type: Boolean, default: false },
+        advanceOrderTracker: { type: Boolean, default: false },
+        // Standalone Delivery Challan module (Orders hub) - separate from the
+        // order-derived challan download, which rides on order access.
+        deliveryChallan: { type: Boolean, default: false },
+        // Task module: manager role (admin is permissions.boss).
+        taskManager: { type: Boolean, default: false },
+        // Purchase > Pricelist module: view/tag, admin (upload, manual add, tag delete/merge), Received Purchase tab.
+        pricelist: { type: Boolean, default: false },
+        pricelistManage: { type: Boolean, default: false },
+        pricelistReceived: { type: Boolean, default: false },
+    },
+    // Task module: a manager's team = users whose managerUsername is theirs.
+    managerUsername: { type: String, default: null },
+});
