@@ -10,7 +10,7 @@
   // Kept in sync with background.js's DEFAULT_API_BASE - the deployed OMS,
   // not localhost, so a fresh install of this extension points at the real
   // server everyone actually uses without needing to know to change it.
-  const DEFAULT_OMS_URL = "https://dev-oms-blush.vercel.app";
+  const DEFAULT_OMS_URL = "https://dev-two-gilt.vercel.app";
   const STATE_KEY = "gemConsigneeState";
   // Item-keyword filters - applied to every row before it's saved anywhere
   // (manual scan, city batch, AND the automated Start-Sync flow triggered
@@ -123,7 +123,11 @@
       DATE_FROM_KEY,
       DATE_TO_KEY,
     ]);
-    omsUrlEl.value = data[OMS_URL_KEY] || DEFAULT_OMS_URL;
+    // A URL saved before the OMS moved deployments shows the new one instead
+    // (background.js's getApiBase migrates the stored value the same way).
+    const storedOmsUrl = (data[OMS_URL_KEY] || "").trim().replace(/\/+$/, "");
+    omsUrlEl.value =
+      !storedOmsUrl || storedOmsUrl === "https://dev-oms-blush.vercel.app" ? DEFAULT_OMS_URL : storedOmsUrl;
     omsUserNameEl.value = data[OMS_USER_KEY] || "";
     consigneeStateEl.value = data[STATE_KEY] || "Gujarat";
     includeKeywordsEl.value = data[INCLUDE_KEYWORDS_KEY] || "";

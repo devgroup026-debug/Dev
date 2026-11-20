@@ -5,7 +5,7 @@
 //
 // Change this if Dev OMS is deployed somewhere other than here (and add the
 // new URL to host_permissions in manifest.json too):
-const API_BASE = "https://dev-oms-blush.vercel.app";
+const API_BASE = "https://dev-two-gilt.vercel.app";
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;

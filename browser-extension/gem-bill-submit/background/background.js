@@ -65,7 +65,7 @@ const REDIRECT_URI = chrome.identity.getRedirectURL(); // extension khud generat
 //   gstSplit: "CGST_SGST" | "IGST" | "UNKNOWN", // Tax Invoice only - drives the Supply Type dropdown
 //   billId: "<mongo _id>",                // used to upload GeM's own e-signed invoice back to OMS
 //   billNo: "DEV048",
-//   billPdfUrl: "https://dev-oms-blush.vercel.app/api/bills/<id>/pdf",
+//   billPdfUrl: "https://dev-two-gilt.vercel.app/api/bills/<id>/pdf",
 //   firmName: "DEV ENTERPRISE",
 //   items: [{ qty, hsnSac, gstPercent }]  // one per Product Details row, same order as the contract
 // }

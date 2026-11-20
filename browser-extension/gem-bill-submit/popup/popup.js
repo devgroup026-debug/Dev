@@ -9,7 +9,7 @@
 //
 // Testing localhost pe kar rahe ho to neeche wali line "http://localhost:3000"
 // pe badal do.
-const OMS_ORIGIN = "https://dev-oms-blush.vercel.app";
+const OMS_ORIGIN = "https://dev-two-gilt.vercel.app";
 
 let credsCache = [];
 let firmNameByCode = {};

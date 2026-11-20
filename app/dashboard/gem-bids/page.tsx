@@ -47,11 +47,24 @@ export default function GemBidsPage() {
   const [bids, setBids] = useState<GemBid[]>([]);
   const [expiredBids, setExpiredBids] = useState<GemBid[]>([]);
   const [deletedBids, setDeletedBids] = useState<GemBid[]>([]);
-  // Everything, including Expired/Deleted - only fetched for the All Bids
-  // tab's own table content (see fetchAllIncludingHoldingAreas), so a bid
-  // sitting in either holding area can still be found there without
-  // counting toward the All Bids tab's own badge (that stays bids.length).
-  const [allIncludingHoldingAreas, setAllIncludingHoldingAreas] = useState<GemBid[]>([]);
+  // Everything, including Expired/Deleted - the All Bids tab's own table
+  // content, so a bid sitting in either holding area can still be found
+  // there without counting toward the All Bids tab's own badge (that stays
+  // bids.length). Built client-side from the three lists already loaded -
+  // it used to be a 4th full-collection fetch (?section=with_deleted_and_expired)
+  // that re-downloaded the exact same documents on every page load/refetch.
+  const allIncludingHoldingAreas = useMemo(() => {
+    const seen = new Set<string>();
+    const merged: GemBid[] = [];
+    for (const b of [...bids, ...expiredBids, ...deletedBids]) {
+      const id = String((b as any)._id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      merged.push(b);
+    }
+    const ts = (b: GemBid) => new Date((b as any).updatedAt || 0).getTime();
+    return merged.sort((a, b) => ts(b) - ts(a));
+  }, [bids, expiredBids, deletedBids]);
   const [loading, setLoading] = useState(true);
   // "all" is a combined search-everything view, not a real workflow stage a
   // bid can be *in* (see lib/gemBids/columns.ts's SECTIONS comment) - same
@@ -258,17 +271,6 @@ export default function GemBidsPage() {
       .catch((err) => console.error("Failed to load expired GeM bids", err));
   }, []);
 
-  // Only fetched/used for the All Bids tab's table content (see its badge
-  // count, which deliberately stays bids.length instead) - a bid sitting in
-  // Expired or Deleted still shows up here so "where is this bid right now"
-  // always has an answer from one tab.
-  const fetchAllIncludingHoldingAreas = useCallback(() => {
-    fetch("/api/gem-bids?section=with_deleted_and_expired")
-      .then((res) => res.json())
-      .then((data) => setAllIncludingHoldingAreas(Array.isArray(data) ? data : []))
-      .catch((err) => console.error("Failed to load all GeM bids", err));
-  }, []);
-
   const fetchLastRun = useCallback(() => {
     fetch("/api/gem-bids/last-run")
       .then((res) => res.json())
@@ -287,10 +289,9 @@ export default function GemBidsPage() {
     fetchBids();
     fetchDeletedBids();
     fetchExpiredBids();
-    fetchAllIncludingHoldingAreas();
     fetchLastRun();
     fetchSyncStatus();
-  }, [fetchBids, fetchDeletedBids, fetchExpiredBids, fetchAllIncludingHoldingAreas, fetchLastRun, fetchSyncStatus]);
+  }, [fetchBids, fetchDeletedBids, fetchExpiredBids, fetchLastRun, fetchSyncStatus]);
 
   useEffect(() => {
     refetchAll();
@@ -626,13 +627,13 @@ export default function GemBidsPage() {
             <DeletedBidsPanel
               bids={deletedBids}
               dateField="deletedAt"
-              onRestored={() => { fetchDeletedBids(); fetchBids(); fetchAllIncludingHoldingAreas(); }}
+              onRestored={() => { fetchDeletedBids(); fetchBids(); }}
             />
           ) : activeSection === "expired_bids" ? (
             <DeletedBidsPanel
               bids={expiredBids}
               dateField="expiredAt"
-              onRestored={() => { fetchExpiredBids(); fetchBids(); fetchAllIncludingHoldingAreas(); }}
+              onRestored={() => { fetchExpiredBids(); fetchBids(); }}
             />
           ) : (
             <GemBidTable

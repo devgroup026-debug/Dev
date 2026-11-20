@@ -17,11 +17,18 @@ const OMS_URL_KEY = "gemOmsUrl";
 // runtime permission prompt) means Start Sync works out of the box; a
 // local-dev OMS still works by typing http://localhost:3000 into the
 // popup's OMS Server URL field, which is stored and always takes priority.
-const DEFAULT_API_BASE = "https://dev-oms-blush.vercel.app";
+const DEFAULT_API_BASE = "https://dev-two-gilt.vercel.app";
+// The OMS moved off this deployment - a URL saved in the popup before the
+// move would otherwise keep winning over the new default forever.
+const OLD_API_BASES = ["https://dev-oms-blush.vercel.app"];
 
 async function getApiBase() {
   const data = await chrome.storage.local.get(OMS_URL_KEY);
   const stored = (data[OMS_URL_KEY] || "").trim().replace(/\/+$/, "");
+  if (OLD_API_BASES.includes(stored)) {
+    await chrome.storage.local.set({ [OMS_URL_KEY]: DEFAULT_API_BASE });
+    return DEFAULT_API_BASE;
+  }
   return stored || DEFAULT_API_BASE;
 }
 
@@ -212,16 +219,46 @@ chrome.runtime.onInstalled.addListener(ensurePollAlarm);
 chrome.runtime.onStartup.addListener(ensurePollAlarm);
 ensurePollAlarm();
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === POLL_ALARM_NAME) {
-    pollAndMaybeStartAutoSync();
-    pollAndMaybeFetchBidDocuments();
-    pollAndMaybeRefreshBidStatuses();
+// One cheap GET /api/gem-bids/extension-poll per tick decides which of the
+// three real pollers actually need to hit the OMS. Calling all three every
+// minute regardless (3 Vercel function invocations/min, 24x7, per installed
+// browser) was a big share of the OMS's serverless CPU usage. If that
+// endpoint can't be reached (older OMS deploy, network error) this falls
+// back to the old call-everything behaviour so nothing silently stops.
+async function pollAll() {
+  let hint = null;
+  try {
+    const apiBase = await getApiBase();
+    const res = await fetch(`${apiBase}/api/gem-bids/extension-poll`);
+    if (res.ok) hint = await res.json();
+  } catch (e) {
+    /* fall back below */
   }
+
+  if (!hint || hint.syncScraping) {
+    pollAndMaybeStartAutoSync();
+  } else {
+    // Purely local housekeeping that pollAndMaybeStartAutoSync normally does
+    // first - keep it running even when there's no OMS run to look at.
+    clearOrphanedClaimIfAny().catch((e) => console.error("[GeM Bid Exporter] orphan check failed:", e));
+  }
+
+  if (!hint || hint.docFetchPending) pollAndMaybeFetchBidDocuments();
+
+  if (!hint || hint.statusRefreshPending) {
+    pollAndMaybeRefreshBidStatuses();
+  } else {
+    // A refresh round that just drained still needs one more pass so
+    // pollAndMaybeRefreshBidStatuses can fire its "complete" notification.
+    const activeData = await chrome.storage.local.get(STATUS_REFRESH_ACTIVE_KEY);
+    if (activeData[STATUS_REFRESH_ACTIVE_KEY]) pollAndMaybeRefreshBidStatuses();
+  }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === POLL_ALARM_NAME) pollAll();
 });
-pollAndMaybeStartAutoSync();
-pollAndMaybeFetchBidDocuments();
-pollAndMaybeRefreshBidStatuses();
+pollAll();
 
 // Clearing the claim is content.js's job (finishOmsBatch, or the error/
 // cancel paths in runBatchStepIfActive) - all of which run *inside* the GeM

@@ -9,7 +9,7 @@
 // (localhost:3000/dashboard/orders/fetch-gem-orders - Intake tab is where a
 // human picks the real orders and transfers them into the Fetched Orders
 // tab on that same page):
-const API_BASE = "https://dev-oms-blush.vercel.app";
+const API_BASE = "https://dev-two-gilt.vercel.app";
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;

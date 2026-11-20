@@ -3,9 +3,12 @@ import { extractOrderItemLinks } from "@/lib/documentMaker/linkExtractEngine";
 
 const SETTINGS_COLLECTION = "gem_bid_settings";
 const LAST_RUN_KEY = "lastAutoDocLinksJobDate";
-const MIN_INTERVAL_MS = 2 * 60 * 1000;
+// Was 2 minutes with 5 bids per run - the PDF parse below (pdfjs-dist +
+// @napi-rs/canvas) is the single most CPU-expensive thing this app does,
+// and that combination regularly blew Vercel's Fluid Active CPU quota.
+const MIN_INTERVAL_MS = 5 * 60 * 1000;
 const ENQUEUE_BATCH_SIZE = 10;
-const EXTRACT_BATCH_SIZE = 5;
+const EXTRACT_BATCH_SIZE = 2;
 // A genuine per-bid failure (R2 hiccup, a transient fetch error reaching
 // mkp.gem.gov.in, etc.) gets a few more tries on later runs before this
 // gives up and treats it the same as "no such table in this bid" - rather
@@ -66,8 +69,26 @@ async function fetchPublicDoc(url: string): Promise<{ buffer: Buffer; contentTyp
 export async function runAutoDocLinksJobIfDue(db: any): Promise<AutoDocLinksJobResult> {
   const now = new Date();
   const settingsCollection = db.collection(SETTINGS_COLLECTION);
-  const settingsDoc = await settingsCollection.findOne({ key: LAST_RUN_KEY });
-  if (settingsDoc?.ranAt && now.getTime() - new Date(settingsDoc.ranAt).getTime() < MIN_INTERVAL_MS) {
+
+  // Claim this run atomically BEFORE doing any work. ranAt used to be
+  // written only at the very end - so a run killed by maxDuration never
+  // recorded it, and every following page load (every user, every tab)
+  // started yet another 60s PDF-parsing run, several in parallel, on the
+  // same bids. The conditional updateOne below only matches (modifiedCount
+  // 1) for exactly one caller once the interval has passed.
+  await settingsCollection.updateOne(
+    { key: LAST_RUN_KEY },
+    { $setOnInsert: { key: LAST_RUN_KEY, ranAt: new Date(0) } },
+    { upsert: true }
+  );
+  const claim = await settingsCollection.updateOne(
+    {
+      key: LAST_RUN_KEY,
+      $or: [{ ranAt: { $exists: false } }, { ranAt: { $lt: new Date(now.getTime() - MIN_INTERVAL_MS) } }],
+    },
+    { $set: { ranAt: now } }
+  );
+  if (claim.modifiedCount === 0) {
     return { ran: false, reason: "checked recently" };
   }
 
@@ -108,6 +129,20 @@ export async function runAutoDocLinksJobIfDue(db: any): Promise<AutoDocLinksJobR
 
   let extracted = 0;
   for (const bid of toExtract) {
+    // Counted as an attempt BEFORE the work, not in the catch below - a
+    // run killed by the platform timeout never reaches any catch, so
+    // counting there meant a bid that always times out was retried
+    // forever and MAX_RETRIES never kicked in.
+    const attempts = (bid.autoDocLinksRetryCount || 0) + 1;
+    if (attempts > MAX_RETRIES) {
+      await bidsCollection.updateOne(
+        { _id: bid._id },
+        { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false } }
+      );
+      continue;
+    }
+    await bidsCollection.updateOne({ _id: bid._id }, { $set: { autoDocLinksRetryCount: attempts } });
+
     try {
       const bidDocBytes = await getFileFromR2(bid.bidLinkDoc.fileKey);
       const links = await extractOrderItemLinks(bidDocBytes);
@@ -132,30 +167,22 @@ export async function runAutoDocLinksJobIfDue(db: any): Promise<AutoDocLinksJobR
       extracted++;
     } catch (err) {
       console.error("autoDocLinksJob: failed for bid", bid._id.toString(), err);
-      const retryCount = (bid.autoDocLinksRetryCount || 0) + 1;
-      if (retryCount >= MAX_RETRIES) {
+      if (attempts >= MAX_RETRIES) {
         // Given up - after this many genuine failures, treat it the same
         // as "checked, nothing found" so it stops being retried forever.
         // A fresh "Fetch Documents" re-run (which clears bidLinkDoc) is
         // still what un-sticks a bid that's actually fixable.
         await bidsCollection.updateOne(
           { _id: bid._id },
-          { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false, autoDocLinksRetryCount: retryCount } }
+          { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false } }
         );
-      } else {
-        // Deliberately NOT setting autoDocLinksCheckedAt - this is what
-        // used to be the bug: a single failure (most commonly the
-        // function simply running out of time, see the route's own
-        // maxDuration comment) got recorded as "confirmed, no links in
-        // this bid" forever, indistinguishable from a bid that genuinely
-        // has no such table. Leaving it unset means the query above picks
-        // this bid up again on a later run instead.
-        await bidsCollection.updateOne({ _id: bid._id }, { $set: { autoDocLinksRetryCount: retryCount } });
       }
+      // Otherwise deliberately NOT setting autoDocLinksCheckedAt - a single
+      // failure must not be recorded as "confirmed, no links in this bid"
+      // forever; the attempt was already counted above, so a later run
+      // retries it until MAX_RETRIES.
     }
   }
-
-  await settingsCollection.updateOne({ key: LAST_RUN_KEY }, { $set: { key: LAST_RUN_KEY, ranAt: now } }, { upsert: true });
 
   return { ran: true, queuedForFetch, extracted };
 }

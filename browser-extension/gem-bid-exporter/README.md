@@ -130,7 +130,7 @@ not the actual deployed OMS. If nobody ever opened the popup to type in the
 real URL, every poll silently went to localhost while the run sat in the
 deployed OMS's database, never picked up — Start Sync looked like it did
 nothing. The fallback now defaults to the deployed OMS
-(`https://dev-oms-blush.vercel.app`, already a static `host_permission` so no
+(`https://dev-two-gilt.vercel.app`, already a static `host_permission` so no
 extra prompt is needed) — a local-dev OMS still works by typing
 `http://localhost:3000` into that same field, which always takes priority
 over the fallback. Also remember: the automated Start-Sync flow scrapes

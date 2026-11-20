@@ -29,7 +29,7 @@
     "https://sso.gem.gov.in/*",
     "https://admin-mkp.gem.gov.in/*",
     "https://www.googleapis.com/*",
-    "https://dev-oms-blush.vercel.app/*",
+    "https://dev-two-gilt.vercel.app/*",
     "http://localhost:3000/*"
   ],
 
@@ -63,6 +63,6 @@
   },
 
   "externally_connectable": {
-    "matches": ["https://dev-oms-blush.vercel.app/*", "http://localhost:3000/*"]
+    "matches": ["https://dev-two-gilt.vercel.app/*", "http://localhost:3000/*"]
   }
 }

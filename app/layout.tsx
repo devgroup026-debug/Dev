@@ -40,31 +40,36 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       router.push("/login");
     } else {
       setIsLoading(false);
-      // Trigger background daily backup on initial site access
-      fetch("/api/backup/auto", { method: "POST" }).catch((err) =>
-        console.error("Auto backup check failed silently:", err)
-      );
-      // Trigger yesterday's courier-tracking run on initial site access
-      fetch("/api/courier/auto", { method: "POST" }).catch((err) =>
-        console.error("Courier auto-run check failed silently:", err)
-      );
+      // Site-visit-triggered background jobs. Each one is also throttled
+      // server-side, but this used to fire all five on EVERY full page load
+      // in every tab - each one a Vercel function invocation (cold start +
+      // Mongo connect) even when the server just answered "not due yet".
+      // A per-browser timestamp (localStorage, so shared across tabs) skips
+      // the call entirely until the job could actually be due again.
+      const runIfDue = (url: string, minIntervalMs: number, label: string) => {
+        const key = `oms_bgjob_last:${url}`;
+        try {
+          const last = Number(localStorage.getItem(key) || 0);
+          if (Date.now() - last < minIntervalMs) return;
+          localStorage.setItem(key, String(Date.now()));
+        } catch {
+          /* storage unavailable - fall through and just call it */
+        }
+        fetch(url, { method: "POST" }).catch((err) => console.error(`${label} check failed silently:`, err));
+      };
+      const MIN = 60 * 1000;
+      // Daily backup / yesterday's courier-tracking run (both once-a-day server-side)
+      runIfDue("/api/backup/auto", 60 * MIN, "Auto backup");
+      runIfDue("/api/courier/auto", 60 * MIN, "Courier auto-run");
       // Permanently remove any GeM bid past its 7-day Deleted Bids window
-      fetch("/api/gem-bids/purge-deleted", { method: "POST" }).catch((err) =>
-        console.error("GeM bid purge check failed silently:", err)
-      );
-      // Self-throttled to roughly every 15 minutes (see expireBidsJob.ts) -
-      // moves any GeM bid past its own end date into Expired Bids, and
-      // purges any already past its 7-day window there
-      fetch("/api/gem-bids/expire-and-purge", { method: "POST" }).catch((err) =>
-        console.error("GeM bid expire-and-purge check failed silently:", err)
-      );
-      // Self-throttled to roughly every 2 minutes (see autoDocLinksJob.ts) -
-      // queues a Bid Document fetch for any Bids to Fill/Submitted Bids bid
-      // that doesn't have one, then auto-fetches that bid's own embedded
-      // Specification/BOQ Detail Document links once it does.
-      fetch("/api/gem-bids/auto-doc-links", { method: "POST" }).catch((err) =>
-        console.error("GeM bid auto-doc-links check failed silently:", err)
-      );
+      runIfDue("/api/gem-bids/purge-deleted", 6 * 60 * MIN, "GeM bid purge");
+      // Moves any GeM bid past its own end date into Expired Bids, and
+      // purges any already past its 7-day window there (server: every 15 min)
+      runIfDue("/api/gem-bids/expire-and-purge", 15 * MIN, "GeM bid expire-and-purge");
+      // Queues a Bid Document fetch for any Bids to Fill/Submitted Bids bid
+      // that doesn't have one, then auto-fetches its embedded Specification
+      // link (server: every 5 min, see autoDocLinksJob.ts)
+      runIfDue("/api/gem-bids/auto-doc-links", 5 * MIN, "GeM bid auto-doc-links");
     }
   }, [isLoginPage, router]);
 

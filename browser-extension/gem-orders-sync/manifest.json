@@ -6,7 +6,7 @@
   "permissions": ["storage"],
   "host_permissions": [
     "http://localhost:3000/*",
-    "https://dev-oms-blush.vercel.app/*"
+    "https://dev-two-gilt.vercel.app/*"
   ],
   "background": {
     "service_worker": "background.js"
