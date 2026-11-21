@@ -26,7 +26,7 @@
 - WhatsApp apna design badle aur kuch kaam karna band ho jaye, to `content.js` ke selectors update karne padenge.
 
 ## DEV OMS se bhejna (v2.1)
-- Extension DEV OMS (localhost:3000 aur dev-oms-blush.vercel.app) se jud jata hai, alag se kuch set nahi karna.
+- Extension DEV OMS (localhost:3000 aur dev-two-gilt.vercel.app) se jud jata hai, alag se kuch set nahi karna.
 - **Courier Tracking:** Run Now → parcels select karo → **Send WhatsApp**. Messages is extension ki queue me jaate hai.
 - **Orders → Send DC WhatsApp:** har institute ki Delivery Challan PDF document ke roop me jaati hai.
 - Ek tab me web.whatsapp.com login rakho. Sent/Failed status OMS me apne aap update hota hai, jab koi bhi OMS page khula ho.

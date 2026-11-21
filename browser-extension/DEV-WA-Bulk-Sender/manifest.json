@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DEV WA Bulk Sender",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "WhatsApp Web se personalised message + images/PDF bhejne ke liye (DEV GROUP). DEV OMS se bhi seedha queue hota hai.",
   "permissions": [
     "storage",
@@ -54,7 +54,7 @@
       "matches": [
         "http://localhost:3000/*",
         "http://127.0.0.1:3000/*",
-        "https://dev-oms-blush.vercel.app/*"
+        "https://dev-two-gilt.vercel.app/*"
       ],
       "js": [
         "oms-connector.js"
