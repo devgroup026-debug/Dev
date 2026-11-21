@@ -734,7 +734,7 @@ async function pollAndMaybeRefreshBidStatuses() {
       let result = await sendTabMessageWithRetry(tabId, { action: "RUN_BID_STATUS_SEARCH", bidNo: bid.bidNo }, 10, 800);
       const body =
         result && result.ok
-          ? { bidId: bid._id, status: result.status }
+          ? { bidId: bid._id, status: result.status, endDate: result.endDate || "" }
           : { bidId: bid._id, error: (result && result.error) || "no response from tab" };
       await fetch(`${apiBase}/api/gem-bids/refresh-status/complete`, {
         method: "POST",

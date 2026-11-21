@@ -18,6 +18,7 @@ import {
   FiCopy,
   FiCheck,
   FiTag,
+  FiSearch,
 } from "react-icons/fi";
 import BlockGuard from "@/components/BlockGuard";
 import { guessInstituteForAddress, SellerLite } from "@/lib/gemBids/instituteMatch";
@@ -305,11 +306,17 @@ function DocumentMakerPageInner() {
   // Same call also returns what we actually paid (Received Purchase items tagged with this bid item name) - shown green.
   const [receivedRates, setReceivedRates] = useState<Record<string, ReceivedRate[]>>({});
   // Near-miss tag names (similarity hints, never auto-linked) for items without an exact tag match.
+  // Only filled by the "Find Pricelist Match" button - never automatically (see findPricelistMatches).
   const [rateSuggestions, setRateSuggestions] = useState<Record<string, RateSuggestion[]>>({});
+  // Best fuzzy Received Purchase match per item title (normalizeName(itemTitle)) - also button-only.
+  const [purchaseMatches, setPurchaseMatches] = useState<
+    Record<string, { rate: number; vendor: string; itemName: string; receivedAt: string | null; score: number }>
+  >({});
+  const [matching, setMatching] = useState(false);
+  const [matchSummary, setMatchSummary] = useState<{ found: number; total: number } | null>(null);
   // Tag Pricelist / Received Purchase items with a bid item's name (button next to the item title).
   // spec is carried alongside so the tag itself is scoped to title+specification, not title alone.
   const [tagBidItem, setTagBidItem] = useState<{ title: string; spec?: string } | null>(null);
-  const [ratesReload, setRatesReload] = useState(0);
   // the row the Tag popup was opened from - the cursor goes back to its Base Rate box when the popup closes
   const tagRowRef = useRef<HTMLElement | null>(null);
   const focusTagRow = () => {
@@ -350,11 +357,14 @@ function DocumentMakerPageInner() {
     () => Array.from(new Set(boqItems.map((it) => normalizeName(itemMatchName(it.itemTitle, it.specification))).filter(Boolean))).sort().join("\n"),
     [boqItems]
   );
+  // Automatic, cheap: only rates of items already TAGGED with these exact
+  // names (no fuzzy scoring). The expensive fuzzy search - near-miss tag
+  // suggestions + Received Purchase matching - runs only when the user
+  // clicks "Find Pricelist Match" (findPricelistMatches below), once.
   useEffect(() => {
     if (!pricelistTitlesKey) {
       setPricelistRates({});
       setReceivedRates({});
-      setRateSuggestions({});
       return;
     }
     const t = setTimeout(() => {
@@ -367,16 +377,110 @@ function DocumentMakerPageInner() {
         .then((d) => {
           setPricelistRates(d.rates || {});
           setReceivedRates(d.received || {});
-          setRateSuggestions(d.suggestions || {});
         })
         .catch(() => {
           setPricelistRates({});
           setReceivedRates({});
-          setRateSuggestions({});
         });
     }, 400);
     return () => clearTimeout(t);
-  }, [pricelistTitlesKey, ratesReload]);
+  }, [pricelistTitlesKey]);
+
+  const findPricelistMatches = async () => {
+    if (!pricelistTitlesKey || matching) return;
+    setMatching(true);
+    try {
+      const res = await fetch("/api/purchase/pricelist/rates-for-names", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          names: pricelistTitlesKey.split("\n"),
+          suggest: true,
+          // title + spec: a purchase is only suggested when both agree
+          purchaseItems: boqItems.map((it) => ({ title: it.itemTitle || "", spec: it.specification || "" })),
+          // bid item title alone, so a tag saved as "title + spec" is still suggested when a later bid words the spec differently
+          titles: Object.fromEntries(boqItems.map((it) => [normalizeName(itemMatchName(it.itemTitle, it.specification)), (it.itemTitle || "").trim()])),
+        }),
+      });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d?.error || "Match failed");
+      const rates = d.rates || {};
+      const received = d.received || {};
+      const suggestions = d.suggestions || {};
+      const purchase = d.purchase || {};
+      setPricelistRates(rates);
+      setReceivedRates(received);
+      setRateSuggestions(suggestions);
+      setPurchaseMatches(purchase);
+      const found = boqItems.filter((it) => {
+        const k = normalizeName(itemMatchName(it.itemTitle, it.specification));
+        return rates[k] || received[k] || suggestions[k] || purchase[k];
+      }).length;
+      setMatchSummary({ found, total: boqItems.length });
+    } catch (err: any) {
+      alert(err?.message || "Could not find pricelist matches");
+    } finally {
+      setMatching(false);
+    }
+  };
+
+  // Suggestions belong to the bid they were searched for.
+  useEffect(() => {
+    setRateSuggestions({});
+    setPurchaseMatches({});
+    setMatchSummary(null);
+  }, [selectedBidId]);
+
+  // Right after tagging a bid item in BidItemTagDialog: fetch rates for
+  // just that one name (not the whole bid again) and put the tagged rate
+  // straight into Base Rate for every row with that name - pricelist rate
+  // first (cheapest active priced), else the received purchase rate.
+  const applyTaggedRate = async (title: string, spec?: string) => {
+    const name = itemMatchName(title, spec);
+    const key = normalizeName(name);
+    try {
+      const res = await fetch("/api/purchase/pricelist/rates-for-names", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ names: [name] }),
+      });
+      const d = await res.json();
+      if (!res.ok) return;
+      const pl: PricelistRate[] = d.rates?.[key] || [];
+      const rec: ReceivedRate[] = d.received?.[key] || [];
+      setPricelistRates((prev) => {
+        const n = { ...prev };
+        if (pl.length) n[key] = pl;
+        else delete n[key];
+        return n;
+      });
+      setReceivedRates((prev) => {
+        const n = { ...prev };
+        if (rec.length) n[key] = rec;
+        else delete n[key];
+        return n;
+      });
+      if (pl.length || rec.length) {
+        setRateSuggestions((prev) => {
+          const n = { ...prev };
+          delete n[key];
+          return n;
+        });
+      }
+      const best = pl.find((r) => r.is_active && r.rate !== null)?.rate ?? rec[0]?.rate ?? null;
+      if (best === null || best === undefined) return;
+      const baseRate = String(best);
+      setBoqItems((prev) =>
+        prev.map((it) =>
+          normalizeName(itemMatchName(it.itemTitle, it.specification)) === key
+            ? { ...it, baseRate, rate: computeRateFromBase(baseRate, it.marginPercent) || it.rate }
+            : it
+        )
+      );
+    } catch (err) {
+      console.error("Failed to load tagged rate", err);
+    }
+  };
   const [loadingBoq, setLoadingBoq] = useState(false);
   const [savingBoq, setSavingBoq] = useState(false);
   const [uploadingBoq, setUploadingBoq] = useState(false);
@@ -760,7 +864,8 @@ function DocumentMakerPageInner() {
     if (!selectedBidId) return;
     setLoadingBoq(true);
     try {
-      const res = await fetch(`/api/gem-bids/boq?bidId=${selectedBidId}`);
+      // skipPurchase: the fuzzy Received Purchase match is on-demand here (Find Pricelist Match)
+      const res = await fetch(`/api/gem-bids/boq?bidId=${selectedBidId}&skipPurchase=1`);
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to load BOQ");
       setBoqItems(data.items || []);
@@ -1095,17 +1200,23 @@ function DocumentMakerPageInner() {
   // which is why the same bid showed this suggestion there but not here.
   // Fills Base Rate (this page has one; GemBidTable's modal doesn't, so
   // its own copy of this fills Rate directly instead).
+  // Now filled by the "Find Pricelist Match" button (purchaseMatches) - the
+  // BOQ load no longer does this match itself (skipPurchase=1).
   const renderPurchaseRateSuggestion = (it: BoqItem) => {
-    if (!it.purchaseRate) return null;
-    const dateLabel = it.purchaseDate ? new Date(it.purchaseDate).toLocaleDateString("en-IN") : "";
+    // only from Find Pricelist Match, and only when title + spec agree (see loadPurchaseMatches)
+    const m = purchaseMatches[normalizeName(itemMatchName(it.itemTitle, it.specification))];
+    if (!m) return null;
+    const rate = String(m.rate);
+    const dateLabel = m.receivedAt ? new Date(m.receivedAt).toLocaleDateString("en-IN") : "";
+    const vendor = m.vendor;
     return (
       <button
         type="button"
-        onClick={() => updateBoqBaseRate(it.itemNumber, it.purchaseRate!)}
-        className="text-[9px] text-emerald-700 underline mt-0.5 block"
-        title={[it.purchaseVendor, dateLabel].filter(Boolean).join(" — ") || undefined}
+        onClick={() => updateBoqBaseRate(it.itemNumber, rate)}
+        className="text-[9px] text-emerald-700 underline mt-0.5 block text-left"
+        title={[`Matched: ${m.itemName} (${Math.round(m.score * 100)}%)`, vendor, dateLabel].filter(Boolean).join(" — ") || undefined}
       >
-        Purchased: {it.purchaseRate}
+        Purchased: {rate}
       </button>
     );
   };
@@ -1214,11 +1325,18 @@ function DocumentMakerPageInner() {
     fetch("/api/gem-bids/boq/save-variants", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ bidId: selectedBidId, variantPartyPercents: percents }),
+      // items = the Rate column as on screen, so each firm's own final rates are
+      // saved under its name from what's currently filled (not a stale save)
+      body: JSON.stringify({
+        bidId: selectedBidId,
+        variantPartyPercents: percents,
+        items: boqItems.map((it) => ({ itemNumber: it.itemNumber, itemTitle: it.itemTitle, rate: it.rate, quantity: it.quantity })),
+      }),
     }).catch(() => {});
   };
 
   const generateBoqRateVariants = () => {
+    persistVariantPercents(boqVariantParties, boqVariantCount, boqVariantL2Percent, boqVariantL3Percent);
     const percents = [parseFloat(boqVariantL2Percent) || 0, parseFloat(boqVariantL3Percent) || 0];
     const rows: BoqVariantRow[] = boqItems.map((it) => {
       const qty = parseFloat(it.quantity) || 0;
@@ -1373,7 +1491,11 @@ function DocumentMakerPageInner() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to save BOQ rates");
-      alert(`Saved ${data.savedCount} rate(s).`);
+      const firms = ((data.firmRatesSaved || []) as string[])
+        .map((id) => companies.find((c) => c._id === id)?.firmCode || companies.find((c) => c._id === id)?.firmName)
+        .filter(Boolean)
+        .join(", ");
+      alert(`Saved ${data.savedCount} rate(s).${firms ? ` Final rate saved for: ${firms}.` : ""}`);
     } catch (err: any) {
       alert(err.message || "Failed to save BOQ rates");
     } finally {
@@ -1440,15 +1562,24 @@ function DocumentMakerPageInner() {
                 Rate Filling, Firm Document Vault &amp; ATC Generation
               </p>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setTab("variant")}
-                className={`flex items-center gap-1.5 font-black uppercase text-[11px] tracking-wide py-2.5 px-4 rounded-xl transition-colors ${
-                  tab === "variant" ? "bg-purple-600 hover:bg-purple-700 text-white" : "bg-slate-900 hover:bg-slate-800 text-white"
-                }`}
-              >
-                <FiPercent size={13} /> Rate Variant Tool
-              </button>
+            <div className="flex flex-wrap items-center justify-end gap-2">
+              {boqItems.length > 0 && (
+                <div className="flex flex-col items-end">
+                  <button
+                    onClick={findPricelistMatches}
+                    disabled={matching}
+                    title="Search the Pricelist and Received Purchases for every item of this bid and show the closest matches under Base Rate. Runs only when clicked."
+                    className="flex items-center gap-1.5 bg-orange-500 hover:bg-orange-600 disabled:opacity-60 text-white font-black uppercase text-[11px] tracking-wide py-2.5 px-4 rounded-xl transition-colors"
+                  >
+                    <FiSearch size={13} /> {matching ? "Finding…" : matchSummary ? "Find Again" : "Find Pricelist Match"}
+                  </button>
+                  {matchSummary && !matching && (
+                    <span className="text-[10px] text-slate-500 mt-0.5">
+                      {matchSummary.found} / {matchSummary.total} items matched
+                    </span>
+                  )}
+                </div>
+              )}
               <button
                 onClick={() => setVaultModalOpen(true)}
                 className="flex items-center gap-1.5 bg-slate-900 hover:bg-slate-800 text-white font-black uppercase text-[11px] tracking-wide py-2.5 px-4 rounded-xl transition-colors"
@@ -2076,113 +2207,6 @@ function DocumentMakerPageInner() {
               <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
                 <div className="p-5 border-b border-slate-100">
                   <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
-                    <FiPercent className="text-purple-600" size={14} /> Rate Variants
-                  </h3>
-                  <p className="text-[10px] text-slate-400 mt-1">
-                    Generates 2 or 3 alternate rate columns from whatever&apos;s currently filled in the Rate column
-                    above, each nudged up or down by a random amount sized to the rate itself (small items get a
-                    small difference, big-ticket items a bigger one) - same approach as the standalone{" "}
-                    <Link href="/dashboard/gem-bids/rate-variant-tool" target="_blank" className="underline">
-                      Rate Variant Tool
-                    </Link>
-                    , just run directly on this bid&apos;s own items.
-                  </p>
-                </div>
-                <div className="p-5 flex flex-col gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="flex items-center gap-1 bg-slate-50 border border-slate-200 rounded-xl p-1">
-                      {([2, 3] as const).map((n) => (
-                        <button
-                          key={n}
-                          onClick={() => setVariantCount(n)}
-                          className={`px-4 py-1.5 rounded-lg text-[11px] font-black uppercase tracking-wide transition-colors ${
-                            variantCount === n ? "bg-purple-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
-                          }`}
-                        >
-                          {n} Variants
-                        </button>
-                      ))}
-                    </div>
-                    <button
-                      onClick={generateRateVariants}
-                      className="flex items-center gap-1.5 bg-purple-600 hover:bg-purple-700 text-white font-black uppercase text-[10px] tracking-wide py-2 px-4 rounded-lg transition-colors"
-                    >
-                      <FiPercent size={12} /> {rateVariants ? "Re-roll" : "Generate Variants"}
-                    </button>
-                  </div>
-
-                  {rateVariants && (
-                    <>
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-xs">
-                          <thead className="bg-slate-50 text-slate-500 uppercase text-[10px] font-black">
-                            <tr>
-                              <th className="py-2 px-2 text-left">Item Title</th>
-                              <th className="py-2 px-2 text-right">Qty</th>
-                              <th className="py-2 px-2 text-right">Rate</th>
-                              {Array.from({ length: variantCount }, (_, i) => (
-                                <th key={i} className="py-2 px-2 text-right">
-                                  Variant {i + 1}
-                                </th>
-                              ))}
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100">
-                            {rateVariants.map((r) => (
-                              <tr key={r.itemNumber}>
-                                <td className="py-2 px-2 font-bold text-slate-700 max-w-[260px] truncate" title={r.itemTitle}>
-                                  {r.itemTitle}
-                                </td>
-                                <td className="py-2 px-2 text-right text-slate-500 whitespace-nowrap">{r.qty}</td>
-                                <td className="py-2 px-2 text-right text-slate-700 whitespace-nowrap">{r.baseRate || "—"}</td>
-                                {r.variants.map((v, i) => (
-                                  <td key={i} className="py-2 px-2 text-right whitespace-nowrap">
-                                    {v.rate ? (
-                                      <>
-                                        <span className="font-bold text-slate-700">{v.rate}</span>{" "}
-                                        <span className={v.diff >= 0 ? "text-emerald-600" : "text-rose-600"}>
-                                          ({v.diff >= 0 ? "+" : ""}
-                                          {v.diff})
-                                        </span>
-                                      </>
-                                    ) : (
-                                      "—"
-                                    )}
-                                  </td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                          <tfoot>
-                            <tr className="border-t-2 border-slate-800">
-                              <td colSpan={3} className="py-2 px-2 text-right font-black uppercase text-[10px] text-slate-700">
-                                Grand Total ({boqGrandTotal.toLocaleString("en-IN", { maximumFractionDigits: 2 })})
-                              </td>
-                              {rateVariantGrandTotals.map((t, i) => (
-                                <td key={i} className="py-2 px-2 text-right font-black text-slate-900 whitespace-nowrap">
-                                  {t.toLocaleString("en-IN", { maximumFractionDigits: 2 })}
-                                </td>
-                              ))}
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
-                      <button
-                        onClick={downloadRateVariants}
-                        className="w-fit px-4 py-2 rounded-lg text-[11px] font-black uppercase tracking-wide bg-slate-100 hover:bg-slate-200 text-slate-700 transition-colors"
-                      >
-                        Download Excel
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {selectedBidId && boqItems.length > 0 && (
-              <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
-                <div className="p-5 border-b border-slate-100">
-                  <h3 className="text-xs font-black uppercase tracking-wider text-slate-900 flex items-center gap-1.5">
                     <FiPercent className="text-purple-600" size={14} /> BOQ Rate Variants
                   </h3>
                   <p className="text-[10px] text-slate-400 mt-1">
@@ -2720,9 +2744,9 @@ function DocumentMakerPageInner() {
             focusTagRow();
           }}
           onDone={() => {
+            const tagged = tagBidItem;
             setTagBidItem(null);
-            setRatesReload((n) => n + 1);
-            focusTagRow();
+            applyTaggedRate(tagged.title, tagged.spec).finally(focusTagRow);
           }}
         />
       )}

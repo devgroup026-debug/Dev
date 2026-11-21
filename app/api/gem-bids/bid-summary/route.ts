@@ -38,6 +38,7 @@ export async function GET() {
             selectedPartyId: 1,
             boqRates: 1,
             boqVariantPartyPercents: 1,
+            firmRates: 1,
             summaryByParty: 1,
           },
         }
@@ -55,6 +56,13 @@ export async function GET() {
       const finalRateByParty: Record<string, number> = {};
       for (const pid of partyIds) {
         const pct = percents[pid] || 0;
+        // saved firm-wise final rate (see lib/gemBids/firmRates.ts) wins; the
+        // percent maths below is only for bids saved before firmRates existed
+        const saved = b.firmRates?.[pid]?.grandTotal;
+        if (typeof saved === "number") {
+          finalRateByParty[pid] = saved;
+          continue;
+        }
         finalRateByParty[pid] = pct
           ? (b.boqRates || []).reduce((sum: number, r: any) => {
               const qty = parseFloat(r.quantity) || 0;

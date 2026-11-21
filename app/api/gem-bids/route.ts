@@ -56,6 +56,91 @@ export async function GET(req: Request) {
         : section
         ? { currentSection: section, ...liveOnly }
         : liveOnly;
+    // ?bidNo=<no> (optionally &fields=a,b) - one full bid on demand: the table's
+    // slim list leaves the heavy/rarely-needed fields out, so Edit Bid and the
+    // Link click fetch just the one bid they need.
+    const oneBidNo = searchParams.get("bidNo");
+    if (oneBidNo) {
+      const fields = (searchParams.get("fields") || "").split(",").map((s) => s.trim()).filter((s) => /^[a-zA-Z0-9_]+$/.test(s));
+      const doc = await db
+        .collection("gem_bids")
+        .findOne({ bidNo: oneBidNo }, fields.length ? { projection: Object.fromEntries(fields.map((f) => [f, 1])) } : undefined);
+      if (!doc) return NextResponse.json({ error: "Bid not found" }, { status: 404, headers: corsHeaders });
+      return NextResponse.json(doc, { headers: corsHeaders });
+    }
+
+    // ?slim=1 - what the GeM Bids table actually renders. Drops the fields that
+    // made the full list ~3.4 MB (per-item boqRates, documents text, ATC/spec/
+    // BOQ/bid links...) and replaces them with tiny derived values: hasBidLink
+    // and boqTotal/boqFilled (the Items cell's "N Pending / N Filled").
+    // ?q=<text> (with slim) - server-side search for the All Bids tab, which
+    // loads nothing until something is searched. Case-insensitive, matches Bid
+    // No, items, address, department or city; capped so one broad search can't
+    // pull the whole collection back.
+    // &f_<field>=<value> narrows by the table's own filter bar (text fields =
+    // case-insensitive contains, f_addressOrDept covers address + department,
+    // dropdown fields = exact match). Any of these also counts as "a search".
+    const escRx = (t: string) => new RegExp(t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const q = (searchParams.get("q") || "").trim();
+    const conds: any[] = [query];
+    if (q) conds.push({ $or: ["bidNo", "items", "address", "departmentNameAndAddress", "consigneeCity"].map((f) => ({ [f]: escRx(q) })) });
+    for (const f of ["bidNo", "items"]) {
+      const v = (searchParams.get("f_" + f) || "").trim();
+      if (v) conds.push({ [f]: escRx(v) });
+    }
+    const addrTerm = (searchParams.get("f_addressOrDept") || "").trim();
+    if (addrTerm) conds.push({ $or: [{ address: escRx(addrTerm) }, { departmentNameAndAddress: escRx(addrTerm) }] });
+    for (const f of ["tag", "consigneeCity", "bidToRaEnabled", "raQualificationRule", "typeOfBid", "evaluationMethod", "bidResult"]) {
+      const v = (searchParams.get("f_" + f) || "").trim();
+      if (v) conds.push({ [f]: v });
+    }
+    const searchQuery: any = conds.length > 1 ? { $and: conds } : query;
+    const isSearch = conds.length > 1;
+
+    if (searchParams.get("slim")) {
+      const slim = await db
+        .collection("gem_bids")
+        .aggregate([
+          { $match: searchQuery },
+          {
+            $addFields: {
+              hasBidLink: { $gt: [{ $strLenCP: { $convert: { input: "$bidLink", to: "string", onError: "", onNull: "" } } }, 0] },
+              boqTotal: { $size: { $cond: [{ $isArray: "$boqRates" }, "$boqRates", []] } },
+              boqFilled: {
+                $size: {
+                  $filter: {
+                    input: { $cond: [{ $isArray: "$boqRates" }, "$boqRates", []] },
+                    as: "r",
+                    cond: { $gt: [{ $convert: { input: "$$r.rate", to: "double", onError: 0, onNull: 0 } }, 0] },
+                  },
+                },
+              },
+            },
+          },
+          {
+            $project: {
+              boqRates: 0,
+              documentRequiredFromSeller: 0,
+              buyerAddedBidSpecificAtcUrl: 0,
+              specificationDocumentUrl: 0,
+              boqDetailDocumentUrl: 0,
+              bidSpecificAtc: 0,
+              bidLink: 0,
+              beneficiary: 0,
+              generation: 0,
+              docFetch: 0,
+              statusRefresh: 0,
+              summaryByParty: 0,
+              sectionStack: 0,
+            },
+          },
+          { $sort: { updatedAt: -1 } },
+          ...(isSearch ? [{ $limit: 150 }] : []),
+        ])
+        .toArray();
+      return NextResponse.json(slim, { headers: corsHeaders });
+    }
+
     const bids = await db
       .collection("gem_bids")
       .find(

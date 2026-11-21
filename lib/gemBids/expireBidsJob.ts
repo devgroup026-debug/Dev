@@ -2,7 +2,7 @@ import { AUTO_DELETE_EXPIRED_SECTIONS } from "./columns";
 import { parseGemDate } from "./expirySweep";
 import { deleteBidDocumentsFromR2 } from "./bidDocCleanup";
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const EXPIRED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const SETTINGS_COLLECTION = "gem_bid_settings";
 const LAST_RUN_KEY = "lastExpireBidsJobDate";
 // How often this actually does the (cheap, but not free) full-section scan
@@ -70,17 +70,40 @@ export async function runExpireBidsJobIfDue(db: any): Promise<ExpireBidsJobResul
     expiredCount = res.modifiedCount || 0;
   }
 
-  // Purge: any bid whose Expired Bids 7-day window has already passed -
+  // Purge: any bid whose Expired Bids retention window has already passed -
   // same retention mechanic as /api/gem-bids/purge-deleted, just keyed off
   // expiredAt instead of deletedAt. No tombstone here (unlike a manual
   // delete) - a bid that expired and was never worked has nothing to
   // protect against re-appearing; the normal sync-vs-existing-doc logic
   // already means a still-live bid just gets re-inserted as new.
-  const purgeCutoff = new Date(now.getTime() - SEVEN_DAYS_MS);
-  const toPurge = await bidsCollection
-    .find({ expiredAt: { $lte: purgeCutoff } })
-    .project({ bidLinkDoc: 1, boqDetailDoc: 1, specificationDoc: 1, bidSpecificAtc: 1 })
+  // Expired Bids are kept for EXPIRED_RETENTION_MS (1 month), counted from the
+  // bid's own Bid End Date/Time - a bid that ended long before it was first
+  // swept into Expired Bids isn't kept another month just because it was
+  // swept late. A bid someone actually worked on (rates saved or a party
+  // chosen) is only ever purged by the plain expiredAt + 1 month rule.
+  const purgeCutoff = new Date(now.getTime() - EXPIRED_RETENTION_MS);
+  const expiredDocs = await bidsCollection
+    .find({ expiredAt: { $exists: true, $ne: null } })
+    .project({
+      bidEndDateTime: 1,
+      expiredAt: 1,
+      selectedPartyIds: 1,
+      selectedPartyId: 1,
+      boqRates: { $slice: 1 },
+      bidLinkDoc: 1,
+      boqDetailDoc: 1,
+      specificationDoc: 1,
+      bidSpecificAtc: 1,
+    })
     .toArray();
+  const toPurge = expiredDocs.filter((b: any) => {
+    const expiredAt = b.expiredAt ? new Date(b.expiredAt) : null;
+    if (expiredAt && expiredAt.getTime() <= purgeCutoff.getTime()) return true;
+    const worked = (Array.isArray(b.boqRates) && b.boqRates.length > 0) || b.selectedPartyIds?.length > 0 || !!b.selectedPartyId;
+    if (worked) return false;
+    const end = parseGemDate(b.bidEndDateTime);
+    return end !== null && end.getTime() <= purgeCutoff.getTime();
+  });
   let purgedCount = 0;
   if (toPurge.length > 0) {
     await deleteBidDocumentsFromR2(toPurge);

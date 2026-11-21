@@ -5,6 +5,7 @@ import { FiArrowLeft, FiX, FiLayers, FiFileText, FiPercent, FiList, FiClipboard 
 import BlockGuard from "@/components/BlockGuard";
 import GemBidTable, { GemBid } from "@/components/GemBidTable";
 import { SECTIONS, SectionKey, SUBMITTED_STATUSES } from "@/lib/gemBids/columns";
+import { parseGemDate } from "@/lib/gemBids/expirySweep";
 
 interface LastRun {
   runAt: string;
@@ -47,25 +48,26 @@ export default function GemBidsPage() {
   const [bids, setBids] = useState<GemBid[]>([]);
   const [expiredBids, setExpiredBids] = useState<GemBid[]>([]);
   const [deletedBids, setDeletedBids] = useState<GemBid[]>([]);
-  // Everything, including Expired/Deleted - the All Bids tab's own table
-  // content, so a bid sitting in either holding area can still be found
-  // there without counting toward the All Bids tab's own badge (that stays
-  // bids.length). Built client-side from the three lists already loaded -
-  // it used to be a 4th full-collection fetch (?section=with_deleted_and_expired)
-  // that re-downloaded the exact same documents on every page load/refetch.
-  const allIncludingHoldingAreas = useMemo(() => {
-    const seen = new Set<string>();
-    const merged: GemBid[] = [];
-    for (const b of [...bids, ...expiredBids, ...deletedBids]) {
-      const id = String((b as any)._id);
-      if (seen.has(id)) continue;
-      seen.add(id);
-      merged.push(b);
-    }
-    const ts = (b: GemBid) => new Date((b as any).updatedAt || 0).getTime();
-    return merged.sort((a, b) => ts(b) - ts(a));
-  }, [bids, expiredBids, deletedBids]);
-  const [loading, setLoading] = useState(true);
+  // Nothing is downloaded up front. Tab badges come from /api/gem-bids/counts;
+  // a section's bids are fetched when its tab is opened (Bids to Fill,
+  // Submitted, Expired) or its Load button is pressed (New, Fetched). `bids`
+  // is the pool of whatever live sections are loaded so far. The All Bids tab
+  // loads nothing until something is searched (server-side).
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [loadedSections, setLoadedSections] = useState<Set<string>>(new Set());
+  const [loadingSections, setLoadingSections] = useState<Set<string>>(new Set());
+  const loadedRef = useRef<Set<string>>(new Set());
+  const [expiredLoaded, setExpiredLoaded] = useState(false);
+  const [expiredLoading, setExpiredLoading] = useState(false);
+  const expiredLoadedRef = useRef(false);
+  // All Bids tab: the table's own filter bar drives a server-side search.
+  const [allFilters, setAllFilters] = useState<Record<string, any>>({});
+  const [filterOptions, setFilterOptions] = useState<Record<string, string[]>>({});
+  const [searchResults, setSearchResults] = useState<GemBid[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [deletedLoaded, setDeletedLoaded] = useState(false);
+  const [deletedLoading, setDeletedLoading] = useState(false);
+  const deletedLoadedRef = useRef(false);
   // "all" is a combined search-everything view, not a real workflow stage a
   // bid can be *in* (see lib/gemBids/columns.ts's SECTIONS comment) - same
   // for "deleted_bids"/"expired_bids", 7-day holding areas rather than one,
@@ -240,14 +242,40 @@ export default function GemBidsPage() {
     }
   }, []);
 
-  const fetchBids = useCallback(() => {
-    setLoading(true);
-    fetch("/api/gem-bids")
+  const fetchCounts = useCallback(() => {
+    fetch("/api/gem-bids/counts")
       .then((res) => res.json())
-      .then((data) => setBids(Array.isArray(data) ? data : []))
-      .catch((err) => console.error("Failed to load GeM bids", err))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        if (data && !data.error) setCounts(data);
+      })
+      .catch((err) => console.error("Failed to load bid counts", err));
   }, []);
+
+  const loadSection = useCallback((key: string) => {
+    setLoadingSections((prev) => new Set(prev).add(key));
+    return fetch(`/api/gem-bids?slim=1&section=${key}`)
+      .then((res) => res.json())
+      .then((data) => {
+        const list: GemBid[] = Array.isArray(data) ? data : [];
+        setBids((prev) => [...prev.filter((b) => b.currentSection !== key), ...list]);
+        loadedRef.current.add(key);
+        setLoadedSections(new Set(loadedRef.current));
+      })
+      .catch((err) => console.error("Failed to load GeM bids", err))
+      .finally(() =>
+        setLoadingSections((prev) => {
+          const n = new Set(prev);
+          n.delete(key);
+          return n;
+        })
+      );
+  }, []);
+
+  // Refresh the counts and re-pull only the sections that are already loaded.
+  const fetchBids = useCallback(() => {
+    fetchCounts();
+    loadedRef.current.forEach((k) => loadSection(k));
+  }, [fetchCounts, loadSection]);
 
   // A bid that's been deleted (see GemBidTable's deleteBids) - soft-deleted
   // for 7 days (/api/gem-bids/purge-deleted removes it for good after
@@ -255,20 +283,32 @@ export default function GemBidsPage() {
   // immediately, so a mistaken delete can still be undone. Fetched
   // separately from the main bids list, which now excludes these.
   const fetchDeletedBids = useCallback(() => {
-    fetch("/api/gem-bids?section=deleted_bids")
+    setDeletedLoading(true);
+    fetch("/api/gem-bids?slim=1&section=deleted_bids")
       .then((res) => res.json())
-      .then((data) => setDeletedBids(Array.isArray(data) ? data : []))
-      .catch((err) => console.error("Failed to load deleted GeM bids", err));
+      .then((data) => {
+        setDeletedBids(Array.isArray(data) ? data : []);
+        deletedLoadedRef.current = true;
+        setDeletedLoaded(true);
+      })
+      .catch((err) => console.error("Failed to load deleted GeM bids", err))
+      .finally(() => setDeletedLoading(false));
   }, []);
 
   // A bid past its own Bid End Date/Time, auto-moved here once a day (evening
   // only - see lib/gemBids/expireBidsJob.ts) - same 7-day-then-purged,
   // restorable-meanwhile shape as Deleted Bids.
   const fetchExpiredBids = useCallback(() => {
-    fetch("/api/gem-bids?section=expired_bids")
+    setExpiredLoading(true);
+    fetch("/api/gem-bids?slim=1&section=expired_bids")
       .then((res) => res.json())
-      .then((data) => setExpiredBids(Array.isArray(data) ? data : []))
-      .catch((err) => console.error("Failed to load expired GeM bids", err));
+      .then((data) => {
+        setExpiredBids(Array.isArray(data) ? data : []);
+        expiredLoadedRef.current = true;
+        setExpiredLoaded(true);
+      })
+      .catch((err) => console.error("Failed to load expired GeM bids", err))
+      .finally(() => setExpiredLoading(false));
   }, []);
 
   const fetchLastRun = useCallback(() => {
@@ -287,8 +327,8 @@ export default function GemBidsPage() {
 
   const refetchAll = useCallback(() => {
     fetchBids();
-    fetchDeletedBids();
-    fetchExpiredBids();
+    if (deletedLoadedRef.current) fetchDeletedBids();
+    if (expiredLoadedRef.current) fetchExpiredBids();
     fetchLastRun();
     fetchSyncStatus();
   }, [fetchBids, fetchDeletedBids, fetchExpiredBids, fetchLastRun, fetchSyncStatus]);
@@ -296,6 +336,87 @@ export default function GemBidsPage() {
   useEffect(() => {
     refetchAll();
   }, [refetchAll]);
+
+  // Opening a tab loads what it needs, except New/Fetched/Expired/Deleted (Load button) and All (search).
+  useEffect(() => {
+    if (
+      activeSection === "all" ||
+      activeSection === "deleted_bids" ||
+      activeSection === "expired_bids" ||
+      activeSection === "new_bids" ||
+      activeSection === "fetched_bid_data"
+    )
+      return;
+    if (!loadedRef.current.has(activeSection)) loadSection(activeSection);
+  }, [activeSection, loadSection]);
+
+  // All Bids tab: the table's filter bar is the search. Nothing is loaded until a
+  // text filter has 2+ characters or a dropdown is picked; then the matches
+  // (max 150) come from the server. Date filters still apply on top, client-side.
+  const allSearchParams = useMemo(() => {
+    const params = new URLSearchParams();
+    let active = false;
+    for (const k of ["bidNo", "items", "addressOrDept"]) {
+      const v = String(allFilters[k] || "").trim();
+      if (v.length >= 2) {
+        params.set("f_" + k, v);
+        active = true;
+      }
+    }
+    for (const k of ["tag", "consigneeCity", "bidToRaEnabled", "raQualificationRule", "typeOfBid", "evaluationMethod", "bidResult"]) {
+      const v = String(allFilters[k] || "").trim();
+      if (v) {
+        params.set("f_" + k, v);
+        active = true;
+      }
+    }
+    return active ? params.toString() : "";
+  }, [allFilters]);
+
+  useEffect(() => {
+    if (!allSearchParams) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    let cancelled = false;
+    const t = setTimeout(() => {
+      fetch(`/api/gem-bids?slim=1&section=with_deleted_and_expired&${allSearchParams}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (!cancelled) setSearchResults(Array.isArray(data) ? data : []);
+        })
+        .catch((err) => console.error("Failed to search GeM bids", err))
+        .finally(() => {
+          if (!cancelled) setSearching(false);
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [allSearchParams]);
+
+  // Dropdown values for the All Bids filters (nothing is loaded to derive them from).
+  useEffect(() => {
+    if (activeSection !== "all" || Object.keys(filterOptions).length > 0) return;
+    fetch("/api/gem-bids/filter-options")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && !data.error) setFilterOptions(data);
+      })
+      .catch((err) => console.error("Failed to load filter options", err));
+  }, [activeSection, filterOptions]);
+
+  // Edits made inside the table update the pool, then the tab badges catch up.
+  const handleBidsUpdated = useCallback(
+    (updater: (prev: GemBid[]) => GemBid[]) => {
+      setBids(updater);
+      setTimeout(fetchCounts, 800);
+    },
+    [fetchCounts]
+  );
 
   // Poll every ~2s while a run is actively scraping/applying so the
   // progress bar below moves live; stop polling once it settles into a
@@ -375,6 +496,9 @@ export default function GemBidsPage() {
     return map;
   }, [bids]);
 
+  // loaded section -> live count from the pool (follows moves/deletes); otherwise the server count
+  const countFor = (key: string) => (loadedSections.has(key) ? sectionCounts[key] || 0 : counts[key] ?? 0);
+
   const submittedStatusCounts = useMemo(() => {
     const map: Record<string, number> = {};
     SUBMITTED_STATUSES.forEach((s) => (map[s] = 0));
@@ -390,13 +514,13 @@ export default function GemBidsPage() {
   const bidsInActiveSection = useMemo(
     () =>
       activeSection === "all"
-        ? allIncludingHoldingAreas
+        ? searchResults
         : activeSection === "deleted_bids"
         ? deletedBids
         : activeSection === "expired_bids"
         ? expiredBids
         : bids.filter((b) => b.currentSection === activeSection),
-    [bids, deletedBids, expiredBids, allIncludingHoldingAreas, activeSection]
+    [bids, deletedBids, expiredBids, searchResults, activeSection]
   );
 
   const openHistory = async (bidNo: string) => {
@@ -504,7 +628,7 @@ export default function GemBidsPage() {
                   activeSection === "all" ? "bg-blue-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                All Bids <span className="ml-1 opacity-70">({bids.length})</span>
+                All Bids <span className="ml-1 opacity-70">({counts.all ?? 0})</span>
               </button>
               {SECTIONS.map((s) => (
                 <button
@@ -514,7 +638,7 @@ export default function GemBidsPage() {
                     activeSection === s.key ? "bg-blue-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
                   }`}
                 >
-                  {s.label} <span className="ml-1 opacity-70">({sectionCounts[s.key] || 0})</span>
+                  {s.label} <span className="ml-1 opacity-70">({countFor(s.key)})</span>
                 </button>
               ))}
               <button
@@ -523,7 +647,7 @@ export default function GemBidsPage() {
                   activeSection === "expired_bids" ? "bg-amber-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                Expired Bids <span className="ml-1 opacity-70">({expiredBids.length})</span>
+                Expired Bids <span className="ml-1 opacity-70">({expiredLoaded ? expiredBids.length : counts.expired_bids ?? 0})</span>
               </button>
               <button
                 onClick={() => setActiveSection("deleted_bids")}
@@ -531,7 +655,7 @@ export default function GemBidsPage() {
                   activeSection === "deleted_bids" ? "bg-rose-600 text-white shadow" : "text-slate-500 hover:text-slate-800"
                 }`}
               >
-                Deleted Bids <span className="ml-1 opacity-70">({deletedBids.length})</span>
+                Deleted Bids <span className="ml-1 opacity-70">({deletedLoaded ? deletedBids.length : counts.deleted_bids ?? 0})</span>
               </button>
             </div>
           </div>
@@ -570,12 +694,12 @@ export default function GemBidsPage() {
               {SECTIONS.map((s) => (
                 <div key={s.key} className="bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1.5">
                   <span className="text-[8px] font-black uppercase text-slate-400 tracking-wider block">{s.label}</span>
-                  <span className="text-sm font-black text-slate-800 block">{sectionCounts[s.key] || 0}</span>
+                  <span className="text-sm font-black text-slate-800 block">{countFor(s.key)}</span>
                 </div>
               ))}
             </div>
 
-            {sectionCounts["submitted_bids"] > 0 && (
+            {countFor("submitted_bids") > 0 && loadedSections.has("submitted_bids") && (
               <div className="mb-2">
                 <span className="text-[8px] font-black uppercase text-slate-400 tracking-wider block mb-1">Submitted Bids — by status</span>
                 <div className="flex flex-wrap gap-1.5">
@@ -619,10 +743,16 @@ export default function GemBidsPage() {
           </div>
           )}
 
-          {loading ? (
+          {loadingSections.has(activeSection) ||
+          (activeSection === "expired_bids" && expiredLoading) ||
+          (activeSection === "deleted_bids" && deletedLoading) ? (
             <div className="flex justify-center items-center py-16">
               <div className="animate-spin rounded-full h-6 w-6 border-t-2 border-blue-500"></div>
             </div>
+          ) : activeSection === "deleted_bids" && !deletedLoaded ? (
+            <LoadCard label="Deleted Bids" count={counts.deleted_bids ?? 0} onLoad={fetchDeletedBids} />
+          ) : activeSection === "expired_bids" && !expiredLoaded ? (
+            <LoadCard label="Expired Bids" count={counts.expired_bids ?? 0} onLoad={fetchExpiredBids} />
           ) : activeSection === "deleted_bids" ? (
             <DeletedBidsPanel
               bids={deletedBids}
@@ -635,15 +765,39 @@ export default function GemBidsPage() {
               dateField="expiredAt"
               onRestored={() => { fetchExpiredBids(); fetchBids(); }}
             />
+          ) : activeSection === "all" ? (
+            <GemBidTable
+              bids={searchResults}
+              currentUsername={currentUsername}
+              onBidsUpdated={setSearchResults}
+              onViewHistory={openHistory}
+              onFiltersChange={setAllFilters}
+              dropdownOptionsOverride={filterOptions}
+              emptyText={
+                searching
+                  ? "Searching..."
+                  : allSearchParams
+                  ? "No bids match these filters"
+                  : "Use the filters above to search - nothing is loaded until you do"
+              }
+              stickyTop={stickyTop}
+              bottomReserve={footerHeight}
+              allSectionsMode
+            />
+          ) : (activeSection === "new_bids" || activeSection === "fetched_bid_data") && !loadedSections.has(activeSection) ? (
+            <LoadCard
+              label={activeSection === "new_bids" ? "New Bids" : "Fetched Bid Data"}
+              count={counts[activeSection] ?? 0}
+              onLoad={() => loadSection(activeSection)}
+            />
           ) : (
             <GemBidTable
               bids={bidsInActiveSection}
               currentUsername={currentUsername}
-              onBidsUpdated={setBids}
+              onBidsUpdated={handleBidsUpdated}
               onViewHistory={openHistory}
               stickyTop={stickyTop}
               bottomReserve={footerHeight}
-              allSectionsMode={activeSection === "all"}
             />
           )}
         </div>
@@ -919,7 +1073,26 @@ export default function GemBidsPage() {
   );
 }
 
-const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+// Shown instead of a tab's table until its Load button is pressed.
+function LoadCard({ label, count, onLoad }: { label: string; count: number; onLoad: () => void }) {
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-10 flex flex-col items-center gap-3">
+      <span className="text-slate-400 text-xs font-bold uppercase tracking-widest">{count} bids - not loaded yet</span>
+      <button
+        onClick={onLoad}
+        className="bg-blue-600 hover:bg-blue-700 text-white font-black uppercase text-[11px] tracking-wide py-2.5 px-5 rounded-xl transition-colors"
+      >
+        Load {label}
+      </button>
+    </div>
+  );
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Deleted Bids are kept 7 days; Expired Bids 1 month (see lib/gemBids/expireBidsJob.ts).
+const DELETED_RETENTION_MS = 7 * DAY_MS;
+const EXPIRED_RETENTION_MS = 30 * DAY_MS;
+const PANEL_PAGE_SIZE = 50;
 
 // A simple, deliberately separate view (not GemBidTable) - deleted/expired
 // bids have none of the workflow actions a live section's rows do (Edit,
@@ -941,6 +1114,13 @@ function DeletedBidsPanel({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const isExpired = dateField === "expiredAt";
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(bids.length / PANEL_PAGE_SIZE));
+  // a restore/refetch can shrink the list under the current page
+  useEffect(() => {
+    setPage((p) => Math.min(p, pageCount - 1));
+  }, [pageCount]);
+  const pageBids = useMemo(() => bids.slice(page * PANEL_PAGE_SIZE, (page + 1) * PANEL_PAGE_SIZE), [bids, page]);
 
   const toggle = (bidNo: string) => {
     setSelected((prev) => {
@@ -1000,8 +1180,15 @@ function DeletedBidsPanel({
               <th className="py-2 px-3 w-8">
                 <input
                   type="checkbox"
-                  checked={selected.size === bids.length}
-                  onChange={() => setSelected(selected.size === bids.length ? new Set() : new Set(bids.map((b) => b.bidNo)))}
+                  checked={pageBids.length > 0 && pageBids.every((b) => selected.has(b.bidNo))}
+                  onChange={() => {
+                    const allOnPage = pageBids.every((b) => selected.has(b.bidNo));
+                    setSelected((prev) => {
+                      const next = new Set(prev);
+                      pageBids.forEach((b) => (allOnPage ? next.delete(b.bidNo) : next.add(b.bidNo)));
+                      return next;
+                    });
+                  }}
                 />
               </th>
               <th className="py-2 px-3 text-left whitespace-nowrap">Bid No</th>
@@ -1012,11 +1199,19 @@ function DeletedBidsPanel({
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {bids.map((b) => {
+            {pageBids.map((b) => {
               const holdingAt = b[dateField] ? new Date(b[dateField] as any) : null;
-              const daysLeft = holdingAt
-                ? Math.max(0, Math.ceil((holdingAt.getTime() + SEVEN_DAYS_MS - Date.now()) / (24 * 60 * 60 * 1000)))
-                : null;
+              // Expired: the month counts from the bid's own end date (unless the bid was
+              // worked on - rates saved / party chosen - which counts from expiredAt),
+              // mirroring the purge in lib/gemBids/expireBidsJob.ts.
+              let purgeFrom = holdingAt;
+              if (isExpired && holdingAt) {
+                const worked = (b.boqTotal || 0) > 0 || (b.selectedPartyIds?.length || 0) > 0 || !!b.selectedPartyId;
+                const end = worked ? null : parseGemDate(b.bidEndDateTime);
+                if (end && end.getTime() < holdingAt.getTime()) purgeFrom = end;
+              }
+              const retention = isExpired ? EXPIRED_RETENTION_MS : DELETED_RETENTION_MS;
+              const daysLeft = purgeFrom ? Math.max(0, Math.ceil((purgeFrom.getTime() + retention - Date.now()) / DAY_MS)) : null;
               return (
                 <tr key={b.bidNo} className="hover:bg-slate-50">
                   <td className="py-2 px-3">
@@ -1047,6 +1242,46 @@ function DeletedBidsPanel({
           </tbody>
         </table>
       </div>
+      {bids.length > PANEL_PAGE_SIZE && (
+        <div className="flex items-center justify-between gap-3 px-3 py-2.5 border-t border-slate-100 text-[11px] font-bold text-slate-500">
+          <span>
+            {page * PANEL_PAGE_SIZE + 1}–{Math.min((page + 1) * PANEL_PAGE_SIZE, bids.length)} of {bids.length}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              disabled={page === 0}
+              onClick={() => setPage(0)}
+              className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 uppercase text-[10px] font-black"
+            >
+              First
+            </button>
+            <button
+              disabled={page === 0}
+              onClick={() => setPage((p) => p - 1)}
+              className="px-3 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 uppercase text-[10px] font-black"
+            >
+              Prev
+            </button>
+            <span className="px-2 text-slate-700">
+              Page {page + 1} / {pageCount}
+            </span>
+            <button
+              disabled={page >= pageCount - 1}
+              onClick={() => setPage((p) => p + 1)}
+              className="px-3 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 uppercase text-[10px] font-black"
+            >
+              Next
+            </button>
+            <button
+              disabled={page >= pageCount - 1}
+              onClick={() => setPage(pageCount - 1)}
+              className="px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40 uppercase text-[10px] font-black"
+            >
+              Last
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -222,9 +222,14 @@ export async function GET(req: Request) {
     // matching in gem-sync/catalogue (see catalogueMatch.ts). Capped and
     // sorted newest-first so a tie between two matches of equal score
     // favors the more recent purchase.
-    const purchaseDocs = await db
+    //
+    // ?skipPurchase=1 (the Bid Rate page) skips this entirely - scoring every
+    // BOQ item against up to 5000 purchase rows on every load was a big CPU
+    // cost; that page now gets the same (more accurate) match on demand from
+    // its "Find Pricelist Match" button via /api/purchase/pricelist/rates-for-names.
+    const purchaseDocs = searchParams.get("skipPurchase") === "1" ? [] : await db
       .collection("Received purchase")
-      .find({ itemName: { $exists: true, $ne: "" } }, { projection: { itemName: 1, rate: 1, vendor: 1, receivedAt: 1 } })
+      .find({ itemName: { $exists: true, $ne: "" }, rate: { $gt: 0 } }, { projection: { itemName: 1, rate: 1, vendor: 1, receivedAt: 1 } })
       .sort({ receivedAt: -1 })
       .limit(5000)
       .toArray();

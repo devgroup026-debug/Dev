@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import clientPromise from "@/lib/mongodb";
+import { syncFirmRates } from "@/lib/gemBids/firmRates";
 
 const DB_NAME = "dev_oms_db";
 
@@ -50,6 +51,16 @@ export async function POST(req: Request) {
     );
     if (result.matchedCount === 0) {
       return NextResponse.json({ error: "Bid not found" }, { status: 404 });
+    }
+
+    // The first selected firm is the one that gets plain L1 saved under its
+    // name when no variant covers it - re-evaluate when the selection changes.
+    if (field === "selectedPartyIds") {
+      try {
+        await syncFirmRates(db, { bidNo });
+      } catch (e) {
+        console.error("firmRates sync failed:", e);
+      }
     }
 
     return NextResponse.json({ success: true });

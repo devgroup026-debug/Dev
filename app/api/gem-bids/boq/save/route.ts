@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import clientPromise from "@/lib/mongodb";
 import { normalizeItemKey } from "@/lib/documentMaker/boqEngine";
+import { syncFirmRates } from "@/lib/gemBids/firmRates";
 
 const DB_NAME = "dev_oms_db";
 
@@ -101,7 +102,17 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ success: true, savedCount: boqRates.length });
+    // Keep each firm's own final rate in step with the Rate column: variant
+    // firms get L1 + their %, and the first selected firm gets plain L1 when
+    // no variant covers it. Non-fatal - the rates themselves are already saved.
+    let firmRatesSaved: string[] = [];
+    try {
+      firmRatesSaved = await syncFirmRates(db, { _id: new ObjectId(bidId) });
+    } catch (e) {
+      console.error("firmRates sync failed:", e);
+    }
+
+    return NextResponse.json({ success: true, savedCount: boqRates.length, firmRatesSaved });
   } catch (error: any) {
     console.error("GeM bid BOQ save error:", error);
     return NextResponse.json({ error: error.message || "Failed to save BOQ rates" }, { status: 500 });

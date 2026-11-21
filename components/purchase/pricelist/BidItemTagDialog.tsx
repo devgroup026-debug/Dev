@@ -3,6 +3,24 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { FiX, FiSearch, FiCheck } from "react-icons/fi";
 import { normalizeName } from "@/lib/pricelist/normalize";
 
+// The full Received Purchase list (with tags) is large and was re-downloaded
+// every time this dialog opened - tagging 20 items of one bid meant 20 full
+// loads. Kept for a few minutes per page session instead; cleared after a
+// save so "Tagged" ticks stay correct.
+const RECEIVED_CACHE_MS = 5 * 60 * 1000;
+let receivedCache: { at: number; rows: Promise<any[]> } | null = null;
+function loadReceivedRows(): Promise<any[]> {
+  if (receivedCache && Date.now() - receivedCache.at < RECEIVED_CACHE_MS) return receivedCache.rows;
+  const rows = fetch("/api/purchase/pricelist/received-with-tags")
+    .then((r) => r.json())
+    .then((d) => (d.rows || []) as any[]);
+  receivedCache = { at: Date.now(), rows };
+  rows.catch(() => {
+    receivedCache = null;
+  });
+  return rows;
+}
+
 const inr = (n: number | null | undefined) => (typeof n === "number" ? n.toLocaleString("en-IN", { maximumFractionDigits: 2 }) : "—");
 
 interface RecItem {
@@ -70,11 +88,10 @@ export default function BidItemTagDialog({
 
   // received purchase items: one row per sku (latest positive rate, 0 if never priced)
   useEffect(() => {
-    fetch("/api/purchase/pricelist/received-with-tags")
-      .then((r) => r.json())
-      .then((d) => {
+    loadReceivedRows()
+      .then((rowsData) => {
         const bySku = new Map<string, RecItem & { at: number }>();
-        for (const r of (d.rows || []) as any[]) {
+        for (const r of rowsData) {
           if (!r.sku) continue;
           const at = new Date(r.receivedAt).getTime() || 0;
           const rate = Number(r.rate) || 0;
@@ -163,8 +180,10 @@ export default function BidItemTagDialog({
         const d = await res.json();
         if (!res.ok) throw new Error(d.error || "Received tag failed");
       }
+      receivedCache = null;
       onDone();
     } catch (e: any) {
+      receivedCache = null;
       setErr(e.message);
       setSaving(false);
     }

@@ -762,7 +762,10 @@
     const statusMatch = (card.containerEl.innerText || "").match(/Status\s*:\s*([^\n]+)/i);
     if (!statusMatch) return { ok: false, error: "status_text_not_found" };
 
-    return { ok: true, status: statusMatch[1].trim() };
+    // The listing card's own End Date rides along, so an extended deadline on
+    // a Submitted bid (which a normal sync never re-reads) reaches the OMS too.
+    const listing = extractFieldsFromText(card.containerEl.innerText, LISTING_LABELS);
+    return { ok: true, status: statusMatch[1].trim(), endDate: (listing["End Date:"] || "").trim() };
   }
 
   // Lists every <select> on the page with enough detail (id/name/class/

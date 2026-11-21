@@ -143,6 +143,13 @@ function toGemOfferItemLabel(title: string): string {
 
 interface Props {
   bids: GemBid[];
+  // All Bids tab: the bids are fetched server-side from these same filters, so
+  // the parent needs to hear about them, the dropdowns need their options from
+  // the server (nothing is loaded to derive them from) and the empty state
+  // needs its own message.
+  onFiltersChange?: (filters: Record<string, any>) => void;
+  dropdownOptionsOverride?: Record<string, string[]>;
+  emptyText?: string;
   currentUsername: string;
   // Patches the parent's full bids array directly (functional update) so a
   // move/delete/status-change reflects instantly - no full refetch, which
@@ -238,7 +245,7 @@ const MERGED_COLUMN_LABELS: Record<string, string> = {
 // bid" link Bid Link already is, so it reads as one family of document
 // links rather than being buried under Document Required's own text).
 const STACKED_GROUPS: Record<string, string[]> = {
-  bidLink: ["bidLink", "specificationDocumentUrl", "boqDetailDocumentUrl"],
+  bidLink: ["bidLink"],
   address: ["address", "departmentNameAndAddress", "consigneeCity"],
   bidToRaEnabled: ["bidToRaEnabled", "raQualificationRule"],
   evaluationMethod: ["evaluationMethod", "emdAmount"],
@@ -264,12 +271,19 @@ export default function GemBidTable({
   currentUsername,
   onBidsUpdated,
   onViewHistory,
+  onFiltersChange,
+  dropdownOptionsOverride,
+  emptyText,
   stickyTop = 0,
   bottomReserve = 0,
   allSectionsMode = false,
 }: Props) {
   const [filters, setFilters] = useState<Record<string, any>>({});
   const [sort, setSort] = useState<{ key: string; dir: "asc" | "desc" } | null>(null);
+  useEffect(() => {
+    onFiltersChange?.(filters);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [displayLimit, setDisplayLimit] = useState(50);
   const [busy, setBusy] = useState(false);
@@ -654,11 +668,44 @@ export default function GemBidTable({
       .catch((err) => console.error("Failed to load document types", err));
   }, [editingBid]);
 
-  const openEdit = (bid: GemBid) => {
+  // The list is slim (no documents text/links/etc.), so Edit Bid loads this one
+  // bid in full first - otherwise those fields would open blank and a save
+  // would overwrite them with "".
+  const openEdit = async (bid: GemBid) => {
+    let full: GemBid = bid;
+    try {
+      const res = await fetch(`/api/gem-bids?bidNo=${encodeURIComponent(bid.bidNo)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Could not load bid");
+      full = { ...bid, ...data };
+    } catch (err: any) {
+      alert(err.message || "Could not load the bid for editing");
+      return;
+    }
     const values: Record<string, string> = {};
-    EDITABLE_FIELD_KEYS.forEach((key) => (values[key] = String(bid[key] ?? "")));
+    EDITABLE_FIELD_KEYS.forEach((key) => (values[key] = String(full[key] ?? "")));
     setEditValues(values);
-    setEditingBid(bid);
+    setEditingBid(full);
+  };
+
+  // Opens the bid's GeM link, fetched only now (not with every list load).
+  // The tab is opened synchronously first so popup blockers allow it.
+  const openBidLink = async (bid: GemBid) => {
+    if (bid.bidLink) {
+      window.open(bid.bidLink, "_blank", "noopener,noreferrer");
+      return;
+    }
+    const w = window.open("", "_blank");
+    try {
+      const res = await fetch(`/api/gem-bids?bidNo=${encodeURIComponent(bid.bidNo)}&fields=bidLink`);
+      const data = await res.json();
+      if (!res.ok || !data?.bidLink) throw new Error(data?.error || "No link for this bid");
+      if (w) w.location.href = data.bidLink;
+      else window.open(data.bidLink, "_blank", "noopener,noreferrer");
+    } catch (err: any) {
+      w?.close();
+      alert(err.message || "Could not open the link");
+    }
   };
 
   const selectedDocTypes = new Set(
@@ -727,7 +774,10 @@ export default function GemBidTable({
   // section-specific reads each row's own currentSection instead of this
   // shared value - see effectiveSectionFor() below.
   const RAW_DATA_SECTIONS_SET = new Set<SectionKey>(RAW_DATA_SECTIONS);
-  const otherColumns = useMemo(() => BID_COLUMNS.filter((c) => c.key !== "bidNo" && !c.hiddenInTable), []);
+  // "Doc Required / ATC" isn't a column here any more: its text/links are heavy
+  // and live with the rest of a bid's documents in Bid Rate (Edit Bid still has
+  // the Document required field).
+  const otherColumns = useMemo(() => BID_COLUMNS.filter((c) => c.key !== "bidNo" && !c.hiddenInTable && c.key !== "documentRequiredFromSeller"), []);
 
   const effectiveSectionFor = (b: GemBid): SectionKey => (allSectionsMode ? b.currentSection : currentSectionKey);
   const showSectionCol = allSectionsMode;
@@ -743,6 +793,7 @@ export default function GemBidTable({
   const extraColCount = [showSectionCol, showBidStatusCol, showBidResultCol, showPartyCol].filter(Boolean).length;
 
   const dropdownOptions = useMemo(() => {
+    if (dropdownOptionsOverride) return dropdownOptionsOverride;
     const map: Record<string, string[]> = {};
     BID_COLUMNS.filter((c) => c.filterType === "dropdown").forEach((c) => {
       const vals = new Set<string>();
@@ -752,7 +803,7 @@ export default function GemBidTable({
       map[c.key] = [...vals].sort();
     });
     return map;
-  }, [bids]);
+  }, [bids, dropdownOptionsOverride]);
 
   // One guessInstituteForAddress pass per bid up front (keyed by bidNo),
   // not re-run per render per row - sellers rarely changes and bids can run
@@ -1444,7 +1495,7 @@ export default function GemBidTable({
             {visible.length === 0 ? (
               <tr>
                 <td colSpan={otherColumns.length + 4 + extraColCount} className="text-center py-10 text-slate-400 text-xs font-bold uppercase tracking-widest">
-                  No bids here
+                  {emptyText || "No bids here"}
                 </td>
               </tr>
             ) : (
@@ -1603,7 +1654,6 @@ export default function GemBidTable({
                         onChange={(ids) => quickUpdate(b.bidNo, "selectedPartyIds", ids)}
                       />
                       {b.lastModifiedBy && <span className="block text-[9px] text-slate-400 mt-0.5">by {b.lastModifiedBy}</span>}
-                      {renderDocLinks(b)}
                     </td>
                   )}
                   {otherColumns.map((col) => {
@@ -1623,6 +1673,21 @@ export default function GemBidTable({
                             </div>
                           )}
                           {group.map((fieldKey, i) => {
+                            // Bid Link isn't in the list payload any more: the link is
+                            // fetched only when it's clicked (hasBidLink just says one exists).
+                            if (fieldKey === "bidLink") {
+                              return (
+                                <div key={fieldKey}>
+                                  {b.hasBidLink || b.bidLink ? (
+                                    <button type="button" onClick={() => openBidLink(b)} className="text-blue-600 underline">
+                                      Link
+                                    </button>
+                                  ) : (
+                                    <span className="text-slate-400">—</span>
+                                  )}
+                                </div>
+                              );
+                            }
                             if (LINK_COLUMNS.has(fieldKey)) {
                               const prefix = STACKED_LINK_PREFIX[fieldKey];
                               return (
@@ -1662,9 +1727,11 @@ export default function GemBidTable({
                     // place every section (not just Bids to Fill/Submitted, which alone
                     // have a Party column) can see it.
                     if (col.key === "items") {
+                      // slim list carries counts (boqTotal/boqFilled), not the rates themselves
                       const boqRatesArr: any[] = Array.isArray(b.boqRates) ? b.boqRates : [];
-                      const totalRates = boqRatesArr.length;
-                      const filledRates = boqRatesArr.filter((r) => (parseFloat(r?.rate) || 0) > 0).length;
+                      const totalRates = typeof b.boqTotal === "number" ? b.boqTotal : boqRatesArr.length;
+                      const filledRates =
+                        typeof b.boqFilled === "number" ? b.boqFilled : boqRatesArr.filter((r) => (parseFloat(r?.rate) || 0) > 0).length;
                       const pendingRates = totalRates - filledRates;
                       return (
                         <td key={col.key} className="py-2 px-2 max-w-[200px]">
@@ -1708,11 +1775,6 @@ export default function GemBidTable({
                     );
                   })}
                   <td className="py-2 px-2">
-                    {/* Sections with no Party column (New Bids, Fetched Bid
-                        Data, and All Bids mode) have nowhere else to show
-                        BOQ Rates/Specifications - the Party cell above
-                        already covers Bids to Fill/Submitted Bids. */}
-                    {!showPartyCol && renderDocLinks(b)}
                     <div className="flex items-center gap-1">
                       {EDITABLE_SECTIONS.has(effectiveSectionFor(b)) && (
                         <button
@@ -2055,7 +2117,7 @@ function PartySelect({
               key={c._id}
               className="flex items-center gap-0.5 bg-blue-50 border border-blue-200 text-blue-700 rounded-full pl-1.5 pr-0.5 py-0.5 text-[9px] font-bold max-w-full"
             >
-              <span className="truncate">{c.firmName}</span>
+              <span className="truncate" title={c.firmName}>{c.firmCode || c.firmName}</span>
               <button
                 type="button"
                 disabled={disabled}

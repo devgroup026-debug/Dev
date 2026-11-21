@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { ObjectId } from "mongodb";
 import clientPromise from "@/lib/mongodb";
+import { syncFirmRates } from "@/lib/gemBids/firmRates";
 
 const DB_NAME = "dev_oms_db";
 
@@ -33,7 +34,13 @@ export async function POST(req: Request) {
     const db = client.db(DB_NAME);
     await db.collection("gem_bids").updateOne({ _id: new ObjectId(bidId) }, { $set: { boqVariantPartyPercents: clean } });
 
-    return NextResponse.json({ success: true });
+    // Save each assigned firm's own final rates (L1 + its variant %) under its
+    // name. `items` (the Rate column as currently on screen) is optional - when
+    // sent, it wins over the last saved boqRates so an unsaved edit isn't missed.
+    const items = Array.isArray(body.items) ? body.items : undefined;
+    const firmRatesSaved = await syncFirmRates(db, { _id: new ObjectId(bidId) }, { percents: clean, items });
+
+    return NextResponse.json({ success: true, firmRatesSaved });
   } catch (error: any) {
     console.error("GeM bid variant-percents save error:", error);
     return NextResponse.json({ error: error.message || "Failed to save variant percents" }, { status: 500 });
