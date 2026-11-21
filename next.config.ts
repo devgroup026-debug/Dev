@@ -33,6 +33,10 @@ const nextConfig: NextConfig = {
     // worker failure mode - this route is what app/layout.tsx's self-
     // throttled site-visit job actually calls.
     "/api/gem-bids/auto-doc-links": ["./node_modules/pdfjs-dist/legacy/build/**"],
+    // Courier booking-register PDF parsing (lib/courier/parseAndMatch.ts,
+    // extractCourierPdfText) - manual upload + Gmail auto-run.
+    "/api/courier/upload-pdf": ["./node_modules/pdfjs-dist/legacy/build/**"],
+    "/api/courier/auto": ["./node_modules/pdfjs-dist/legacy/build/**"],
   },
 };
 

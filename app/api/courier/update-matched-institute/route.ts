@@ -29,12 +29,37 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: `No courier run found for date=${date}.` }, { status: 404 });
     }
 
+    const newWhatsappNumber = (seller.whatsappNumber || "").trim();
+
     const parcel = (log.matched || []).find((m: any) => m.docketNo === docketNo);
     if (!parcel) {
-      return NextResponse.json({ error: `No matched parcel with docketNo=${docketNo} in this run.` }, { status: 404 });
+      // Not matched yet - a "Needs Review" parcel staff have now assigned by
+      // hand: move it into matched[] so it can be WhatsApp'd like any other.
+      const reviewIdx = (log.needsReview || []).findIndex((r: any) => r.docketNo === docketNo);
+      if (reviewIdx === -1) {
+        return NextResponse.json({ error: `No parcel with docketNo=${docketNo} in this run.` }, { status: 404 });
+      }
+      const review: any = log.needsReview![reviewIdx];
+      const moved = {
+        docketNo,
+        instituteName: seller.instituteName,
+        sellerId: String(seller._id),
+        city: review.parsedCity || "",
+        receiverName: review.parsedReceiverName || "",
+        firmName: "",
+        buyerName: seller.buyerName || undefined,
+        score: 1, // manually confirmed
+        whatsappNumber: newWhatsappNumber || undefined,
+        whatsappStatus: newWhatsappNumber ? "NOT_SENT" : "NO_NUMBER",
+        emailDate: review.emailDate,
+      };
+      log.needsReview!.splice(reviewIdx, 1);
+      log.matched = [...(log.matched || []), moved as any];
+      log.matchedCount = log.matched.length;
+      log.needsReviewCount = log.needsReview!.length;
+      await log.save();
+      return NextResponse.json({ success: true, matched: moved });
     }
-
-    const newWhatsappNumber = (seller.whatsappNumber || "").trim();
 
     parcel.instituteName = seller.instituteName;
     parcel.sellerId = String(seller._id);

@@ -5,6 +5,7 @@ import Header from "@/components/Header";
 import GlobalAddItem from "@/components/GlobalAddItem";
 import GlobalTaskCreate from "@/components/GlobalTaskCreate";
 import Footer from "@/components/Footer";
+import WaExtensionSync from "@/components/WaExtensionSync";
 // DISABLED (Urgent Tasks): import UrgentTaskPopup from "@/components/UrgentTaskPopup";
 import { getPageTitle } from "@/lib/pageTitles";
 import "./globals.css";
@@ -112,6 +113,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             {/* DISABLED (Urgent Tasks) - uncomment to re-enable: <UrgentTaskPopup /> */}
             <GlobalTaskCreate />
             <GlobalAddItem />
+            {/* Writes DEV WA Bulk Sender extension send results back to the DB */}
+            <WaExtensionSync />
           </div>
         ) : (
           <main className="h-full">{children}</main>

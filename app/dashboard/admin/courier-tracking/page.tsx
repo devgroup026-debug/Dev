@@ -1,10 +1,164 @@
 "use client";
-import { useEffect, useState } from "react";
-import { FiTruck, FiCheckCircle, FiAlertTriangle, FiRefreshCw, FiPackage, FiSend, FiEdit2 } from "react-icons/fi";
+import { useEffect, useRef, useState } from "react";
+import { FiTruck, FiCheckCircle, FiAlertTriangle, FiRefreshCw, FiPackage, FiSend, FiEdit2, FiUpload } from "react-icons/fi";
+import {
+  buildCourierMessage,
+  enqueueWa,
+  pingWaExtension,
+  WA_EXTENSION_MISSING_MSG,
+  WA_RESULTS_SYNCED_EVENT,
+  type WaEnqueueResponse,
+} from "@/lib/waExtension";
+
+/** Human summary of what the extension did with a batch. */
+function describeEnqueue(r: WaEnqueueResponse, noun: string): string {
+  let msg = `${r.queued ?? 0} ${noun} DEV WA Bulk Sender me queue ho gaye - WhatsApp Web tab ek-ek karke bhejega.`;
+  if (r.duplicates) msg += ` ${r.duplicates} pehle se queue me the (skip).`;
+  if (r.rejected) msg += ` ${r.rejected} ka number invalid tha.`;
+  if (r.warning) msg += ` Note: ${r.warning}`;
+  return msg;
+}
+
+interface SellerOption {
+  _id: string;
+  instituteName: string;
+  place?: string;
+}
+
+/**
+ * Type-to-search institute picker (replaces a plain <select> with hundreds of
+ * sellers). The list is position:fixed so the table's overflow-x-auto
+ * wrapper can't clip it. Enter picks the highlighted row, Esc / click
+ * outside cancels.
+ */
+function InstituteSearchSelect({
+  options,
+  disabled,
+  placeholder = "Institute / city search karo...",
+  onSelect,
+  onCancel,
+}: {
+  options: SellerOption[];
+  disabled?: boolean;
+  placeholder?: string;
+  onSelect: (id: string) => void;
+  onCancel: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const [pos, setPos] = useState<{ left: number; top: number; width: number; maxHeight: number } | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+
+  const filtered = (() => {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return options.slice(0, 100);
+    return options
+      .filter((o) => {
+        const hay = `${o.instituteName} ${o.place || ""}`.toLowerCase();
+        return words.every((w) => hay.includes(w));
+      })
+      .slice(0, 100);
+  })();
+
+  const place = () => {
+    const r = inputRef.current?.getBoundingClientRect();
+    if (!r) return;
+    const below = window.innerHeight - r.bottom - 8;
+    const above = r.top - 8;
+    const openUp = below < 200 && above > below;
+    const maxHeight = Math.min(280, openUp ? above : below);
+    setPos({ left: r.left, width: Math.max(r.width, 300), maxHeight, top: openUp ? r.top - maxHeight - 4 : r.bottom + 4 });
+  };
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    place();
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (!wrapRef.current?.contains(t) && !listRef.current?.contains(t)) onCancel();
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => setActive(0), [query]);
+
+  useEffect(() => {
+    listRef.current?.querySelector<HTMLElement>(`[data-idx="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((a) => Math.min(a + 1, filtered.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((a) => Math.max(a - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (filtered[active]) onSelect(filtered[active]._id);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onCancel();
+    }
+  };
+
+  return (
+    <div ref={wrapRef} className="relative inline-block w-[240px]">
+      <input
+        ref={inputRef}
+        type="text"
+        value={query}
+        disabled={disabled}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={onKeyDown}
+        placeholder={placeholder}
+        className="w-full text-xs font-semibold border border-blue-400 rounded-lg px-2 py-1 bg-white outline-none focus:ring-2 focus:ring-blue-200"
+      />
+      {pos && (
+        <ul
+          ref={listRef}
+          style={{ position: "fixed", left: pos.left, top: pos.top, width: pos.width, maxHeight: pos.maxHeight }}
+          className="z-50 overflow-y-auto bg-white border border-slate-200 rounded-lg shadow-xl py-1 text-xs"
+        >
+          {filtered.length === 0 ? (
+            <li className="px-3 py-2 text-slate-400 font-semibold">Koi institute nahi mila</li>
+          ) : (
+            filtered.map((o, i) => (
+              <li
+                key={o._id}
+                data-idx={i}
+                onMouseEnter={() => setActive(i)}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  onSelect(o._id);
+                }}
+                className={`px-3 py-1.5 cursor-pointer ${i === active ? "bg-blue-50 text-blue-800" : "text-slate-700"}`}
+              >
+                <span className="font-bold">{o.instituteName}</span>
+                {o.place && <span className="text-slate-400"> ({o.place})</span>}
+              </li>
+            ))
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 interface MatchedParcel {
   docketNo: string;
   instituteName: string;
+  buyerName?: string;
   city: string;
   receiverName: string;
   score: number;
@@ -65,27 +219,31 @@ export default function CourierTrackingPage() {
   });
   const [selectedDockets, setSelectedDockets] = useState<Set<string>>(new Set());
   const [sending, setSending] = useState(false);
-  const [sellers, setSellers] = useState<{ _id: string; instituteName: string; place?: string }[]>([]);
+  const [sellers, setSellers] = useState<SellerOption[]>([]);
   const [dcWhatsappRecords, setDcWhatsappRecords] = useState<DcWhatsappRecord[]>([]);
-  const [bridgeStatus, setBridgeStatus] = useState<{ status: string; qrDataUrl: string | null; updatedAt: string | null }>({
-    status: "UNKNOWN",
-    qrDataUrl: null,
-    updatedAt: null,
-  });
+  // undefined = still checking, null = extension not found, string = version
+  const [extVersion, setExtVersion] = useState<string | null | undefined>(undefined);
+  const [resendingDcId, setResendingDcId] = useState<string | null>(null);
   const [editingDocket, setEditingDocket] = useState<string | null>(null);
   const [savingInstitute, setSavingInstitute] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  // Which "Needs Review" row is having its institute picked by hand
+  const [assigningDocket, setAssigningDocket] = useState<string | null>(null);
 
   const [autoStatus, setAutoStatus] = useState<{
     todayRunCompleted: boolean;
     todayLog: CourierRunLog | null;
     history: CourierRunLog[];
     gmailConfigured: boolean;
+    gmailDisabled: boolean;
     courierSenderConfigured: boolean;
   }>({
     todayRunCompleted: false,
     todayLog: null,
     history: [],
     gmailConfigured: false,
+    gmailDisabled: false,
     courierSenderConfigured: false,
   });
 
@@ -99,11 +257,40 @@ export default function CourierTrackingPage() {
           todayLog: data.todayLog,
           history: data.history || [],
           gmailConfigured: data.gmailConfigured,
+          gmailDisabled: !!data.gmailDisabled,
           courierSenderConfigured: data.courierSenderConfigured,
         });
       }
     } catch (e) {
       console.error("Failed to fetch courier run status", e);
+    }
+  };
+
+  // Manual alternative to the Gmail fetch: upload the courier's
+  // booking-register PDF(s); parcels are parsed, matched and merged into
+  // today's list below.
+  const handleUploadPdfs = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0 || uploading) return;
+    setUploading(true);
+    setStatus({ type: null, message: "" });
+    try {
+      const form = new FormData();
+      Array.from(fileList).forEach((f) => form.append("files", f));
+      const res = await fetch("/api/courier/upload-pdf", { method: "POST", body: form });
+      const data = await res.json().catch(() => ({}));
+      const fileProblems = (data.files || [])
+        .filter((f: any) => f.error)
+        .map((f: any) => `${f.name}: ${f.error}`)
+        .join(" | ");
+      if (!res.ok) throw new Error((data.error || "PDF upload failed") + (fileProblems ? ` (${fileProblems})` : ""));
+      setStatus({ type: "success", message: data.message + (fileProblems ? ` | ${fileProblems}` : "") });
+      setSelectedDockets(new Set());
+      await fetchStatus();
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message });
+    } finally {
+      setUploading(false);
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
     }
   };
 
@@ -117,23 +304,25 @@ export default function CourierTrackingPage() {
     }
   };
 
-  const fetchBridgeStatus = async () => {
-    try {
-      const res = await fetch("/api/whatsapp-bridge/status");
-      const data = await res.json();
-      if (res.ok) setBridgeStatus({ status: data.status, qrDataUrl: data.qrDataUrl, updatedAt: data.updatedAt });
-    } catch (e) {
-      console.error("Failed to fetch WhatsApp bridge status", e);
-    }
-  };
-
-  // Polled every 10s while this page is open - a QR code expires after a
-  // short while and whatsapp-web.js issues a fresh one automatically, so the
-  // image shown here needs to keep itself current without a manual refresh.
+  // WhatsApp sending goes through the DEV WA Bulk Sender Chrome extension
+  // (the user's own WhatsApp Web tab) - re-check every 15s so the badge
+  // updates if the extension gets enabled/reloaded while this page is open.
   useEffect(() => {
-    fetchBridgeStatus();
-    const interval = setInterval(fetchBridgeStatus, 10000);
+    const check = async () => setExtVersion(await pingWaExtension());
+    check();
+    const interval = setInterval(check, 15000);
     return () => clearInterval(interval);
+  }, []);
+
+  // WaExtensionSync (root layout) fires this after writing Sent/Failed
+  // results to the DB - refetch so status pills update live.
+  useEffect(() => {
+    const onSynced = () => {
+      fetchStatus();
+      fetchDcWhatsappStatus();
+    };
+    window.addEventListener(WA_RESULTS_SYNCED_EVENT, onSynced);
+    return () => window.removeEventListener(WA_RESULTS_SYNCED_EVENT, onSynced);
   }, []);
 
   useEffect(() => {
@@ -178,11 +367,15 @@ export default function CourierTrackingPage() {
 
   const todayLog = autoStatus.todayLog;
 
-  // Only NOT_SENT/FAILED parcels can be selected - PENDING is already
-  // queued (waiting on the bridge), SENT is done, NO_NUMBER has nothing to
-  // send to.
+  // NOT_SENT/FAILED/PENDING parcels can be selected. PENDING stays
+  // selectable so anything stuck "Queued" (e.g. from the old bridge, or an
+  // extension queue that got cleared) can be pushed again - the extension
+  // itself skips a parcel that's still waiting in its queue, so this can't
+  // double-send. SENT is done, NO_NUMBER has nothing to send to.
+  const isSelectable = (s?: MatchedParcel["whatsappStatus"]) =>
+    s === "NOT_SENT" || s === "FAILED" || s === "PENDING";
   const selectableDockets = (todayLog?.matched || [])
-    .filter((m) => m.whatsappStatus === "NOT_SENT" || m.whatsappStatus === "FAILED")
+    .filter((m) => isSelectable(m.whatsappStatus))
     .map((m) => m.docketNo);
 
   const toggleDocket = (docketNo: string) => {
@@ -205,22 +398,42 @@ export default function CourierTrackingPage() {
     setSending(true);
     setStatus({ type: null, message: "" });
     try {
+      const version = await pingWaExtension();
+      setExtVersion(version);
+      if (!version) throw new Error(WA_EXTENSION_MISSING_MSG);
+
+      const parcels = (todayLog.matched || []).filter(
+        (m) => selectedDockets.has(m.docketNo) && m.whatsappNumber
+      );
+      if (parcels.length === 0) throw new Error("Selected parcels me koi WhatsApp number nahi hai.");
+
+      // 1) Hand the messages to the extension first - if that fails nothing
+      //    gets marked Queued in the DB.
+      const r = await enqueueWa(
+        parcels.map((m) => ({
+          phone: m.whatsappNumber!,
+          name: m.instituteName,
+          msg: buildCourierMessage(m),
+          ref: `courier|${todayLog.date}|${m.docketNo}`,
+        }))
+      );
+      if (!r.ok) throw new Error(r.error || "Extension ne queue nahi kiya");
+
+      // 2) Mark them Queued (PENDING) in the DB; Sent/Failed arrives later
+      //    via WaExtensionSync.
       const res = await fetch("/api/courier/queue-whatsapp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ date: todayLog.date, docketNos: [...selectedDockets] }),
+        body: JSON.stringify({ date: todayLog.date, docketNos: parcels.map((m) => m.docketNo) }),
       });
-      const data = await res.json();
-      if (res.ok) {
-        setStatus({
-          type: "success",
-          message: `Queued ${selectedDockets.size} WhatsApp message(s) - the bridge will send them shortly.`,
-        });
-        setSelectedDockets(new Set());
-        await fetchStatus();
-      } else {
-        throw new Error(data.error || "Failed to queue WhatsApp sends");
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        console.error("queue-whatsapp status update failed", data);
       }
+
+      setStatus({ type: "success", message: describeEnqueue(r, "message(s)") });
+      setSelectedDockets(new Set());
+      await fetchStatus();
     } catch (err: any) {
       setStatus({ type: "error", message: err.message });
     } finally {
@@ -231,6 +444,7 @@ export default function CourierTrackingPage() {
   const handleInstituteChange = async (docketNo: string, sellerId: string) => {
     if (!sellerId || !todayLog) {
       setEditingDocket(null);
+      setAssigningDocket(null);
       return;
     }
     setSavingInstitute(true);
@@ -245,6 +459,7 @@ export default function CourierTrackingPage() {
       if (res.ok) {
         setStatus({ type: "success", message: "Institute corrected." });
         setEditingDocket(null);
+        setAssigningDocket(null);
         await fetchStatus();
       } else {
         throw new Error(data.error || "Failed to update institute");
@@ -253,6 +468,43 @@ export default function CourierTrackingPage() {
       setStatus({ type: "error", message: err.message });
     } finally {
       setSavingInstitute(false);
+    }
+  };
+
+  // Re-send one Delivery Challan row (stuck Queued from the old bridge, or
+  // Failed) through the extension, using the PDF stored with the record.
+  const handleResendDc = async (id: string) => {
+    if (resendingDcId) return;
+    setResendingDcId(id);
+    setStatus({ type: null, message: "" });
+    try {
+      const version = await pingWaExtension();
+      setExtVersion(version);
+      if (!version) throw new Error(WA_EXTENSION_MISSING_MSG);
+
+      const res = await fetch(`/api/delivery-challan/whatsapp-pdf?id=${encodeURIComponent(id)}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "PDF load nahi hua");
+      const rec = data.record;
+      if (!rec.pdfBase64) {
+        throw new Error("Is record ki PDF saved nahi hai - Orders page se 'Send DC WhatsApp' dobara dabao.");
+      }
+
+      const r = await enqueueWa([
+        {
+          phone: rec.whatsappNumber,
+          name: rec.instituteName,
+          msg: `Delivery Challan - ${rec.instituteName}\nOrder(s): ${(rec.orderNos || []).join(", ")}`,
+          files: [{ name: rec.fileName, type: "application/pdf", dataUrl: `data:application/pdf;base64,${rec.pdfBase64}` }],
+          ref: `dc|${rec._id}`,
+        },
+      ]);
+      if (!r.ok) throw new Error(r.error || "Extension ne queue nahi kiya");
+      setStatus({ type: "success", message: describeEnqueue(r, "Delivery Challan") });
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message });
+    } finally {
+      setResendingDcId(null);
     }
   };
 
@@ -278,12 +530,18 @@ export default function CourierTrackingPage() {
             <div className="flex items-center gap-2 flex-wrap justify-end">
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
-                  autoStatus.gmailConfigured
+                  autoStatus.gmailDisabled
+                    ? "bg-slate-100 text-slate-600 border border-slate-300"
+                    : autoStatus.gmailConfigured
                     ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
                     : "bg-amber-100 text-amber-800 border border-amber-300"
                 }`}
               >
-                {autoStatus.gmailConfigured ? "Gmail Connected" : "Gmail Setup Pending"}
+                {autoStatus.gmailDisabled
+                  ? "Gmail Off - PDF Upload"
+                  : autoStatus.gmailConfigured
+                  ? "Gmail Connected"
+                  : "Gmail Setup Pending"}
               </span>
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
@@ -296,38 +554,34 @@ export default function CourierTrackingPage() {
               </span>
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold ${
-                  bridgeStatus.status === "CONNECTED"
+                  extVersion
                     ? "bg-emerald-100 text-emerald-800 border border-emerald-300"
-                    : "bg-red-100 text-red-800 border border-red-300"
+                    : extVersion === null
+                    ? "bg-red-100 text-red-800 border border-red-300"
+                    : "bg-slate-100 text-slate-600 border border-slate-300"
                 }`}
               >
-                {bridgeStatus.status === "CONNECTED"
-                  ? "WhatsApp Bridge Connected"
-                  : bridgeStatus.status === "NEEDS_QR"
-                  ? "WhatsApp Login Needed"
-                  : bridgeStatus.status === "DISCONNECTED"
-                  ? "WhatsApp Disconnected"
-                  : "WhatsApp Status Unknown"}
+                {extVersion
+                  ? `WA Extension v${extVersion} Ready`
+                  : extVersion === null
+                  ? "WA Extension Not Found"
+                  : "Checking WA Extension..."}
               </span>
             </div>
           </div>
 
-          {/* WhatsApp re-login needed - scan right here, no PC/terminal access required */}
-          {(bridgeStatus.status === "NEEDS_QR" || bridgeStatus.status === "DISCONNECTED") && (
-            <div className="bg-red-50 border border-red-200 rounded-2xl p-6 flex flex-col sm:flex-row items-center gap-6">
-              <FiAlertTriangle size={28} className="text-red-600 shrink-0" />
-              <div className="flex-1">
-                <h3 className="text-sm font-black text-red-800 uppercase mb-1">WhatsApp session logged out</h3>
-                <p className="text-xs text-red-700 font-bold">
-                  Courier tracking aur Delivery Challan WhatsApp bhejna ruk gaya hai - dobara login karna hoga.
-                  {bridgeStatus.status === "NEEDS_QR"
-                    ? " Neeche diye QR code ko apne phone se WhatsApp → Settings → Linked Devices → Link a Device se scan karo."
-                    : " Login QR thodi der me yahan apne aap aa jayega - agar 30 second me nahi aaya, page refresh karo."}
+          {extVersion === null && (
+            <div className="bg-red-50 border border-red-200 rounded-2xl p-6 flex items-start gap-4">
+              <FiAlertTriangle size={24} className="text-red-600 shrink-0" />
+              <div>
+                <h3 className="text-sm font-black text-red-800 uppercase mb-1">DEV WA Bulk Sender extension nahi mila</h3>
+                <p className="text-xs text-red-700 font-bold leading-relaxed">
+                  WhatsApp message ab is Chrome extension se jaate hain. Chrome me <code>chrome://extensions</code> kholo →
+                  Developer mode ON → <b>Load unpacked</b> → <code>browser-extension\DEV-WA-Bulk-Sender</code> folder
+                  select karo (pehle se laga hai to <b>Reload</b> dabao). Phir yeh page refresh karo aur ek tab me
+                  web.whatsapp.com login rakho.
                 </p>
               </div>
-              {bridgeStatus.qrDataUrl && (
-                <img src={bridgeStatus.qrDataUrl} alt="WhatsApp login QR code" className="w-44 h-44 rounded-xl border border-red-200 bg-white p-2 shrink-0" />
-              )}
             </div>
           )}
 
@@ -359,8 +613,9 @@ export default function CourierTrackingPage() {
                 received since the last successful fetch (so a courier mail that arrives late or after a missed
                 day still gets picked up), parses each parcel, and matches it to an institute by receiver name +
                 city. Each entry shows the date of its own courier email. WhatsApp sending is always manual -
-                select the parcels you want to notify below and press &quot;Send WhatsApp&quot;; nothing gets
-                messaged on its own.
+                select the parcels you want to notify below and press &quot;Send WhatsApp&quot;; the selected
+                messages are handed to the DEV WA Bulk Sender extension, which sends them one by one from your
+                logged-in WhatsApp Web tab. Nothing gets messaged on its own.
               </p>
 
               <div className="bg-slate-50 rounded-xl p-3.5 border border-slate-100 mb-6 space-y-2 text-xs">
@@ -393,24 +648,55 @@ export default function CourierTrackingPage() {
               </div>
             </div>
 
-            <button
-              type="button"
-              disabled={runLoading}
-              onClick={handleRunNow}
-              className="w-full flex items-center justify-center gap-2 bg-orange-600 text-white font-black uppercase text-xs tracking-wider py-3.5 rounded-xl transition-all hover:bg-orange-700 active:scale-[0.98] disabled:opacity-40"
-            >
-              {runLoading ? (
-                <>
-                  <FiRefreshCw size={14} className="animate-spin" />
-                  <span>Running...</span>
-                </>
-              ) : (
-                <>
-                  <FiPackage size={16} />
-                  <span>Run Now</span>
-                </>
+            <input
+              ref={uploadInputRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              multiple
+              className="hidden"
+              onChange={(e) => handleUploadPdfs(e.target.files)}
+            />
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button
+                type="button"
+                disabled={uploading}
+                onClick={() => uploadInputRef.current?.click()}
+                className="flex-1 flex items-center justify-center gap-2 bg-blue-600 text-white font-black uppercase text-xs tracking-wider py-3.5 rounded-xl transition-all hover:bg-blue-700 active:scale-[0.98] disabled:opacity-40"
+                title="Courier ki booking register PDF (MOHIT ENTERPRISE / Shree Mahavir) upload karo"
+              >
+                {uploading ? (
+                  <>
+                    <FiRefreshCw size={14} className="animate-spin" />
+                    <span>Reading PDF...</span>
+                  </>
+                ) : (
+                  <>
+                    <FiUpload size={16} />
+                    <span>Upload Courier PDF</span>
+                  </>
+                )}
+              </button>
+              {!autoStatus.gmailDisabled && (
+                <button
+                  type="button"
+                  disabled={runLoading}
+                  onClick={handleRunNow}
+                  className="flex-1 flex items-center justify-center gap-2 bg-orange-600 text-white font-black uppercase text-xs tracking-wider py-3.5 rounded-xl transition-all hover:bg-orange-700 active:scale-[0.98] disabled:opacity-40"
+                >
+                  {runLoading ? (
+                    <>
+                      <FiRefreshCw size={14} className="animate-spin" />
+                      <span>Running...</span>
+                    </>
+                  ) : (
+                    <>
+                      <FiPackage size={16} />
+                      <span>Run Now (Gmail)</span>
+                    </>
+                  )}
+                </button>
               )}
-            </button>
+            </div>
           </div>
 
           {/* Matched */}
@@ -456,7 +742,7 @@ export default function CourierTrackingPage() {
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {todayLog.matched.map((m) => {
-                      const selectable = m.whatsappStatus === "NOT_SENT" || m.whatsappStatus === "FAILED";
+                      const selectable = isSelectable(m.whatsappStatus);
                       return (
                         <tr key={m.docketNo}>
                           <td className="py-2 pr-3">
@@ -472,24 +758,12 @@ export default function CourierTrackingPage() {
                           <td className="py-2 pr-4 font-mono">{m.docketNo}</td>
                           <td className="py-2 pr-4 font-bold text-slate-800">
                             {editingDocket === m.docketNo ? (
-                              <select
-                                autoFocus
-                                defaultValue=""
+                              <InstituteSearchSelect
+                                options={sellers}
                                 disabled={savingInstitute}
-                                onChange={(e) => handleInstituteChange(m.docketNo, e.target.value)}
-                                onBlur={() => setEditingDocket(null)}
-                                className="text-xs font-semibold border border-slate-300 rounded-lg px-2 py-1 max-w-[220px] bg-white"
-                              >
-                                <option value="" disabled>
-                                  -- Select correct institute --
-                                </option>
-                                {sellers.map((s) => (
-                                  <option key={s._id} value={s._id}>
-                                    {s.instituteName}
-                                    {s.place ? ` (${s.place})` : ""}
-                                  </option>
-                                ))}
-                              </select>
+                                onSelect={(id) => handleInstituteChange(m.docketNo, id)}
+                                onCancel={() => setEditingDocket(null)}
+                              />
                             ) : (
                               <span className="inline-flex items-center gap-1.5">
                                 {m.instituteName}
@@ -555,7 +829,8 @@ export default function CourierTrackingPage() {
                       <th className="pb-2 pr-4">Parsed Receiver</th>
                       <th className="pb-2 pr-4">Best Guess</th>
                       <th className="pb-2 pr-4">Score</th>
-                      <th className="pb-2">Reason</th>
+                      <th className="pb-2 pr-4">Reason</th>
+                      <th className="pb-2">Assign</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -567,7 +842,26 @@ export default function CourierTrackingPage() {
                         <td className="py-2 pr-4 text-slate-500">{r.parsedReceiverName}</td>
                         <td className="py-2 pr-4 text-slate-700">{r.bestGuessInstituteName || "-"}</td>
                         <td className="py-2 pr-4 text-amber-700 font-mono">{r.score.toFixed(2)}</td>
-                        <td className="py-2 text-slate-500">{r.reason}</td>
+                        <td className="py-2 pr-4 text-slate-500">{r.reason}</td>
+                        <td className="py-2">
+                          {assigningDocket === r.docketNo ? (
+                            <InstituteSearchSelect
+                              options={sellers}
+                              disabled={savingInstitute}
+                              onSelect={(id) => handleInstituteChange(r.docketNo, id)}
+                              onCancel={() => setAssigningDocket(null)}
+                            />
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setAssigningDocket(r.docketNo)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase bg-amber-100 text-amber-800 hover:bg-amber-200"
+                              title="Sahi institute chuno - parcel Matched list me chala jayega"
+                            >
+                              <FiEdit2 size={10} /> Assign
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -612,7 +906,8 @@ export default function CourierTrackingPage() {
                       <th className="pb-2 pr-4">Order No(s)</th>
                       <th className="pb-2 pr-4">WhatsApp No.</th>
                       <th className="pb-2 pr-4">Requested By</th>
-                      <th className="pb-2">Status</th>
+                      <th className="pb-2 pr-4">Status</th>
+                      <th className="pb-2"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
@@ -625,7 +920,7 @@ export default function CourierTrackingPage() {
                         <td className="py-2 pr-4 text-slate-500">{(r.orderNos || []).join(", ")}</td>
                         <td className="py-2 pr-4 text-slate-500 font-mono">{r.whatsappNumber}</td>
                         <td className="py-2 pr-4 text-slate-500">{r.requestedBy || "-"}</td>
-                        <td className="py-2">
+                        <td className="py-2 pr-4">
                           <span
                             className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
                               r.status === "SENT"
@@ -638,6 +933,20 @@ export default function CourierTrackingPage() {
                           >
                             {r.status === "PENDING" ? "Queued" : r.status === "SENT" ? "Sent" : "Failed"}
                           </span>
+                        </td>
+                        <td className="py-2 text-right">
+                          {r.status !== "SENT" && (
+                            <button
+                              type="button"
+                              disabled={!!resendingDcId}
+                              onClick={() => handleResendDc(r._id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-[10px] font-black uppercase bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-40"
+                              title="DEV WA Bulk Sender extension se bhejo"
+                            >
+                              {resendingDcId === r._id ? <FiRefreshCw size={10} className="animate-spin" /> : <FiSend size={10} />}
+                              Send
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ))}

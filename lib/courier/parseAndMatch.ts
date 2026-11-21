@@ -32,6 +32,8 @@ export interface ParsedParcel {
   receiverFullText: string;
   firmName: string;
   rawLine: string;
+  /** YYYY-MM-DD from the register's own "Date : dd/mm/yyyy" section header, if present. */
+  bookingDate?: string;
 }
 
 export interface SellerForCourierMatch {
@@ -112,10 +114,20 @@ export function parseCourierPdfText(text: string, firmNames: string[]): ParsedPa
     .sort((a, b) => b.norm.length - a.norm.length); // longest first, avoids a short firm name matching inside a longer one
 
   const parcels: ParsedParcel[] = [];
+  // The register groups rows under "Date : 20/11/2026" headers - remember
+  // the latest one so each parcel knows its own booking date.
+  let bookingDate: string | undefined;
 
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line) continue;
+
+    const dateHeader = /^Date\s*:\s*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/i.exec(line);
+    if (dateHeader) {
+      const [, d, m, y] = dateHeader;
+      bookingDate = `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+      continue;
+    }
 
     const docketMatch = DOCKET_RE.exec(line);
     if (!docketMatch) continue;
@@ -146,7 +158,7 @@ export function parseCourierPdfText(text: string, firmNames: string[]): ParsedPa
 
     if (!city && !receiverFullText) continue;
 
-    parcels.push({ docketNo, city, receiverFirstName, receiverFullText, firmName: firmMatch.raw, rawLine: line });
+    parcels.push({ docketNo, city, receiverFirstName, receiverFullText, firmName: firmMatch.raw, rawLine: line, bookingDate });
   }
 
   return parcels;
@@ -232,10 +244,11 @@ function toDateOnly(d: Date): string {
   return d.toISOString().split("T")[0];
 }
 
-/** Fetch + parse + match, tied together. No WhatsApp send here (deferred). */
-export async function processNewCourierParcels(db: any): Promise<ProcessResult> {
-  const { fetchNewCourierPdfsSince } = await import("./gmailFetch");
-
+/**
+ * PDF bytes -> plain text. Shared by the Gmail auto-run and the manual
+ * "Upload Courier PDF" route.
+ */
+export async function extractCourierPdfText(buffer: Buffer | Uint8Array): Promise<string> {
   // Some courier PDFs (Type3-font glyph paths, pattern fills) make
   // pdfjs-dist reach for the browser-only DOMMatrix class even during plain
   // text extraction, which throws "DOMMatrix is not defined" outside a
@@ -246,43 +259,192 @@ export async function processNewCourierParcels(db: any): Promise<ProcessResult> 
   // if globalThis.DOMMatrix isn't already set; it never re-checks later.
   // @napi-rs/canvas's platform-specific prebuilt binary loads fine on this
   // Windows dev machine but fails on Vercel's Linux serverless runtime, so
-  // this MUST install before "pdf-parse" (and therefore pdfjs-dist) is even
+  // this MUST install before pdfjs-dist is even
   // imported below - installing it after, like the first attempt at this
   // fix did, is too late: pdfjs-dist's own (failing, on Vercel) attempt has
   // already run and given up by then. See domMatrixPolyfill.ts for why.
   const { installDOMMatrixPolyfillIfMissing } = await import("./domMatrixPolyfill");
   installDOMMatrixPolyfillIfMissing();
 
-  // pdf-parse v2 is a class-based API (PDFParse), not the old v1
-  // require("pdf-parse")(buffer) function-call style. It's built on
-  // pdfjs-dist, which normally resolves its worker script (pdf.worker.mjs)
-  // relative to its own package location - a lookup that breaks once
-  // Next.js/Turbopack bundles this into .next's chunk output (the worker
-  // file doesn't get copied to the expected relative path). Pointing
-  // GlobalWorkerOptions.workerSrc at the real on-disk file in node_modules
-  // sidesteps the bundler entirely.
-  const { PDFParse } = await import("pdf-parse");
-  const path = await import("path");
-  const { pathToFileURL } = await import("url");
-  PDFParse.setWorker(pathToFileURL(path.join(process.cwd(), "node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs")).href);
+  // Uses the app's own top-level pdfjs-dist directly (same as
+  // documentMaker/*Engine.ts and serverExternalPackages in next.config.ts),
+  // NOT pdf-parse. pdf-parse pins an older pdfjs-dist copy, and pdfjs keeps
+  // its in-process "fake worker" on a process-wide global
+  // (globalThis.pdfjsWorker): once any other feature (e.g. the GeM
+  // auto-doc-links job) has loaded the newer worker, pdf-parse's older API
+  // picks it up and fails with 'The API version "5.x" does not match the
+  // Worker version "6.x"'. One pdfjs version for everything avoids that.
+  const pdfjsLib: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
+
+  // pdfjs rejects a Node Buffer (checks the exact constructor) - wrap as a
+  // plain Uint8Array view over the same bytes.
+  const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const loadingTask = pdfjsLib.getDocument({ data, useSystemFonts: true });
+
+  // Rebuild visual lines: text items sharing (roughly) the same baseline y
+  // form one row, ordered left-to-right and tab-joined - the same shape
+  // parseCourierPdfText() expects ("<docket>\t<city>\t<firm>\t<receiver>").
+  const lines: string[] = [];
+  try {
+    const pdf = await loadingTask.promise;
+    for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+      const page = await pdf.getPage(pageNum);
+      try {
+        const content = await page.getTextContent();
+        const rows: { y: number; items: { x: number; s: string }[] }[] = [];
+        for (const item of content.items as any[]) {
+          const s = typeof item?.str === "string" ? item.str.trim() : "";
+          if (!s) continue;
+          const x = item.transform[4];
+          const y = item.transform[5];
+          let row = rows.find((r) => Math.abs(r.y - y) <= 3);
+          if (!row) {
+            row = { y, items: [] };
+            rows.push(row);
+          }
+          row.items.push({ x, s });
+        }
+        rows.sort((a, b) => b.y - a.y); // PDF y grows upwards -> top row first
+        for (const row of rows) {
+          lines.push(row.items.sort((a, b) => a.x - b.x).map((i) => i.s).join("\t"));
+        }
+      } finally {
+        page.cleanup();
+      }
+    }
+  } finally {
+    await loadingTask.destroy();
+  }
+  return lines.join("\n");
+}
+
+export interface CourierMatchContext {
+  sellers: SellerForCourierMatch[];
+  firmNames: string[];
+}
+
+export async function loadCourierMatchContext(db: any): Promise<CourierMatchContext> {
+  const [sellersRaw, companiesRaw] = await Promise.all([
+    db.collection("sellers").find({}, { projection: { instituteName: 1, buyerName: 1, place: 1, whatsappNumber: 1 } }).toArray(),
+    db.collection("companies").find({}, { projection: { firmName: 1 } }).toArray(),
+  ]);
+  return {
+    sellers: sellersRaw.map((s: any) => ({
+      _id: s._id,
+      instituteName: s.instituteName,
+      buyerName: s.buyerName,
+      place: s.place,
+      whatsappNumber: s.whatsappNumber,
+    })),
+    firmNames: companiesRaw.map((c: any) => c.firmName).filter(Boolean),
+  };
+}
+
+/**
+ * Parses one courier PDF's text and matches every parcel to an institute.
+ * `fallbackDate` (YYYY-MM-DD) is used for parcels whose register section
+ * had no "Date :" header.
+ *
+ * NEW COURIER FORMAT? Only parseCourierPdfText() needs a sibling parser -
+ * pick it here based on something distinctive in `text` (e.g. the courier's
+ * name in the header); matching/saving/WhatsApp stay unchanged.
+ */
+export function parseAndMatchCourierText(
+  text: string,
+  ctx: CourierMatchContext,
+  fallbackDate: string
+): ProcessResult {
+  const parcels = parseCourierPdfText(text, ctx.firmNames);
+  const matched: ProcessedMatchedParcel[] = [];
+  const needsReview: ProcessedReviewParcel[] = [];
+
+  for (const parcel of parcels) {
+    const emailDate = parcel.bookingDate || fallbackDate;
+    const { seller, score } = matchParcelToInstitute(parcel, ctx.sellers);
+
+    if (seller && score >= MATCH_THRESHOLD) {
+      const whatsappNumber = (seller.whatsappNumber || "").trim();
+      matched.push({
+        docketNo: parcel.docketNo,
+        instituteName: seller.instituteName,
+        sellerId: String(seller._id),
+        city: parcel.city,
+        receiverName: parcel.receiverFullText,
+        firmName: parcel.firmName,
+        buyerName: seller.buyerName || undefined,
+        score,
+        whatsappNumber: whatsappNumber || undefined,
+        // NOT_SENT (not PENDING) - sending is a manual, per-parcel choice
+        // made on the Courier Tracking page, never automatic at match time.
+        whatsappStatus: whatsappNumber ? "NOT_SENT" : "NO_NUMBER",
+        emailDate,
+      });
+    } else {
+      needsReview.push({
+        docketNo: parcel.docketNo,
+        parsedCity: parcel.city,
+        parsedReceiverName: parcel.receiverFullText,
+        bestGuessInstituteName: seller?.instituteName,
+        bestGuessSellerId: seller ? String(seller._id) : undefined,
+        score,
+        reason: seller
+          ? `Best match "${seller.instituteName}" scored ${score.toFixed(2)}, below the ${MATCH_THRESHOLD} threshold.`
+          : "No institute matched at all.",
+        emailDate,
+      });
+    }
+  }
+
+  return { matched, needsReview, totalParcels: parcels.length };
+}
+
+/**
+ * Merges newly processed parcels into an existing day's lists. A docket
+ * already present (in either list) is kept exactly as it is, so a re-run or
+ * re-upload never resets a parcel's WhatsApp status or a manual institute
+ * correction.
+ */
+export function mergeCourierResults(
+  existing: { matched?: any[]; needsReview?: any[] } | null | undefined,
+  incoming: ProcessResult
+): { matched: any[]; needsReview: any[]; added: number; alreadyPresent: number } {
+  const plain = (p: any) => (p && typeof p.toObject === "function" ? p.toObject() : p);
+  const matched = (existing?.matched || []).map(plain);
+  const needsReview = (existing?.needsReview || []).map(plain);
+  const seen = new Set<string>([...matched, ...needsReview].map((p: any) => p.docketNo));
+  let added = 0;
+  let alreadyPresent = 0;
+
+  for (const p of incoming.matched) {
+    if (seen.has(p.docketNo)) {
+      alreadyPresent++;
+      continue;
+    }
+    seen.add(p.docketNo);
+    matched.push(p);
+    added++;
+  }
+  for (const p of incoming.needsReview) {
+    if (seen.has(p.docketNo)) {
+      alreadyPresent++;
+      continue;
+    }
+    seen.add(p.docketNo);
+    needsReview.push(p);
+    added++;
+  }
+  return { matched, needsReview, added, alreadyPresent };
+}
+
+/** Gmail fetch + parse + match, tied together. No WhatsApp send here. */
+export async function processNewCourierParcels(db: any): Promise<ProcessResult> {
+  const { fetchNewCourierPdfsSince } = await import("./gmailFetch");
 
   const fetchState = await db.collection("courier_fetch_state").findOne({ _id: FETCH_STATE_ID });
   const sinceDate: Date | null = fetchState?.lastProcessedEmailDate ? new Date(fetchState.lastProcessedEmailDate) : null;
 
   const pdfs = await fetchNewCourierPdfsSince(sinceDate);
-
-  const [sellersRaw, companiesRaw] = await Promise.all([
-    db.collection("sellers").find({}, { projection: { instituteName: 1, buyerName: 1, place: 1, whatsappNumber: 1 } }).toArray(),
-    db.collection("companies").find({}, { projection: { firmName: 1 } }).toArray(),
-  ]);
-  const sellers: SellerForCourierMatch[] = sellersRaw.map((s: any) => ({
-    _id: s._id,
-    instituteName: s.instituteName,
-    buyerName: s.buyerName,
-    place: s.place,
-    whatsappNumber: s.whatsappNumber,
-  }));
-  const firmNames = companiesRaw.map((c: any) => c.firmName).filter(Boolean);
+  const ctx = await loadCourierMatchContext(db);
 
   const matched: ProcessedMatchedParcel[] = [];
   const needsReview: ProcessedReviewParcel[] = [];
@@ -292,52 +454,13 @@ export async function processNewCourierParcels(db: any): Promise<ProcessResult> 
 
   for (const pdf of pdfs) {
     if (!maxEmailDate || pdf.emailDate > maxEmailDate) maxEmailDate = pdf.emailDate;
+    // Gmail path keeps the email's own date as each parcel's date (as before).
     const emailDate = toDateOnly(pdf.emailDate);
-
-    const parser = new PDFParse({ data: pdf.buffer });
-    let text: string;
-    try {
-      const result = await parser.getText();
-      text = result.text;
-    } finally {
-      await parser.destroy();
-    }
-    const parcels = parseCourierPdfText(text, firmNames);
-    totalParcels += parcels.length;
-
-    for (const parcel of parcels) {
-      const { seller, score } = matchParcelToInstitute(parcel, sellers);
-
-      if (seller && score >= MATCH_THRESHOLD) {
-        const whatsappNumber = (seller.whatsappNumber || "").trim();
-        matched.push({
-          docketNo: parcel.docketNo,
-          instituteName: seller.instituteName,
-          sellerId: String(seller._id),
-          city: parcel.city,
-          receiverName: parcel.receiverFullText,
-          firmName: parcel.firmName,
-          buyerName: seller.buyerName || undefined,
-          score,
-          whatsappNumber: whatsappNumber || undefined,
-          // NOT_SENT (not PENDING) - sending is a manual, per-parcel choice
-          // made on the Courier Tracking page, never automatic at match time.
-          whatsappStatus: whatsappNumber ? "NOT_SENT" : "NO_NUMBER",
-          emailDate,
-        });
-      } else {
-        needsReview.push({
-          docketNo: parcel.docketNo,
-          parsedCity: parcel.city,
-          parsedReceiverName: parcel.receiverFullText,
-          bestGuessInstituteName: seller?.instituteName,
-          bestGuessSellerId: seller ? String(seller._id) : undefined,
-          score,
-          reason: seller ? `Best match "${seller.instituteName}" scored ${score.toFixed(2)}, below the ${MATCH_THRESHOLD} threshold.` : "No institute matched at all.",
-          emailDate,
-        });
-      }
-    }
+    const text = await extractCourierPdfText(pdf.buffer);
+    const r = parseAndMatchCourierText(text, ctx, emailDate);
+    matched.push(...r.matched.map((m) => ({ ...m, emailDate })));
+    needsReview.push(...r.needsReview.map((n) => ({ ...n, emailDate })));
+    totalParcels += r.totalParcels;
   }
 
   // Only advance the checkpoint once everything above has succeeded - if

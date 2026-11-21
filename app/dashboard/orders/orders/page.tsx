@@ -9,6 +9,7 @@ import { useRouter } from "next/navigation";
 import { FiExternalLink, FiTruck, FiRotateCcw, FiEdit, FiRefreshCcw, FiCheckCircle, FiPlus, FiDownload, FiTrash2, FiX, FiArrowLeft, FiSend, FiChevronDown } from "react-icons/fi";
 import { LuRotateCcw, LuRefreshCw } from "react-icons/lu";
 import { DEFAULT_LABEL_SETTINGS, loadLabelSettings, saveLabelSettings, printLabels, type LabelSettings } from "@/lib/printLabels";
+import { enqueueWa, pingWaExtension, WA_EXTENSION_MISSING_MSG, type WaItem } from "@/lib/waExtension";
 // jspdf, jspdf-autotable and xlsx are all heavy (500KB+) and only ever needed
 // when the user actually clicks an Export/Download button - dynamically
 // imported inside those handlers below instead of bundled into every load
@@ -1077,34 +1078,64 @@ const shippingLock = useRef(false);
   // footer/terms) onto a given jsPDF doc at its current page. autoTable is
   // passed in rather than imported here since it's loaded on demand by the
   // caller (downloadDeliveryChallan) to keep it out of the page's main bundle.
+  // A4 portrait (210 x 297 mm) with 14 mm side margins -> 182 mm content width.
+  const CHALLAN_MARGIN = 14;
+  const CHALLAN_CONTENT_W = 210 - CHALLAN_MARGIN * 2;
+  const newChallanDoc = (jsPDF: any) => new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+
   const drawChallanPage = (doc: any, autoTable: any, sellerInfo: any, items: any[], companies: any[], formattedDate: string, transporters: any[]) => {
-    doc.setFontSize(22);
+    const left = CHALLAN_MARGIN;
+    const right = 210 - CHALLAN_MARGIN;
+
+    doc.setTextColor(0, 0, 0);
+    doc.setFontSize(20);
     doc.setFont("helvetica", "bold");
     doc.text("DELIVERY CHALLAN", 105, 20, { align: "center" });
 
     doc.setFontSize(10);
     doc.setFont("helvetica", "normal");
-    doc.text(`Date: ${formattedDate}`, 105, 26, { align: "center" });
+    doc.text(`Date: ${formattedDate}`, right, 28, { align: "right" });
+    doc.setDrawColor(180);
+    doc.setLineWidth(0.3);
+    doc.line(left, 31, right, 31);
 
-    doc.setFontSize(11);
-    doc.setFont("helvetica", "normal");
-    doc.text("To,", 14, 35);
+    doc.setFontSize(10);
+    doc.text("To,", left, 38);
     doc.setFont("helvetica", "bold");
-
+    doc.setFontSize(11);
     const displayName = sellerInfo.buyerName || items[0]?.buyerName || 'Valued Customer';
-    doc.text(`${displayName}`, 14, 42);
+    doc.text(`${displayName}`, left, 44);
 
+    // Long addresses wrap inside the page width instead of running off it.
     doc.setFont("helvetica", "normal");
-    doc.setFontSize(8);
-    doc.text([
-      `Institute: ${sellerInfo.instituteName || items[0]?.instituteName || 'N/A'}`,
-      `Address: ${sellerInfo.address || '---'}`,
+    doc.setFontSize(8.5);
+    const detailLines: string[] = [
+      ...doc.splitTextToSize(`Institute: ${sellerInfo.instituteName || items[0]?.instituteName || 'N/A'}`, CHALLAN_CONTENT_W),
+      ...doc.splitTextToSize(`Address: ${sellerInfo.address || '---'}`, CHALLAN_CONTENT_W),
       `Place: ${sellerInfo.place || '---'}`,
-      `Mobile: ${sellerInfo.mobile || '---'}`
-    ], 14, 48);
+      `Mobile: ${sellerInfo.mobile || '---'}`,
+    ];
+    const lineH = 4.2;
+    doc.text(detailLines, left, 50, { lineHeightFactor: 1.4 });
+    const tableStartY = 50 + detailLines.length * lineH + 6;
 
     autoTable(doc, {
-      startY: 75,
+      startY: tableStartY,
+      margin: { left, right: CHALLAN_MARGIN, bottom: 20 },
+      tableWidth: CHALLAN_CONTENT_W,
+      rowPageBreak: 'avoid',
+      showHead: 'everyPage',
+      // Fixed widths (sum = 182 mm) so short values like "21 NOS" or the
+      // GeM contract number never break mid-word.
+      columnStyles: {
+        0: { cellWidth: 9, halign: 'center' },
+        1: { cellWidth: 23 },
+        2: { cellWidth: 34 },
+        3: { cellWidth: 26 },
+        4: { cellWidth: 14, halign: 'center' },
+        5: { cellWidth: 38, fontSize: 7.5 },
+        6: { cellWidth: 38 },
+      },
       head: [['Sr.', 'Order No.', 'Item Name', 'Firm Name', 'Qty', 'Contract Info', 'Transport Details']],
       body: items.map((order: any, i: number) => {
         const company = companies.find(c => c.firmCode === order.firmCode);
@@ -1118,7 +1149,8 @@ const shippingLock = useRef(false);
           : '---';
 
         const transportDetails = order.transportName
-          ? `${order.transportName}\nDate: ${order.deliveryDate || '---'}\nRemark: ${order.transportRemark || ''}`
+          ? `${String(order.transportName).trim()}\nDate: ${order.deliveryDate || '---'}` +
+            (order.transportRemark ? `\nRemark: ${String(order.transportRemark).trim()}` : '')
           : 'Direct Delivery';
 
         return [
@@ -1132,8 +1164,8 @@ const shippingLock = useRef(false);
         ];
       }),
       theme: 'grid',
-      headStyles: { textColor: 20, fontStyle: 'bold' },
-      styles: { fontSize: 8, cellPadding: 2, valign: 'middle' },
+      headStyles: { textColor: 20, fontStyle: 'bold', fontSize: 8.5 },
+      styles: { fontSize: 8, cellPadding: 2, valign: 'middle', overflow: 'linebreak', textColor: 40 },
       didDrawCell: (data) => {
         if (data.section === 'body' && data.column.index === 5) {
           const order = items[data.row.index];
@@ -1145,7 +1177,8 @@ const shippingLock = useRef(false);
       }
     });
 
-    const tableBottomY = (doc as any).lastAutoTable.finalY || 75;
+    const tableBottomY = (doc as any).lastAutoTable.finalY || tableStartY;
+    doc.setTextColor(0, 0, 0); // didDrawCell may have left it blue (contract link)
 
     const checkPageSpace = (currentY: number, requiredSpace: number) => {
       if (currentY + requiredSpace > 270) {
@@ -1157,10 +1190,15 @@ const shippingLock = useRef(false);
 
     // Transporter used for this delivery (order.transportName), with its
     // phone number(s) looked up from the Transporter directory.
-    let afterTableY = checkPageSpace(tableBottomY + 10, 20);
-    const transportName = items.find((o: any) => o.transportName)?.transportName;
-    if (transportName) {
-      const transporterDoc = transporters.find((t: any) => t.name === transportName);
+    // One challan can now hold orders sent by different transporters (all of
+    // an institute's orders share one table), so list each distinct one.
+    let afterTableY = tableBottomY + 10;
+    const transportNames = [...new Set(
+      items.map((o: any) => (o.transportName || "").trim()).filter(Boolean)
+    )] as string[];
+    for (const transportName of transportNames) {
+      afterTableY = checkPageSpace(afterTableY, 12);
+      const transporterDoc = transporters.find((t: any) => (t.name || "").trim() === transportName);
       const contactLines = (transporterDoc?.contacts || [])
         .filter((c: any) => c.mobile)
         .map((c: any) => (c.person ? `${c.person}: ${c.mobile}` : c.mobile));
@@ -1177,8 +1215,8 @@ const shippingLock = useRef(false);
     let footerY = checkPageSpace(afterTableY + 3, 25);
     doc.setFont("helvetica", "bold");
     doc.setFontSize(10);
-    doc.line(140, footerY + 15, 190, footerY + 15);
-    doc.text("Sign for Receiver", 165, footerY + 20, { align: "center" });
+    doc.line(146, footerY + 15, 196, footerY + 15);
+    doc.text("Sign for Receiver", 171, footerY + 20, { align: "center" });
 
     footerY = checkPageSpace(footerY + 30, 40);
 
@@ -1194,15 +1232,148 @@ const shippingLock = useRef(false);
       "4. Dispatch Dept Contact: +91 8200093336"
     ];
 
-    doc.text(terms, 14, footerY + 5, { maxWidth: 180 });
+    doc.text(terms, 14, footerY + 5, { maxWidth: CHALLAN_CONTENT_W });
+  };
+
+  const challanDateStr = () => {
+    const today = new Date();
+    const dd = String(today.getDate()).padStart(2, '0');
+    const mm = String(today.getMonth() + 1).padStart(2, '0');
+    const yy = String(today.getFullYear()).slice(-2);
+    return `${dd}-${mm}-${yy}`;
+  };
+
+  // One challan (one table) per INSTITUTE, not per seller record - the same
+  // institute's orders can be linked to different Seller records (e.g. an
+  // older order on an older record), which used to split them into separate
+  // challan pages.
+  const groupOrdersBySeller = (orders: any[], sellersList: any[]): Record<string, any[]> =>
+    orders.reduce((acc: any, order) => {
+      const info = findSellerInfo(order, sellersList);
+      const institute = String(info.instituteName || order.instituteName || "").trim().toLowerCase().replace(/\s+/g, " ");
+      const key = institute || order.sellerId || order.buyerName || "unknown_seller";
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(order);
+      return acc;
+    }, {});
+
+  // WhatsApp caption sent with the Delivery Challan PDF - kept short on
+  // purpose; all order/transport detail is in the attached PDF itself.
+  const buildDcWhatsappMessage = (sellerInfo: any, items: any[]) => {
+    const name = sellerInfo.buyerName || items[0]?.buyerName || "Sir/Madam";
+    return [
+      `Dear ${name},`,
+      ``,
+      `Please find attached the *Delivery Challan* for your order.`,
+      ``,
+      `Kindly check the goods within 2 days of receipt. If there is any damage or defect, please inform us immediately.`,
+      `Dispatch Dept: +91 8200093336`,
+      ``,
+      `*DEV ENTERPRISE GROUPS (FIRMS)*`,
+    ].join("\n");
+  };
+
+  // One WhatsApp per recipient: challan groups (one per seller record, so
+  // the same institute can show up as several groups - e.g. orders linked to
+  // different seller records / dates) are merged by WhatsApp number (falling
+  // back to institute name), so an institute gets ONE message with ONE PDF.
+  const groupChallansByRecipient = (challanGroups: any[][], sellersList: any[]) => {
+    const byRecipient = new Map<string, { sellerInfo: any; groups: any[][] }>();
+    for (const items of challanGroups) {
+      const sellerInfo = findSellerInfo(items[0], sellersList);
+      const digits = String(sellerInfo.whatsappNumber || "").replace(/\D/g, "").slice(-10);
+      const key = digits || `name:${(sellerInfo.instituteName || items[0].instituteName || "").trim().toLowerCase()}`;
+      const existing = byRecipient.get(key);
+      if (existing) existing.groups.push(items);
+      else byRecipient.set(key, { sellerInfo, groups: [items] });
+    }
+    return [...byRecipient.values()];
+  };
+
+  // Builds one PDF (one challan page per group, same layout as the
+  // download) for a single recipient.
+  const buildRecipientChallanPdf = (jsPDF: any, autoTable: any, groups: any[][], sellersList: any[], companies: any[], formattedDate: string) => {
+    const doc = newChallanDoc(jsPDF);
+    groups.forEach((items, i) => {
+      if (i > 0) doc.addPage();
+      drawChallanPage(doc, autoTable, findSellerInfo(items[0], sellersList), items, companies, formattedDate, transporters);
+    });
+    return doc;
+  };
+
+  const pdfBase64Of = (doc: any): string => {
+    const dataUri: string = doc.output("datauristring");
+    return dataUri.slice(dataUri.indexOf("base64,") + "base64,".length);
+  };
+
+  // Records each challan (status shows on Courier Tracking) and hands it to
+  // the DEV WA Bulk Sender Chrome extension, which sends it from the user's
+  // WhatsApp Web tab; Sent/Failed is written back by WaExtensionSync.
+  const [sendingDcWhatsapp, setSendingDcWhatsapp] = useState(false);
+  const queueDcWhatsapp = async (
+    entries: { sellerInfo: any; items: any[]; pdfBase64: string; fileName: string; formattedDate: string }[]
+  ) => {
+    const currentUsername = JSON.parse(localStorage.getItem("oms_user") || "{}")?.username || "";
+    const waItems: WaItem[] = [];
+    const skipped: string[] = [];
+    let queuedCount = 0;
+
+    for (const { sellerInfo, items, pdfBase64, fileName, formattedDate } of entries) {
+      const instituteName = sellerInfo.instituteName || items[0].instituteName || items[0].buyerName || "Unknown Institute";
+      const whatsappNumber = (sellerInfo.whatsappNumber || "").trim();
+      if (!whatsappNumber) {
+        skipped.push(`${instituteName} (WhatsApp number nahi hai)`);
+        continue;
+      }
+
+      const res = await fetch("/api/delivery-challan/queue-whatsapp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instituteName,
+          whatsappNumber,
+          sellerId: sellerInfo._id || items[0].sellerId || null,
+          orderNos: items.map((o: any) => o.orderNo),
+          fileName,
+          pdfBase64,
+          requestedBy: currentUsername,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        waItems.push({
+          phone: whatsappNumber,
+          name: instituteName,
+          msg: buildDcWhatsappMessage(sellerInfo, items),
+          files: [{ name: fileName, type: "application/pdf", dataUrl: `data:application/pdf;base64,${pdfBase64}` }],
+          ref: `dc|${data.id}`,
+        });
+      } else {
+        const err = await res.json().catch(() => ({}));
+        skipped.push(`${instituteName} (${err.error || "queue failed"})`);
+      }
+    }
+
+    if (waItems.length > 0) {
+      try {
+        const r = await enqueueWa(waItems);
+        if (r.ok) queuedCount = r.queued ?? waItems.length;
+        else skipped.push(`Extension error: ${r.error || "queue failed"} (Courier Tracking page se 'Send' dabake dobara bhejo)`);
+        if (r.warning) skipped.push(`Note: ${r.warning}`);
+      } catch (e: any) {
+        skipped.push(`Extension error: ${e.message} (Courier Tracking page se 'Send' dabake dobara bhejo)`);
+      }
+    }
+
+    let message = queuedCount > 0
+      ? `✓ ${queuedCount} institute(s) ko Delivery Challan WhatsApp queue ho gaya - WhatsApp Web tab se ek-ek karke jayega.`
+      : "WhatsApp pe kuch nahi gaya.";
+    if (skipped.length > 0) message += `\n\nSkipped: ${skipped.join(", ")}`;
+    alert(message);
   };
 
   const downloadDeliveryChallan = async (filteredOrders: any[], sellers: any[], companies: any[], selectedOrderIds: string[] = []) => {
-    // if (!filteredOrders || filteredOrders.length === 0) {
-    //   alert("No orders selected to download.");
-    //   return;
-    // }
-
     const activeOrders = selectedOrderIds.length > 0
       ? filteredOrders.filter(order => selectedOrderIds.includes(order._id))
       : filteredOrders;
@@ -1217,50 +1388,72 @@ const shippingLock = useRef(false);
       import("jspdf-autotable"),
     ]);
 
-    const doc = new jsPDF();
-    const today = new Date();
-    const dd = String(today.getDate()).padStart(2, '0');
-    const mm = String(today.getMonth() + 1).padStart(2, '0');
-    const yy = String(today.getFullYear()).slice(-2);
-    const formattedDate = `${dd}-${mm}-${yy}`;
-
-    const groupedBySeller = activeOrders.reduce((acc: any, order) => {
-      const key = order.sellerId || order.instituteName || "unknown_seller";
-      if (!acc[key]) acc[key] = [];
-      acc[key].push(order);
-      return acc;
-    }, {});
+    const doc = newChallanDoc(jsPDF);
+    const formattedDate = challanDateStr();
+    const groupedBySeller = groupOrdersBySeller(activeOrders, sellers);
+    const groupKeys = Object.keys(groupedBySeller).filter((k) => groupedBySeller[k]?.length);
 
     let fileNameBase = "Delivery_Challan";
 
-    Object.keys(groupedBySeller).forEach((groupKey, index) => {
+    groupKeys.forEach((groupKey, index) => {
       const items = groupedBySeller[groupKey];
-
-      if (!items || items.length === 0) return;
-
       if (index > 0) doc.addPage();
-
       const sellerInfo = findSellerInfo(items[0], sellers);
-
       if (index === 0) {
         fileNameBase = sellerInfo.instituteName || sellerInfo.buyerName || items[0].buyerName || "Challan";
       }
-
       drawChallanPage(doc, autoTable, sellerInfo, items, companies, formattedDate, transporters);
     });
 
     const safeName = fileNameBase.replace(/[^a-z0-9]/gi, '_');
-    doc.save(`Challan_${safeName}_${formattedDate}.pdf`);
+    const downloadName = `Challan_${safeName}_${formattedDate}.pdf`;
+    doc.save(downloadName);
+
+    // Ticked orders: the challan also goes to the institute's WhatsApp via
+    // the DEV WA Bulk Sender extension. "Download All" (nothing ticked) only
+    // downloads, so one click can never message every institute.
+    if (selectedOrderIds.length === 0) return;
+
+    setSendingDcWhatsapp(true);
+    try {
+      if (!(await pingWaExtension())) {
+        alert(`PDF download ho gayi, lekin WhatsApp nahi gaya:\n\n${WA_EXTENSION_MISSING_MSG}`);
+        return;
+      }
+
+      const recipients = groupChallansByRecipient(groupKeys.map((k) => groupedBySeller[k]), sellers);
+
+      if (recipients.length === 1) {
+        // One recipient: send exactly the PDF that was just downloaded, as
+        // a single message (even if it has several challan pages).
+        const { sellerInfo, groups } = recipients[0];
+        await queueDcWhatsapp([
+          { sellerInfo, items: groups.flat(), pdfBase64: pdfBase64Of(doc), fileName: downloadName, formattedDate },
+        ]);
+      } else {
+        // Several recipients: the combined download holds everyone's pages,
+        // so each one gets one PDF with only its own challan page(s).
+        const entries = recipients.map(({ sellerInfo, groups }) => {
+          const one = buildRecipientChallanPdf(jsPDF, autoTable, groups, sellers, companies, formattedDate);
+          const name = (sellerInfo.instituteName || groups[0][0].instituteName || "Challan").replace(/[^a-z0-9]/gi, '_');
+          return { sellerInfo, items: groups.flat(), pdfBase64: pdfBase64Of(one), fileName: `Challan_${name}_${formattedDate}.pdf`, formattedDate };
+        });
+        await queueDcWhatsapp(entries);
+      }
+    } finally {
+      setSendingDcWhatsapp(false);
+    }
   };
 
-  // "Send DC WhatsApp" - same grouping-by-institute as downloadDeliveryChallan
-  // above, but one SEPARATE single-institute PDF per seller (not one combined
-  // multi-page download) since each institute's challan has to go to that
-  // institute's own WhatsApp number. Queues each PDF via
-  // /api/delivery-challan/queue-whatsapp - the local whatsapp-bridge service
-  // (already running for courier-tracking sends) polls and actually sends it.
-  const [sendingDcWhatsapp, setSendingDcWhatsapp] = useState(false);
-  const sendDeliveryChallanWhatsapp = async (filteredOrders: any[], sellers: any[], companies: any[], selectedOrderIds: string[] = []) => {
+  // "Send DC WhatsApp" button - same as above but without downloading, and
+  // with a confirm (it can target the whole filtered list when nothing is
+  // ticked). One single-institute PDF per seller.
+  const sendDeliveryChallanWhatsapp = async (
+    filteredOrders: any[],
+    sellers: any[],
+    companies: any[],
+    selectedOrderIds: string[] = []
+  ) => {
     const activeOrders = selectedOrderIds.length > 0
       ? filteredOrders.filter(order => selectedOrderIds.includes(order._id))
       : filteredOrders;
@@ -1272,79 +1465,40 @@ const shippingLock = useRef(false);
 
     setSendingDcWhatsapp(true);
     try {
+      if (!(await pingWaExtension())) {
+        alert(WA_EXTENSION_MISSING_MSG);
+        return;
+      }
+
       const [{ default: jsPDF }, { default: autoTable }] = await Promise.all([
         import("jspdf"),
         import("jspdf-autotable"),
       ]);
 
-      const today = new Date();
-      const dd = String(today.getDate()).padStart(2, '0');
-      const mm = String(today.getMonth() + 1).padStart(2, '0');
-      const yy = String(today.getFullYear()).slice(-2);
-      const formattedDate = `${dd}-${mm}-${yy}`;
+      const formattedDate = challanDateStr();
+      const groupedBySeller = groupOrdersBySeller(activeOrders, sellers);
+      const recipients = groupChallansByRecipient(
+        Object.values(groupedBySeller).filter((items) => items?.length),
+        sellers
+      );
 
-      const groupedBySeller = activeOrders.reduce((acc: any, order) => {
-        const key = order.sellerId || order.instituteName || "unknown_seller";
-        if (!acc[key]) acc[key] = [];
-        acc[key].push(order);
-        return acc;
-      }, {});
-
-      const currentUsername = JSON.parse(localStorage.getItem("oms_user") || "{}")?.username || "";
-
-      let queuedCount = 0;
-      const skipped: string[] = [];
-
-      for (const groupKey of Object.keys(groupedBySeller)) {
-        const items = groupedBySeller[groupKey];
-        if (!items || items.length === 0) continue;
-
-        const sellerInfo = findSellerInfo(items[0], sellers);
-        const instituteName = sellerInfo.instituteName || items[0].instituteName || items[0].buyerName || "Unknown Institute";
-        const whatsappNumber = (sellerInfo.whatsappNumber || "").trim();
-
-        if (!whatsappNumber) {
-          skipped.push(instituteName);
-          continue;
-        }
-
-        const doc = new jsPDF();
-        drawChallanPage(doc, autoTable, sellerInfo, items, companies, formattedDate, transporters);
-
-        const dataUri: string = doc.output("datauristring");
-        const pdfBase64 = dataUri.slice(dataUri.indexOf("base64,") + "base64,".length);
-        const safeName = instituteName.replace(/[^a-z0-9]/gi, '_');
-        const fileName = `Challan_${safeName}_${formattedDate}.pdf`;
-
-        const res = await fetch("/api/delivery-challan/queue-whatsapp", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            instituteName,
-            whatsappNumber,
-            sellerId: sellerInfo._id || items[0].sellerId || null,
-            orderNos: items.map((o: any) => o.orderNo),
-            fileName,
-            pdfBase64,
-            requestedBy: currentUsername,
-          }),
-        });
-
-        if (res.ok) {
-          queuedCount++;
-        } else {
-          const err = await res.json().catch(() => ({}));
-          skipped.push(`${instituteName} (${err.error || "queue failed"})`);
-        }
+      const instituteNames = recipients.map(({ sellerInfo, groups }) =>
+        sellerInfo.instituteName || groups[0][0].instituteName || groups[0][0].buyerName || "Unknown Institute"
+      );
+      const preview = instituteNames.slice(0, 15).join(", ") + (instituteNames.length > 15 ? ` ... +${instituteNames.length - 15} more` : "");
+      const scopeNote = selectedOrderIds.length > 0
+        ? `${activeOrders.length} selected order(s)`
+        : `KOI ORDER SELECT NAHI HAI - list ke SAARE ${activeOrders.length} order(s)`;
+      if (!confirm(`${scopeNote} se ${instituteNames.length} institute(s) ko Delivery Challan WhatsApp jayega:\n\n${preview}\n\nBhejna hai?`)) {
+        return;
       }
 
-      let message = queuedCount > 0
-        ? `✓ ${queuedCount} institute(s) queued for WhatsApp - the bridge will send them shortly.`
-        : "Nothing was queued.";
-      if (skipped.length > 0) {
-        message += `\n\nSkipped (no WhatsApp number or error): ${skipped.join(", ")}`;
-      }
-      alert(message);
+      const entries = recipients.map(({ sellerInfo, groups }) => {
+        const doc = buildRecipientChallanPdf(jsPDF, autoTable, groups, sellers, companies, formattedDate);
+        const name = (sellerInfo.instituteName || groups[0][0].instituteName || groups[0][0].buyerName || "Challan").replace(/[^a-z0-9]/gi, '_');
+        return { sellerInfo, items: groups.flat(), pdfBase64: pdfBase64Of(doc), fileName: `Challan_${name}_${formattedDate}.pdf`, formattedDate };
+      });
+      await queueDcWhatsapp(entries);
     } finally {
       setSendingDcWhatsapp(false);
     }
@@ -1634,7 +1788,8 @@ const shippingLock = useRef(false);
           <div className="flex items-center gap-2 mb-1">
             <button
               onClick={() => downloadDeliveryChallan(filteredOrders, sellers as any[], companies as any[], selectedOrderIds)}
-              className="flex items-center px-4 justify-end py-2 bg-red-600 text-white rounded-sm font-black text-[10px] uppercase tracking-widest hover:bg-red-700 transition-all active:scale-95"
+              disabled={sendingDcWhatsapp}
+              className="flex items-center px-4 justify-end py-2 bg-red-600 text-white rounded-sm font-black text-[10px] uppercase tracking-widest hover:bg-red-700 disabled:opacity-50 transition-all active:scale-95"
             >
               <FiDownload className="text-xl mr-1" />
               {selectedOrderIds.length > 0

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import mongoose from "mongoose";
 import CourierRunLog from "@/models/CourierRunLog";
-import { processNewCourierParcels } from "@/lib/courier/parseAndMatch";
+import { mergeCourierResults, processNewCourierParcels } from "@/lib/courier/parseAndMatch";
 
 // PDF fetch + parse + match can take a few seconds - stay under Vercel's
 // default 10s function timeout the same way /api/backup/auto does.
@@ -14,15 +14,19 @@ export async function GET() {
     }
 
     const todayDate = new Date().toISOString().split("T")[0];
-    const existingLog = await CourierRunLog.findOne({ date: todayDate, status: "SUCCESS" });
+    // Today's log is returned whatever its status - a failed Gmail auto-run
+    // must not hide parcels that were already added today (e.g. by a manual
+    // PDF upload); `error` on it is shown separately.
+    const existingLog = await CourierRunLog.findOne({ date: todayDate });
     const recentLogs = await CourierRunLog.find().sort({ timestamp: -1 }).limit(10).lean();
 
     return NextResponse.json({
       success: true,
-      todayRunCompleted: !!existingLog,
+      todayRunCompleted: existingLog?.status === "SUCCESS",
       todayLog: existingLog || null,
       history: recentLogs,
       gmailConfigured: !!(process.env.GMAIL_API_CLIENT_ID && process.env.GMAIL_API_CLIENT_SECRET && process.env.GMAIL_API_REFRESH_TOKEN),
+      gmailDisabled: process.env.COURIER_GMAIL_DISABLED === "true",
       courierSenderConfigured: !!process.env.COURIER_SENDER_EMAIL,
     });
   } catch (error: any) {
@@ -58,6 +62,19 @@ export async function POST(req: Request) {
     // someone happened to hit "Run Now" or the next day's first login. The
     // cooldown still stops every single page navigation from hitting the
     // Gmail API, without silently going quiet for the rest of the day.
+    // COURIER_GMAIL_DISABLED=true turns off the Gmail fetch entirely (e.g.
+    // while the Gmail account/token is unusable) - courier PDFs then come in
+    // only via the manual "Upload Courier PDF" button. Without this, the
+    // site-visit auto-run would keep failing and flagging today's log.
+    if (process.env.COURIER_GMAIL_DISABLED === "true") {
+      return NextResponse.json(
+        forceRun
+          ? { error: "Gmail fetch band hai (COURIER_GMAIL_DISABLED=true) - 'Upload Courier PDF' se PDF daalo." }
+          : { skipped: true, message: "Gmail fetch disabled (COURIER_GMAIL_DISABLED=true)." },
+        { status: forceRun ? 400 : 200 }
+      );
+    }
+
     const COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours
     const lastSuccess = await CourierRunLog.findOne({ status: "SUCCESS" }).sort({ timestamp: -1 });
     const withinCooldown = !!lastSuccess && Date.now() - new Date(lastSuccess.timestamp).getTime() < COOLDOWN_MS;
@@ -85,15 +102,21 @@ export async function POST(req: Request) {
 
     const result = await processNewCourierParcels(db);
 
+    // Merge, don't overwrite - today's list may already hold parcels from an
+    // earlier run or a manual PDF upload, with WhatsApp statuses that must
+    // survive.
+    const existingToday = await CourierRunLog.findOne({ date: todayDate });
+    const merged = mergeCourierResults(existingToday, result);
+
     const updatedLog = await CourierRunLog.findOneAndUpdate(
       { date: todayDate },
       {
         status: "SUCCESS",
-        totalParcels: result.totalParcels,
-        matchedCount: result.matched.length,
-        needsReviewCount: result.needsReview.length,
-        matched: result.matched,
-        needsReview: result.needsReview,
+        totalParcels: merged.matched.length + merged.needsReview.length,
+        matchedCount: merged.matched.length,
+        needsReviewCount: merged.needsReview.length,
+        matched: merged.matched,
+        needsReview: merged.needsReview,
         timestamp: new Date(),
         error: result.totalParcels === 0 ? "No new courier parcels found since the last fetch." : undefined,
         triggeredBy: forceRun ? "MANUAL_RUN_NOW" : "AUTO_SITE_ACCESS",

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEV WA Bulk Sender</title>
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+<header>
+  <img src="icons/icon48.png" alt="">
+  <div>
+    <h1>DEV WA Bulk Sender</h1>
+    <p>Existing customers / staff ko personalised message + images</p>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1. Contact list</h2>
+    <p class="hint">Excel (.xlsx) ya CSV upload karo. Pehli row me headings ho — jaise <b>Phone, Name, Firm</b>. Har column message me <code>{Name}</code>, <code>{Firm}</code> ki tarah use ho sakta hai.</p>
+    <input type="file" id="file" accept=".xlsx,.xls,.csv">
+    <p class="hint">Ya seedha paste karo (har line: <code>number, naam</code>):</p>
+    <textarea id="paste" rows="4" placeholder="9876543210, Rameshbhai&#10;9898989898, Sureshbhai"></textarea>
+    <div class="row">
+      <label>Country code <input type="text" id="cc" value="91" size="4"></label>
+      <button id="loadPaste" class="ghost">Paste list load karo</button>
+    </div>
+    <div id="listInfo" class="info"></div>
+  </section>
+
+  <section class="card">
+    <h2>2. Message</h2>
+    <textarea id="msg" rows="7" placeholder="Namaste {Name} ji,&#10;&#10;DEV GROUP ki taraf se..."></textarea>
+    <div id="placeholders" class="hint"></div>
+    <div class="preview-wrap"><b>Preview (pehla contact):</b><pre id="preview">—</pre></div>
+  </section>
+
+  <section class="card">
+    <h2>3. Images (optional)</h2>
+    <p class="hint">Yeh images sabko jayengi. Message pehli image ka caption banega.</p>
+    <input type="file" id="images" accept="image/*" multiple>
+    <div id="thumbs" class="thumbs"></div>
+  </section>
+
+  <section class="card">
+    <h2>4. Settings</h2>
+    <div class="row">
+      <label>Min delay (sec) <input type="number" id="dmin" value="15" min="10"></label>
+      <label>Max delay (sec) <input type="number" id="dmax" value="35" min="15"></label>
+      <label>Daily limit <input type="number" id="limit" value="150" min="1"></label>
+    </div>
+    <p class="hint">Delay jitna zyada, ban ka risk utna kam. Apne contacts ke liye 15–35 sec theek hai.</p>
+  </section>
+
+  <section class="card controls">
+    <div class="row">
+      <button id="start" class="primary">▶ Start (nayi list)</button>
+      <button id="pause">⏸ Pause</button>
+      <button id="resume">⏯ Resume</button>
+      <button id="stop" class="danger">⏹ Stop</button>
+    </div>
+    <div id="status" class="status">Idle</div>
+    <div class="progress"><div id="bar"></div></div>
+    <div class="row stats">
+      <span>✅ Sent: <b id="sSent">0</b></span>
+      <span>❌ Failed: <b id="sFail">0</b></span>
+      <span>⏳ Pending: <b id="sPend">0</b></span>
+      <span>📅 Aaj bheje: <b id="sToday">0</b></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row between">
+      <h2>Report</h2>
+      <div>
+        <button id="retry" class="ghost">Failed wale dobara</button>
+        <button id="export" class="ghost">⬇ Report Excel</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th><th>Phone</th><th>Naam</th><th>Status</th><th>Reason</th><th>Time</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script src="xlsx.full.min.js"></script>
+<script src="common.js"></script>
+<script src="dashboard.js"></script>
+</body>
+</html>
