@@ -23,16 +23,23 @@
   }
 
   // ---------- Overlay (WhatsApp page par status) ----------
-  let box;
-  function overlay(text, color = '#075e54') {
+  // Upar beech me dikhta hai (neeche Send button / compose box ko nahi dhakta),
+  // pointer-events:none - iske peeche jo bhi button ho wo click ho jata hai.
+  // autoHideMs diya ho to utne time baad apne aap gayab ho jata hai.
+  let box, hideTimer;
+  function overlay(text, color = '#075e54', autoHideMs = 0) {
     if (!box) {
       box = document.createElement('div');
-      box.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:999999;padding:10px 14px;' +
-        'border-radius:10px;color:#fff;font:600 13px system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.3);max-width:320px';
+      box.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:999999;' +
+        'padding:6px 12px;border-radius:8px;color:#fff;font:600 12px system-ui,sans-serif;' +
+        'box-shadow:0 2px 8px rgba(0,0,0,.25);max-width:360px;pointer-events:none;opacity:.95';
       document.body.appendChild(box);
     }
+    clearTimeout(hideTimer);
+    box.style.display = '';
     box.style.background = color;
     box.textContent = '📤 DEV Bulk: ' + text;
+    if (autoHideMs > 0) hideTimer = setTimeout(() => { if (box) box.style.display = 'none'; }, autoHideMs);
   }
 
   // ---------- WhatsApp DOM helpers (selectors badal sakte hai) ----------
@@ -377,7 +384,7 @@
         if (fresh.index >= fresh.items.length) {
           Object.assign(fresh, { status: 'done', stage: 'idle' });
           await setJob(fresh);
-          overlay('✅ Sab messages complete!', '#128c7e');
+          overlay('✅ Sab messages complete!', '#128c7e', 5000);
           return;
         }
         if (daily.count >= fresh.dailyLimit) {
@@ -389,7 +396,7 @@
         if (fresh.status !== 'running') {
           fresh.stage = 'idle';
           await setJob(fresh);
-          overlay(fresh.status === 'stopped' ? 'Stopped' : 'Paused', '#e67e22');
+          overlay(fresh.status === 'stopped' ? 'Stopped' : 'Paused', '#e67e22', 8000);
           return;
         }
         fresh.stage = 'waiting';
@@ -402,7 +409,7 @@
           const jj = await getJob();
           if (!alive() || !jj || jj.status !== 'running') {
             if (jj) { jj.stage = 'idle'; await setJob(jj); }
-            overlay(jj && jj.status === 'stopped' ? 'Stopped' : 'Paused', '#e67e22');
+            overlay(jj && jj.status === 'stopped' ? 'Stopped' : 'Paused', '#e67e22', 8000);
             return;
           }
         }
