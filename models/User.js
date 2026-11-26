@@ -32,6 +32,16 @@ const userSchema = new mongoose.Schema({
         pricelist: { type: Boolean, default: false },
         pricelistManage: { type: Boolean, default: false },
         pricelistReceived: { type: Boolean, default: false },
+        // Account > Cashbook module (see lib/cashbook/server.ts CB_PERMISSION_KEYS).
+        cashbookView: { type: Boolean, default: false },
+        cashbookEntry: { type: Boolean, default: false },
+        cashbookApprove: { type: Boolean, default: false },
+        cashbookEditApproved: { type: Boolean, default: false },
+        cashbookAdvance: { type: Boolean, default: false },
+        cashbookOrderPayment: { type: Boolean, default: false },
+        cashbookMasters: { type: Boolean, default: false },
+        cashbookReports: { type: Boolean, default: false },
+        cashbookAllEntries: { type: Boolean, default: false },
     },
     // Task module: a manager's team = users whose managerUsername is theirs.
     managerUsername: { type: String, default: null },

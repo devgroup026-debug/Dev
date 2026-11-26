@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import clientPromise from "@/lib/mongodb";
 import { ELIGIBLE_BILL_STATUSES } from "@/lib/reconciliation/matchingEngine";
+import dbConnect from "@/lib/dbConnect";
+import { cashReceiptTotals, onAccountByInstitute } from "@/lib/cashbook/orderPayment";
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
@@ -77,17 +79,36 @@ export async function GET(req: Request) {
       ...receiptTotals.keys(),
     ]);
 
+    // Cashbook: cash received "on account" (not yet tied to an order) already
+    // reduces the institute's total outstanding. It has no firm, so it is only
+    // netted in the all-firms view.
+    if (!firmCode) await dbConnect(); // cashbook models use mongoose
+    const onAccount = firmCode ? new Map<string, number>() : await onAccountByInstitute();
+    const cash = firmCode ? new Map<string, any>() : await cashReceiptTotals();
+
     const summary = [...instituteNames]
       .filter(Boolean)
       .map((name) => {
         const bill = billTotals.find((b) => b._id === name);
-        const receipts = receiptTotals.get(name!) || { totalReceived: 0, totalTDS: 0, totalGST: 0, totalKasar: 0 };
+        const bank = receiptTotals.get(name!) || { totalReceived: 0, totalTDS: 0, totalGST: 0, totalKasar: 0 };
+        // Cash receipts (Cashbook) add to received; their deduction (if any) is added by type.
+        const c = cash.get(name!);
+        const cashTds = c ? c.TDS + Math.min(c["TDS+GST"], round2(c["TDS+GST"] / 2)) : 0;
+        const receipts = c
+          ? {
+              totalReceived: round2(bank.totalReceived + c.received),
+              totalTDS: round2(bank.totalTDS + cashTds),
+              totalGST: round2(bank.totalGST + (c["TDS+GST"] - Math.min(c["TDS+GST"], round2(c["TDS+GST"] / 2)))),
+              totalKasar: round2(bank.totalKasar + c.Kasar),
+            }
+          : bank;
         const totalBilled = bill?.totalBilled || 0;
         const totalSettled = bill?.totalSettled || 0;
         return {
           instituteName: name,
           totalBilled: round2(totalBilled),
-          pendingAmount: round2(Math.max(0, totalBilled - totalSettled)),
+          pendingAmount: round2(Math.max(0, totalBilled - totalSettled - (onAccount.get(name!) || 0))),
+          onAccount: onAccount.get(name!) || 0,
           ...receipts,
         };
       })

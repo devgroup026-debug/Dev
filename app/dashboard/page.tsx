@@ -121,7 +121,7 @@ export default function DashboardPage() {
     if (item.name === "Scan Dispatch") return user?.permissions?.printLabels === true;
     if (item.name === "Backup") return user?.permissions?.backup === true;
     if (item.name === "GeM Links") return user?.permissions?.gemLinks === true;
-    if (item.name === "Account") return user?.permissions?.accountStatements === true;
+    if (item.name === "Account") return user?.permissions?.accountStatements === true || user?.permissions?.cashbookView === true;
     if (item.name === "Summary") return user?.permissions?.dashboardSummary === true;
     if (item.name === "GeM Bids") return user?.permissions?.gemBids === true;
     // Same gate the page itself uses (BlockGuard permission="boss"), so nobody

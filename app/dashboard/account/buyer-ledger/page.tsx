@@ -5,6 +5,8 @@ import { FiArrowLeft, FiBookOpen, FiSearch, FiDownload } from "react-icons/fi";
 import BlockGuard from "@/components/BlockGuard";
 import { SellerLite } from "@/lib/institutMatcher";
 import * as XLSX from "xlsx";
+import OnAccountPanel, { CashReceipt } from "@/components/cashbook/OnAccountPanel";
+import { cbFetch } from "@/lib/cashbook/client";
 
 interface Order {
   _id: string;
@@ -64,6 +66,11 @@ export default function BuyerLedgerPage() {
   const [loading, setLoading] = useState(false);
   const [partySummary, setPartySummary] = useState<PartySummary | null>(null);
   const [confirmedMatches, setConfirmedMatches] = useState<ReconciliationMatch[]>([]);
+  // Cashbook: cash received from this institute (+ the on-account balance), and a reload trigger
+  const [cashReceipts, setCashReceipts] = useState<CashReceipt[]>([]);
+  const [onAccountPaise, setOnAccountPaise] = useState(0);
+  const [canAllocate, setCanAllocate] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     fetch("/api/companies")
@@ -100,7 +107,29 @@ export default function BuyerLedgerPage() {
       .then((data) => setOrders(Array.isArray(data.orders) ? data.orders : []))
       .catch((err) => console.error("Failed to load ledger transactions", err))
       .finally(() => setLoading(false));
-  }, [selectedInstitute, firmFilter]);
+  }, [selectedInstitute, firmFilter, reloadKey]);
+
+  // Cash receipts recorded in the Cashbook. Users without cashbook access just get [] (403 is ignored).
+  useEffect(() => {
+    if (!selectedInstitute) {
+      setCashReceipts([]);
+      setOnAccountPaise(0);
+      return;
+    }
+    cbFetch<{ receipts: CashReceipt[]; onAccountPaise: number; canAllocate: boolean }>(
+      `/api/cashbook/order-payments/ledger?institute=${encodeURIComponent(selectedInstitute)}`
+    )
+      .then((d) => {
+        setCashReceipts(d.receipts || []);
+        setOnAccountPaise(d.onAccountPaise || 0);
+        setCanAllocate(!!d.canAllocate);
+      })
+      .catch(() => {
+        setCashReceipts([]);
+        setOnAccountPaise(0);
+        setCanAllocate(false);
+      });
+  }, [selectedInstitute, reloadKey]);
 
   useEffect(() => {
     if (!selectedInstitute) {
@@ -113,7 +142,7 @@ export default function BuyerLedgerPage() {
       .then((res) => res.json())
       .then((data) => setPartySummary(Array.isArray(data) ? data[0] || null : null))
       .catch((err) => console.error("Failed to load party summary", err));
-  }, [selectedInstitute, firmFilter]);
+  }, [selectedInstitute, firmFilter, reloadKey]);
 
   // Confirmed reconciliation matches carry the actual TDS/TDS+GST/Kasar cut
   // against each settled bill - the raw bank statement scan below only ever
@@ -199,6 +228,37 @@ export default function BuyerLedgerPage() {
     [confirmedMatches, firmNameByCode]
   );
 
+  // Approved cash receipts (Cashbook): the full cash received is a credit, any deduction a second credit.
+  // Receipts carry no firm, so they only show in the all-firms view.
+  const cashEntries = useMemo<LedgerEntry[]>(() => {
+    if (firmFilter) return [];
+    const rows: LedgerEntry[] = [];
+    for (const r of cashReceipts) {
+      if (r.status !== "APPROVED") continue;
+      rows.push({
+        key: `cash-${r.id}`,
+        date: r.date,
+        type: "Receipt",
+        voucherNo: r.onAccountPaise > 0 ? "Cash (on account part)" : "Cash",
+        accountName: "Cashbook",
+        debit: 0,
+        credit: r.amountPaise / 100,
+      });
+      if (r.deductionPaise > 0 && r.deductionType) {
+        rows.push({
+          key: `cash-ded-${r.id}`,
+          date: r.date,
+          type: r.deductionType as LedgerEntry["type"],
+          voucherNo: "Cash",
+          accountName: "Cashbook",
+          debit: 0,
+          credit: r.deductionPaise / 100,
+        });
+      }
+    }
+    return rows;
+  }, [cashReceipts, firmFilter]);
+
   const saleEntries = useMemo<LedgerEntry[]>(
     () =>
       orders.map((o) => ({
@@ -216,8 +276,8 @@ export default function BuyerLedgerPage() {
 
   // Full chronological history (unbounded) so the running balance carries forward correctly
   const fullHistory = useMemo(
-    () => [...saleEntries, ...receiptEntries, ...deductionEntries].sort((a, b) => a.date.localeCompare(b.date)),
-    [saleEntries, receiptEntries, deductionEntries]
+    () => [...saleEntries, ...receiptEntries, ...deductionEntries, ...cashEntries].sort((a, b) => a.date.localeCompare(b.date)),
+    [saleEntries, receiptEntries, deductionEntries, cashEntries]
   );
 
   const { openingBalance, visibleRows, closingBalance, totals } = useMemo(() => {
@@ -424,6 +484,16 @@ export default function BuyerLedgerPage() {
                 <span className="text-sm font-black text-red-800 block mt-0.5">₹{formatMoney(partySummary.pendingAmount)}</span>
               </div>
             </div>
+          )}
+
+          {selectedInstitute && (
+            <OnAccountPanel
+              institute={selectedInstitute}
+              receipts={cashReceipts}
+              onAccountPaise={onAccountPaise}
+              canAllocate={canAllocate}
+              onChanged={() => setReloadKey((k) => k + 1)}
+            />
           )}
 
           {!selectedInstitute ? (

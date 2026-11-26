@@ -1,5 +1,7 @@
 import { NextResponse } from "next/server";
 import clientPromise from "@/lib/mongodb";
+import dbConnect from "@/lib/dbConnect";
+import { onAccountByInstitute } from "@/lib/cashbook/orderPayment";
 
 // GET: institute-wise order totals from the verified sellerorders collection,
 // optionally scoped to one firm (?firmCode=XYZ).
@@ -35,12 +37,18 @@ export async function GET(req: Request) {
 
     const results = await db.collection("sellerorders").aggregate(pipeline).toArray();
 
+    // Cashbook: cash received on account reduces the institute's outstanding straight away
+    // (it has no firm, so only the all-firms view is netted).
+    if (!firmCode) await dbConnect();
+    const onAccount = firmCode ? new Map<string, number>() : await onAccountByInstitute();
+
     const ledger = results.map((r) => ({
       instituteName: r._id || "Unknown Institute",
       totalOrders: r.totalOrders,
       totalValue: r.totalValue,
       paidValue: r.paidValue,
-      pendingValue: r.pendingValue,
+      pendingValue: Math.max(0, r.pendingValue - (onAccount.get(r._id) || 0)),
+      onAccountValue: onAccount.get(r._id) || 0,
       firmCodes: (r.firmCodes || []).filter(Boolean),
     }));
 

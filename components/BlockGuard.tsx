@@ -2,7 +2,7 @@
 import { useState, useEffect } from "react";
 
 interface BlockGuardProps {
-  permission: string;
+  permission: string | string[];
   children: React.ReactNode;
   fallback?: React.ReactNode;
 }

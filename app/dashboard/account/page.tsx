@@ -1,13 +1,24 @@
 "use client";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { FiFileText, FiArrowLeft, FiList, FiBookOpen, FiCheckSquare, FiPrinter, FiCreditCard, FiClock, FiHash } from "react-icons/fi";
+import { FiFileText, FiArrowLeft, FiList, FiBookOpen, FiCheckSquare, FiPrinter, FiCreditCard, FiClock, FiHash, FiDollarSign } from "react-icons/fi";
 import BlockGuard from "@/components/BlockGuard";
+import { useOmsUser } from "@/lib/cashbook/client";
 
 export default function AccountPage() {
   const router = useRouter();
 
-  const menuItems = [
+  const { can } = useOmsUser();
+
+  const allMenuItems: { name: string; path: string; sub: string; icon: React.ReactNode; color: string; permission?: string }[] = [
+    {
+      name: "Cashbook",
+      path: "/dashboard/account/cashbook",
+      sub: "DAILY CASH / BANK / ADVANCE",
+      icon: <FiDollarSign />,
+      color: "bg-[#15803d]",
+      permission: "cashbookView",
+    },
     {
       name: "Generate Bill",
       path: "/dashboard/account/bills",
@@ -66,9 +77,13 @@ export default function AccountPage() {
     },
   ];
 
+  // Existing tiles need accountStatements; Cashbook needs its own permission,
+  // so a cashbook-only user sees just the Cashbook tile.
+  const menuItems = allMenuItems.filter((i) => can(i.permission || "accountStatements"));
+
   return (
     <BlockGuard
-      permission="accountStatements"
+      permission={["accountStatements", "cashbookView"]}
       fallback={
         <div className="flex flex-col items-center gap-2 m-4 p-4 border border-red-200 rounded-xl bg-red-50 text-center">
           <p className="text-red-500 font-bold uppercase">You have no Access for this Page.</p>

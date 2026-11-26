@@ -3,6 +3,7 @@ import BlockGuard from "@/components/BlockGuard";
 import Link from "next/link";
 import { useState, useEffect } from "react";
 import { FiChevronDown, FiChevronUp } from "react-icons/fi";
+import { CB_PERMISSIONS } from "@/lib/cashbook/client";
 
 // Define the initial state so we can reuse it to clear the form
 const initialState = {
@@ -38,6 +39,15 @@ const initialState = {
         pricelist: false,
         pricelistManage: false,
         pricelistReceived: false,
+        cashbookView: false,
+        cashbookEntry: false,
+        cashbookApprove: false,
+        cashbookEditApproved: false,
+        cashbookAdvance: false,
+        cashbookOrderPayment: false,
+        cashbookMasters: false,
+        cashbookReports: false,
+        cashbookAllEntries: false,
     },
 };
 
@@ -77,6 +87,10 @@ const MODULE_GROUPS = [
             { key: "pricelistManage", label: "Pricelist Admin: upload / add items, delete & merge tags" },
             { key: "pricelistReceived", label: "Pricelist: Received Purchase tab (view & tag)" }
         ]
+    },
+    {
+        title: "💰 Account > Cashbook",
+        permissions: CB_PERMISSIONS
     },
     {
         title: "🛡️ System & Admin Pages",
@@ -153,13 +167,19 @@ export default function ManageUsers() {
     if (!isMounted) return <div suppressHydrationWarning />;
 
     const handleCheckboxChange = (name: string) => {
-        setFormData((prev) => ({
-            ...prev,
-            permissions: {
+        setFormData((prev) => {
+            const next: any = {
                 ...prev.permissions,
                 [name]: !prev.permissions[name as keyof typeof prev.permissions],
-            },
-        }));
+            };
+            // Any other Cashbook permission needs the base "view" access to open the page.
+            if (name.startsWith("cashbook") && name !== "cashbookView" && next[name]) next.cashbookView = true;
+            // Removing the base access removes the rest of the Cashbook permissions too.
+            if (name === "cashbookView" && !next.cashbookView) {
+                Object.keys(next).filter((k) => k.startsWith("cashbook")).forEach((k) => (next[k] = false));
+            }
+            return { ...prev, permissions: next };
+        });
     };
 
 
@@ -230,6 +250,15 @@ export default function ManageUsers() {
                 pricelist: user.permissions?.pricelist || false,
                 pricelistManage: user.permissions?.pricelistManage || false,
                 pricelistReceived: user.permissions?.pricelistReceived || false,
+                cashbookView: user.permissions?.cashbookView || false,
+                cashbookEntry: user.permissions?.cashbookEntry || false,
+                cashbookApprove: user.permissions?.cashbookApprove || false,
+                cashbookEditApproved: user.permissions?.cashbookEditApproved || false,
+                cashbookAdvance: user.permissions?.cashbookAdvance || false,
+                cashbookOrderPayment: user.permissions?.cashbookOrderPayment || false,
+                cashbookMasters: user.permissions?.cashbookMasters || false,
+                cashbookReports: user.permissions?.cashbookReports || false,
+                cashbookAllEntries: user.permissions?.cashbookAllEntries || false,
             },
         });
         window.scrollTo({ top: 0, behavior: 'smooth' });
