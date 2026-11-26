@@ -1,18 +1,41 @@
 importScripts('common.js');
 
-// Icon click -> Dashboard kholo (agar pehle se khula hai to wahi)
-chrome.action.onClicked.addListener(async () => {
-  const url = chrome.runtime.getURL('dashboard.html');
-  const tabs = await chrome.tabs.query({ url });
-  if (tabs.length) {
-    await chrome.tabs.update(tabs[0].id, { active: true });
-    await chrome.windows.update(tabs[0].windowId, { focused: true });
+// Extension ka page kholo (agar pehle se khula hai to wahi). path me #hash ho sakta hai.
+async function openPage(path) {
+  const [file, hash] = String(path || 'dashboard.html').split('#');
+  const base = chrome.runtime.getURL(file);
+  const url = base + (hash ? '#' + hash : '');
+  const tab = (await chrome.tabs.query({})).find(t => (t.url || '').split('#')[0] === base);
+  if (tab) {
+    await chrome.tabs.update(tab.id, hash && tab.url !== url ? { active: true, url } : { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
   } else {
     await chrome.tabs.create({ url });
+  }
+}
+
+// Icon click -> Dashboard. (v2.2 se popup.html hai, to yeh tabhi chalega jab popup hata do.)
+chrome.action.onClicked.addListener(() => openPage('dashboard.html'));
+
+// ---------- Quick Doc: extension reload/update ke baad khule WhatsApp tab me panel wapas ----------
+// Sirf quickdoc files inject karte hai (content.js nahi — taaki bulk job apne aap resume na ho).
+const QD_MAIN_FILES = ['quickdoc/qd-bridge.js'];
+const QD_CONTENT_FILES = ['quickdoc/selectors.js', 'quickdoc/qd-common.js', 'quickdoc/qd-attach.js', 'quickdoc/qd-panel.js'];
+chrome.runtime.onInstalled.addListener(async () => {
+  const tabs = await chrome.tabs.query({ url: 'https://web.whatsapp.com/*' });
+  for (const t of tabs) {
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: t.id }, world: 'MAIN', files: QD_MAIN_FILES });
+      await chrome.scripting.executeScript({ target: { tabId: t.id }, files: QD_CONTENT_FILES });
+    } catch (e) { /* tab abhi load ho raha ho to manifest wale scripts khud aa jayenge */ }
   }
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === 'open-page') {
+    openPage(msg.path).then(() => sendResponse({ ok: true })).catch(e => sendResponse({ ok: false, error: String(e) }));
+    return true; // async
+  }
   if (msg.type === 'whoami') {
     sendResponse({ tabId: sender.tab ? sender.tab.id : null });
     return;

@@ -31,3 +31,11 @@
 - **Orders → Send DC WhatsApp:** har institute ki Delivery Challan PDF document ke roop me jaati hai.
 - Ek tab me web.whatsapp.com login rakho. Sent/Failed status OMS me apne aap update hota hai, jab koi bhi OMS page khula ho.
 - Extension update karne ke baad `chrome://extensions` me **Reload** dabao aur OMS + WhatsApp dono tab refresh karo.
+
+## Quick Docs (v2.2)
+- Extension icon → popup → **⚙ Quick Docs Settings**. Yahan firm-wise PDF add karo: label, firm, caption (`{firm}`, `{date}`, `{contact_name}`), colour, shortcut.
+- WhatsApp Web me right side **📄 Quick Docs** panel aata hai. Upar "Sending to: …" naam check karo, phir button dabao (ya Alt+1…9).
+- **Direct Send** = turant chala jata hai. **Attach Only** = PDF + caption lag jata hai, Send aap dabao.
+- **👥 Multi Send** = kai contacts ko docs (Dashboard ki list ya paste kiye numbers). Pause/Stop/Retry hai.
+- **Export backup** se dusre PC par same setup **Import** karo.
+- Kuch attach na ho to `quickdoc/selectors.js` ke selectors update karo (Console me `[QuickDoc]` dekho).

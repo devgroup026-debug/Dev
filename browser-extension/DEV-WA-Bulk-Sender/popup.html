@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DEV WA Bulk Sender</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; width: 290px; font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; color: #1f2937; background: #f0f2f5; }
+  header { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: #075e54; color: #fff; }
+  header img { width: 28px; height: 28px; }
+  header b { font-size: 14px; }
+  header small { display: block; opacity: .8; font-size: 11px; }
+  .wrap { padding: 10px 12px 12px; display: grid; gap: 8px; }
+  button { width: 100%; padding: 9px 12px; border-radius: 8px; border: 1px solid #d1d5db; background: #fff; font: 600 13px system-ui; cursor: pointer; text-align: left; }
+  button:hover { background: #f3f4f6; }
+  .big { background: #25d366; border-color: #25d366; color: #fff; text-align: center; font-size: 14px; }
+  .big:hover { background: #1ebe5b; }
+  .card { background: #fff; border-radius: 10px; padding: 10px; display: grid; gap: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .row small { display: block; color: #6b7280; font-size: 11.5px; }
+  .stat { color: #374151; font-size: 12.5px; }
+  .stat.warn b { color: #c0392b; }
+  .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch span { position: absolute; inset: 0; background: #cbd5e1; border-radius: 22px; transition: .2s; cursor: pointer; }
+  .switch span::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+  .switch input:checked + span { background: #25d366; }
+  .switch input:checked + span::before { transform: translateX(16px); }
+  .ver { text-align: center; color: #9ca3af; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <img src="icons/icon48.png" alt="">
+  <div><b>DEV WA Bulk Sender</b><small>DEV GROUP</small></div>
+</header>
+<div class="wrap">
+  <button id="dash" class="big">📤 Bulk Sender Dashboard</button>
+  <div class="card">
+    <div class="row">
+      <div><b>📄 Quick Docs</b><small>WhatsApp Web me floating doc buttons</small></div>
+      <label class="switch" title="Quick Docs panel on/off"><input type="checkbox" id="qdOn"><span></span></label>
+    </div>
+    <div class="stat" id="stat">Aaj bheje: <b id="today">0</b> / <span id="limit">50</span> · <span id="docCount">0</span> docs</div>
+    <button id="qdSettings">⚙ Quick Docs Settings</button>
+    <button id="qdLog">🧾 Send Log</button>
+  </div>
+  <div class="ver" id="ver"></div>
+</div>
+<script src="quickdoc/qd-common.js"></script>
+<script src="popup.js"></script>
+</body>
+</html>

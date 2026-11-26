@@ -428,6 +428,10 @@
     }
   });
 
+  // Quick Doc module (quickdoc/qd-panel.js) inhi helpers ko reuse karta hai —
+  // khaas kar bina reload chat kholna. Sirf expose kiya hai, bulk logic same hai.
+  window.__devwaDom = { openChatInPlace, composeBox, chatTitle, invalidDialog, isLoggedOut, pasteInto, footerSendBtn };
+
   // Page khud load/refresh hua aur kaam chalu tha -> continue
   setTimeout(async () => {
     for (let i = 0; i < 8; i++) {

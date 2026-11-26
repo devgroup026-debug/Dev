@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DEV WA Bulk Sender",
-  "version": "2.1.4",
-  "description": "WhatsApp Web se personalised message + images/PDF bhejne ke liye (DEV GROUP). DEV OMS se bhi seedha queue hota hai.",
+  "version": "2.2.0",
+  "description": "WhatsApp Web se personalised message + images/PDF bhejne ke liye (DEV GROUP). DEV OMS se bhi seedha queue hota hai. Quick Docs: firm-wise PDFs 1 click me.",
   "permissions": [
     "storage",
     "unlimitedStorage",
@@ -17,11 +17,16 @@
   },
   "action": {
     "default_title": "DEV WA Bulk Sender",
+    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
+  },
+  "options_ui": {
+    "page": "quickdoc/settings.html",
+    "open_in_tab": true
   },
   "icons": {
     "16": "icons/icon16.png",
@@ -35,7 +40,8 @@
       ],
       "js": [
         "wppconnect-wa.js",
-        "bridge-main.js"
+        "bridge-main.js",
+        "quickdoc/qd-bridge.js"
       ],
       "world": "MAIN",
       "run_at": "document_idle"
@@ -46,7 +52,11 @@
       ],
       "js": [
         "common.js",
-        "content.js"
+        "content.js",
+        "quickdoc/selectors.js",
+        "quickdoc/qd-common.js",
+        "quickdoc/qd-attach.js",
+        "quickdoc/qd-panel.js"
       ],
       "run_at": "document_idle"
     },

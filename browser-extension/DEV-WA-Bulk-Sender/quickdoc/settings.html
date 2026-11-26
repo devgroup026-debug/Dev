@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quick Docs — DEV WA Bulk Sender</title>
+<link rel="stylesheet" href="../dashboard.css">
+<link rel="stylesheet" href="settings.css">
+</head>
+<body>
+<header>
+  <img src="../icons/icon48.png" alt="">
+  <div class="grow">
+    <h1>Quick Docs</h1>
+    <p>Firm-wise bank detail PDFs — WhatsApp me 1 click me bhejo</p>
+  </div>
+  <label class="switch-lbl" title="WhatsApp Web me floating panel">
+    Panel <span class="switch"><input type="checkbox" id="enabled"><span></span></span>
+  </label>
+  <a class="hdr-link" href="../dashboard.html">📤 Bulk Sender Dashboard</a>
+</header>
+
+<nav class="tabs">
+  <button data-tab="docs" class="on">📄 Quick Docs</button>
+  <button data-tab="log">🧾 Log</button>
+</nav>
+
+<main>
+  <!-- ================= Quick Docs ================= -->
+  <section id="tab-docs">
+    <section class="card">
+      <div class="row between">
+        <h2>Documents</h2>
+        <div class="row tight">
+          <button id="add" class="primary">➕ Add document</button>
+          <button id="export" class="ghost">⬇ Export backup</button>
+          <button id="importBtn" class="ghost">⬆ Import backup</button>
+          <input type="file" id="importFile" accept=".json,application/json" hidden>
+        </div>
+      </div>
+      <p class="hint">⠿ pakad ke drag karo = WhatsApp panel me buttons ka order. Switch off = button chhup jayega.</p>
+      <div id="docList" class="doclist"></div>
+      <input type="file" id="replaceFile" accept=".pdf,application/pdf,image/jpeg,image/png" hidden>
+    </section>
+
+    <section class="card">
+      <h2>Settings</h2>
+      <div class="row">
+        <label>Default mode
+          <select id="mode">
+            <option value="direct">⚡ Direct Send</option>
+            <option value="attach">👁 Attach Only (review)</option>
+          </select>
+        </label>
+        <label>Daily limit (doc sends) <input type="number" id="dailyLimit" min="1"></label>
+        <label>Multi Send delay min (sec) <input type="number" id="delayMin" min="3"></label>
+        <label>Multi Send delay max (sec) <input type="number" id="delayMax" min="3"></label>
+      </div>
+      <p class="hint">Aaj bheje: <b id="todayCount">0</b>. Limit aane par Multi Send ruk jata hai, aur single click par confirm puchta hai.</p>
+    </section>
+  </section>
+
+  <!-- ================= Log ================= -->
+  <section id="tab-log" hidden>
+    <section class="card">
+      <div class="row between">
+        <h2>Send Log</h2>
+        <div class="row tight">
+          <button id="csv" class="ghost">⬇ Export CSV</button>
+          <button id="clearLog" class="ghost danger">🗑 Clear log</button>
+        </div>
+      </div>
+      <div class="row">
+        <label>From <input type="date" id="fFrom"></label>
+        <label>To <input type="date" id="fTo"></label>
+        <label>Document <select id="fDoc"><option value="">Sab</option></select></label>
+        <label>Status
+          <select id="fStatus">
+            <option value="">Sab</option><option>Sent</option><option>Attached</option><option>Failed</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint" id="logInfo"></p>
+      <div class="table-wrap tall">
+        <table>
+          <thead><tr><th>Date-time</th><th>Contact</th><th>Number</th><th>Document</th><th>Mode</th><th>Status</th><th>Reason</th></tr></thead>
+          <tbody id="logBody"></tbody>
+        </table>
+      </div>
+      <p class="hint">90 din se purani entries apne aap delete ho jaati hai.</p>
+    </section>
+  </section>
+</main>
+
+<!-- ================= Add / Edit dialog ================= -->
+<dialog id="editor">
+  <form method="dialog" id="form">
+    <h2 id="edTitle">Add document</h2>
+    <div class="grid2">
+      <label>Button label * <input type="text" id="label" maxlength="24" placeholder="SS Bank" required></label>
+      <label>Firm name <input type="text" id="firm" placeholder="S S Enterprise"></label>
+    </div>
+    <label>PDF file * <small>(PDF / JPG / PNG, max 10 MB)</small>
+      <input type="file" id="file" accept=".pdf,application/pdf,image/jpeg,image/png">
+    </label>
+    <div id="fileInfo" class="info"></div>
+    <label>Send file name <small>(WhatsApp me yahi naam dikhega)</small>
+      <input type="text" id="sendName" placeholder="SS_Enterprise_Bank_Details.pdf">
+    </label>
+    <label>Caption <small>(PDF ke saath jaane wala text — khaali chhodo to sirf PDF jayega)</small>
+      <textarea id="caption" rows="5" placeholder="*{firm} – Bank Details*"></textarea>
+    </label>
+    <div class="hint">Variables (click = insert):
+      <button type="button" class="var" data-v="{firm}">{firm}</button>
+      <button type="button" class="var" data-v="{date}">{date}</button>
+      <button type="button" class="var" data-v="{contact_name}">{contact_name}</button>
+      &nbsp;· <code>*bold*</code> <code>_italic_</code>
+    </div>
+    <div class="preview-wrap"><b>Preview</b> <small>(contact: Ramesh Bhai)</small><pre id="capPreview">—</pre></div>
+    <div class="row">
+      <label>Button colour
+        <span class="colors"><input type="color" id="color"><span id="swatches"></span></span>
+      </label>
+      <label>Shortcut <select id="shortcut"></select></label>
+      <label class="inline"><input type="checkbox" id="active" checked> Active</label>
+    </div>
+    <div id="edErr" class="info err"></div>
+    <div class="row end">
+      <button type="button" id="edCancel">Cancel</button>
+      <button type="submit" class="primary" id="edSave">💾 Save</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- ================= Import dialog ================= -->
+<dialog id="importDlg">
+  <h2>Import backup</h2>
+  <p id="importInfo"></p>
+  <div class="row end">
+    <button type="button" data-imp="cancel">Cancel</button>
+    <button type="button" data-imp="merge">➕ Merge (purane rakho)</button>
+    <button type="button" data-imp="replace" class="danger">♻ Replace all</button>
+  </div>
+</dialog>
+
+<script src="qd-common.js"></script>
+<script src="settings.js"></script>
+</body>
+</html>

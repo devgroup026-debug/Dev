@@ -1,0 +1,54 @@
+/* Quick Docs settings — dashboard.css ke upar extra styles */
+[hidden] { display: none !important; }
+header .grow { flex: 1; }
+.hdr-link { color: #fff; text-decoration: none; font-weight: 600; font-size: 13px; padding: 6px 10px; border: 1px solid rgba(255,255,255,.4); border-radius: 8px; }
+.hdr-link:hover { background: rgba(255,255,255,.12); }
+.switch-lbl { flex-direction: row; align-items: center; gap: 8px; color: #fff; }
+
+.tabs { max-width: 900px; margin: 16px auto 0; padding: 0 16px; display: flex; gap: 6px; }
+.tabs button { border-radius: 8px 8px 0 0; border-bottom: 0; background: #e5e7eb; }
+.tabs button.on { background: #fff; color: #075e54; }
+.tabs + main { margin-top: 0; }
+
+.row.tight { margin-top: 0; gap: 8px; }
+.row.end { justify-content: flex-end; }
+select { padding: 7px 8px; border: 1px solid #d1d7db; border-radius: 8px; font: inherit; }
+input[type=date] { padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 8px; font: inherit; }
+.table-wrap.tall { max-height: 560px; }
+td.Attached { color: #0b84ff; font-weight: 600; }
+
+/* Switch */
+.switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch span { position: absolute; inset: 0; background: #cbd5e1; border-radius: 22px; transition: .2s; cursor: pointer; }
+.switch span::before { content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: .2s; }
+.switch input:checked + span { background: #25d366; }
+.switch input:checked + span::before { transform: translateX(16px); }
+
+/* Doc list */
+.doclist { display: grid; gap: 8px; margin-top: 10px; }
+.doc { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 10px; background: #fff; }
+.doc.off { opacity: .55; }
+.doc.drag-over { border-color: #25d366; box-shadow: 0 0 0 2px #25d36655; }
+.doc.dragging { opacity: .4; }
+.doc .grip { cursor: grab; color: #9ca3af; font-size: 18px; user-select: none; }
+.chip { min-width: 90px; text-align: center; padding: 7px 10px; border-radius: 8px; font-weight: 700; font-size: 13px; }
+.doc .meta { flex: 1; min-width: 0; }
+.doc .meta b { display: block; }
+.doc .meta small { color: #6b7280; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc .acts { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.doc .acts button { padding: 6px 10px; }
+.empty-docs { text-align: center; color: #6b7280; padding: 24px; border: 2px dashed #e5e7eb; border-radius: 10px; }
+
+/* Dialogs */
+dialog { border: 0; border-radius: 14px; padding: 18px 22px; width: min(640px, 94vw); box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog form > label, dialog .grid2 label { margin-top: 10px; }
+dialog label small { font-weight: 400; color: #6b7280; }
+dialog input[type=text] { width: 100%; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+label.inline { flex-direction: row; align-items: center; gap: 6px; padding-bottom: 8px; }
+.colors { display: flex; align-items: center; gap: 6px; }
+.colors input[type=color] { width: 40px; height: 32px; padding: 0; border: 1px solid #d1d5db; border-radius: 6px; }
+.colors i { width: 20px; height: 20px; border-radius: 50%; display: inline-block; cursor: pointer; border: 2px solid #fff; box-shadow: 0 0 0 1px #d1d5db; }
+.var { padding: 2px 8px; font: 12px ui-monospace, monospace; }
