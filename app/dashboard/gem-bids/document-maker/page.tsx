@@ -488,6 +488,9 @@ function DocumentMakerPageInner() {
   const boqFileRef = useRef<HTMLInputElement>(null);
   const [uploadingSpec, setUploadingSpec] = useState(false);
   const specFileRef = useRef<HTMLInputElement>(null);
+  // "Load Spec from Bid Doc" button - idle | waiting for the extension to
+  // fetch the Bid Document | parsing it for the Specification link.
+  const [specLoadPhase, setSpecLoadPhase] = useState<"idle" | "fetching" | "extracting">("idle");
   // Typed once, applied to every row's own Margin % at a click - each row
   // stays individually editable afterward (this is a bulk-fill, not a
   // locked global setting).
@@ -927,6 +930,73 @@ function DocumentMakerPageInner() {
       alert(err.message || "Upload failed");
     } finally {
       setUploadingSpec(false);
+    }
+  };
+
+  // Pulls the Specification Document out of the bid's own Bid Document on
+  // demand. Used to happen automatically in the background for every bid
+  // (autoDocLinksJob.ts), which burned Vercel CPU on bids nobody worked on.
+  // The Bid Document itself is still auto-queued in the background, so
+  // usually only the parse step runs here; if it isn't there yet, this
+  // queues it and waits for the extension the same way Generate ATC does.
+  const loadSpecFromBidDoc = async () => {
+    const bidId = selectedBidId;
+    if (!bidId) return;
+    try {
+      let haveBidDoc = hasBidDocument;
+      if (!haveBidDoc) {
+        setSpecLoadPhase("fetching");
+        let status = docFetchStatus?.status || "idle";
+        if (status !== "pending" && status !== "fetching") {
+          const queueRes = await fetch("/api/gem-bids/fetch-documents", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ bidId }),
+          });
+          if (!queueRes.ok) throw new Error("Bid Document fetch queue nahi ho paya");
+          status = "pending";
+          setDocFetchStatus({ status: "pending" });
+        }
+        // The extension checks about once a minute - capped so an offline
+        // extension doesn't leave the button spinning forever.
+        const deadline = Date.now() + 3 * 60 * 1000;
+        while ((status === "pending" || status === "fetching") && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 4000));
+          const statusRes = await fetch(`/api/gem-bids/fetch-documents/status?bidId=${bidId}`);
+          const statusData = await statusRes.json();
+          if (statusData?.error) break;
+          status = statusData.docFetch?.status || "idle";
+          haveBidDoc = !!statusData.hasBidDocument;
+          setDocFetchStatus(statusData.docFetch || { status: "idle" });
+          setHasBidDocument(haveBidDoc);
+        }
+        if (!haveBidDoc) {
+          throw new Error(
+            "Bid Document abhi tak nahi aaya. Check karo ki GeM Bid Exporter extension Chrome mein chal raha hai, phir dobara try karo."
+          );
+        }
+      }
+
+      setSpecLoadPhase("extracting");
+      const res = await fetch("/api/gem-bids/auto-doc-links/extract", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ bidId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error || "Spec extraction failed");
+      if (data.reason === "no_spec_link") {
+        alert("Is bid ke Bid Document mein Specification Document ka link nahi mila - zarurat ho to haath se upload karo.");
+      } else if (data.reason === "spec_fetch_failed") {
+        alert("Specification link mila, par file download nahi ho payi (GeM site se). Thodi der baad dobara try karo.");
+      } else if (data.reason === "no_bid_document") {
+        alert("Bid Document nahi mila - dobara try karo.");
+      }
+      fetchDocStatus();
+    } catch (err: any) {
+      alert(err.message || "Spec load failed");
+    } finally {
+      setSpecLoadPhase("idle");
     }
   };
 
@@ -1877,6 +1947,21 @@ function DocumentMakerPageInner() {
                       <FiUploadCloud size={13} />
                       {uploadingSpec ? "Uploading..." : hasSpecDocument ? "Replace Specification Doc" : "Upload Specification Doc"}
                     </button>
+                    {!hasSpecDocument && (
+                      <button
+                        disabled={specLoadPhase !== "idle" || uploadingSpec}
+                        onClick={loadSpecFromBidDoc}
+                        title="Bid Document mein diye link se Specification Document apne aap le aao"
+                        className="w-fit flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white font-black uppercase text-[10px] tracking-wide py-2.5 px-4 rounded-lg transition-colors"
+                      >
+                        <FiDownload size={13} />
+                        {specLoadPhase === "fetching"
+                          ? "Bid Doc aa raha hai..."
+                          : specLoadPhase === "extracting"
+                          ? "Spec nikal raha hai..."
+                          : "Load Spec from Bid Doc"}
+                      </button>
+                    )}
                     {hasSpecDocument && (
                       <>
                         <span className="text-[10px] font-black uppercase text-emerald-600">✓ Loaded</span>

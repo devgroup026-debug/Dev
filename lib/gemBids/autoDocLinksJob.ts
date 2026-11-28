@@ -8,20 +8,11 @@ const LAST_RUN_KEY = "lastAutoDocLinksJobDate";
 // and that combination regularly blew Vercel's Fluid Active CPU quota.
 const MIN_INTERVAL_MS = 5 * 60 * 1000;
 const ENQUEUE_BATCH_SIZE = 10;
-const EXTRACT_BATCH_SIZE = 2;
-// A genuine per-bid failure (R2 hiccup, a transient fetch error reaching
-// mkp.gem.gov.in, etc.) gets a few more tries on later runs before this
-// gives up and treats it the same as "no such table in this bid" - rather
-// than either retrying forever on a truly broken file, or (the bug this
-// replaced) recording a single failure as permanent fact. See the catch
-// block below for the retryCount bookkeeping this backs.
-const MAX_RETRIES = 5;
 
 export interface AutoDocLinksJobResult {
   ran: boolean;
   reason?: string;
   queuedForFetch?: number;
-  extracted?: number;
 }
 
 async function fetchPublicDoc(url: string): Promise<{ buffer: Buffer; contentType: string } | null> {
@@ -115,74 +106,63 @@ export async function runAutoDocLinksJobIfDue(db: any): Promise<AutoDocLinksJobR
     queuedForFetch = res.modifiedCount || 0;
   }
 
-  const toExtract = await bidsCollection
-    .find(
-      {
-        currentSection: { $in: sections },
-        "bidLinkDoc.fileKey": { $exists: true },
-        autoDocLinksCheckedAt: { $exists: false },
-      },
-      { projection: { _id: 1, bidLinkDoc: 1, boqDetailDoc: 1, specificationDoc: 1, autoDocLinksRetryCount: 1 } }
-    )
-    .limit(EXTRACT_BATCH_SIZE)
-    .toArray();
+  // Step 2 (parsing the Bid Document for its Specification link) used to
+  // run here too, on 2 bids every run - the PDF parse is the single most
+  // CPU-expensive thing this app does, and it was spent on every bid that
+  // reached Bids to Fill/Submitted Bids, most of which expire unworked.
+  // It now runs only on demand, per bid, from Document Maker's "Load Spec
+  // from Bid Doc" button (POST /api/gem-bids/auto-doc-links/extract ->
+  // extractSpecForBid below). Queueing the Bid Document itself (step 1,
+  // DB-only, no CPU to speak of) stays automatic so that button is fast.
+  return { ran: true, queuedForFetch };
+}
 
-  let extracted = 0;
-  for (const bid of toExtract) {
-    // Counted as an attempt BEFORE the work, not in the catch below - a
-    // run killed by the platform timeout never reaches any catch, so
-    // counting there meant a bid that always times out was retried
-    // forever and MAX_RETRIES never kicked in.
-    const attempts = (bid.autoDocLinksRetryCount || 0) + 1;
-    if (attempts > MAX_RETRIES) {
-      await bidsCollection.updateOne(
-        { _id: bid._id },
-        { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false } }
-      );
-      continue;
-    }
-    await bidsCollection.updateOne({ _id: bid._id }, { $set: { autoDocLinksRetryCount: attempts } });
+export interface ExtractSpecResult {
+  ok: boolean;
+  found: boolean;
+  reason?: "no_bid_document" | "already_has_spec" | "no_spec_link" | "spec_fetch_failed";
+}
 
-    try {
-      const bidDocBytes = await getFileFromR2(bid.bidLinkDoc.fileKey);
-      const links = await extractOrderItemLinks(bidDocBytes);
-      let found = false;
+/**
+ * On-demand (button-triggered) version of the old automatic step 2: reads
+ * one bid's already-fetched Bid Document, pulls the embedded Specification
+ * Document link out of it and stores that file in R2. Never overwrites a
+ * Specification Document that's already there. R2/parse errors throw to
+ * the caller so the button can show them.
+ */
+export async function extractSpecForBid(db: any, bidId: any): Promise<ExtractSpecResult> {
+  const bidsCollection = db.collection("gem_bids");
+  const bid = await bidsCollection.findOne(
+    { _id: bidId },
+    { projection: { _id: 1, bidLinkDoc: 1, specificationDoc: 1 } }
+  );
+  if (!bid?.bidLinkDoc?.fileKey) return { ok: false, found: false, reason: "no_bid_document" };
+  if (bid.specificationDoc?.fileKey) return { ok: true, found: true, reason: "already_has_spec" };
 
-      if (links.specificationUrl && !bid.specificationDoc?.fileKey) {
-        const fetched = await fetchPublicDoc(links.specificationUrl);
-        if (fetched) {
-          const key = `bids/${bid._id.toString()}/source-docs/spec.pdf`;
-          await uploadFileToR2(fetched.buffer, key, "application/pdf");
-          await bidsCollection.updateOne(
-            { _id: bid._id },
-            { $set: { "specificationDoc.fileKey": key, "specificationDoc.fetchedAt": now } }
-          );
-          found = true;
-        }
-      }
-      await bidsCollection.updateOne(
-        { _id: bid._id },
-        { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: found } }
-      );
-      extracted++;
-    } catch (err) {
-      console.error("autoDocLinksJob: failed for bid", bid._id.toString(), err);
-      if (attempts >= MAX_RETRIES) {
-        // Given up - after this many genuine failures, treat it the same
-        // as "checked, nothing found" so it stops being retried forever.
-        // A fresh "Fetch Documents" re-run (which clears bidLinkDoc) is
-        // still what un-sticks a bid that's actually fixable.
-        await bidsCollection.updateOne(
-          { _id: bid._id },
-          { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false } }
-        );
-      }
-      // Otherwise deliberately NOT setting autoDocLinksCheckedAt - a single
-      // failure must not be recorded as "confirmed, no links in this bid"
-      // forever; the attempt was already counted above, so a later run
-      // retries it until MAX_RETRIES.
-    }
+  const now = new Date();
+  const bidDocBytes = await getFileFromR2(bid.bidLinkDoc.fileKey);
+  const links = await extractOrderItemLinks(bidDocBytes);
+
+  if (!links.specificationUrl) {
+    await bidsCollection.updateOne({ _id: bid._id }, { $set: { autoDocLinksCheckedAt: now, autoDocLinksFound: false } });
+    return { ok: true, found: false, reason: "no_spec_link" };
   }
 
-  return { ran: true, queuedForFetch, extracted };
+  const fetched = await fetchPublicDoc(links.specificationUrl);
+  if (!fetched) return { ok: false, found: false, reason: "spec_fetch_failed" };
+
+  const key = `bids/${bid._id.toString()}/source-docs/spec.pdf`;
+  await uploadFileToR2(fetched.buffer, key, "application/pdf");
+  await bidsCollection.updateOne(
+    { _id: bid._id },
+    {
+      $set: {
+        "specificationDoc.fileKey": key,
+        "specificationDoc.fetchedAt": now,
+        autoDocLinksCheckedAt: now,
+        autoDocLinksFound: true,
+      },
+    }
+  );
+  return { ok: true, found: true };
 }

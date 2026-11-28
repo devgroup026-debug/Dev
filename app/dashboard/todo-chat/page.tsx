@@ -99,13 +99,22 @@ export default function TodoChatPage() {
     fetchChat();
     fetchUsers();
 
-    // Poll for new tasks & chat messages every 4 seconds for real-time feel
-    const interval = setInterval(() => {
+    // Poll for new tasks & chat messages. Was every 4s in every open tab
+    // (2 Vercel function invocations per 4s = ~1,800/hour per tab, even
+    // when the tab sat in the background) - now 15s and only while the tab
+    // is visible, plus an immediate refresh when the user comes back to it.
+    const tick = () => {
+      if (document.visibilityState !== "visible") return;
       pollTasks();
       pollChat();
-    }, 4000);
+    };
+    const interval = setInterval(tick, 15000);
+    document.addEventListener("visibilitychange", tick);
 
-    return () => clearInterval(interval);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", tick);
+    };
   }, [router]);
 
   // Scroll to bottom of chat — only when the user is already near the bottom,
